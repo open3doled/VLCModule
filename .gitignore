@@ -1,0 +1,24 @@
+# Local build/output artifacts
+build/
+*.o
+*.lo
+*.la
+*.a
+*.so
+*.dylib
+*.dll
+*.log
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Temporary local work
+.tmp/
+__pycache__/
+*.pyc
+.local_paths.env
+.redaction_paths.local
+local/
+PLAYBOOK.md

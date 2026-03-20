@@ -1,0 +1,8 @@
+[submodule "vendor/edge264"]
+	path = vendor/edge264
+	url = git@github-open3doled:open3doled/edge264.git
+	branch = open3doled_001
+[submodule "vendor/libbluray"]
+	path = vendor/libbluray
+	url = git@github-open3doled:open3doled/libbluray.git
+	branch = open3doled_001

@@ -1,0 +1,265 @@
+diff --git a/modules/access/Makefile.am b/modules/access/Makefile.am
+index 7d23797..6faf94b 100644
+--- a/modules/access/Makefile.am
++++ b/modules/access/Makefile.am
+@@ -440,3 +440,9 @@ librist_plugin_la_SOURCES = access/rist.c access/rist.h
+ librist_plugin_la_CFLAGS = $(AM_CFLAGS)
+ librist_plugin_la_LIBADD = $(SOCKET_LIBS)
+ access_LTLIBRARIES += librist_plugin.la
++
++libopen3dbluraymvc_plugin_la_SOURCES = access/open3dbluraymvc.c
++access_LTLIBRARIES += libopen3dbluraymvc_plugin.la
++libopen3dbluraymvc_plugin_la_CFLAGS = $(AM_CFLAGS) $(OPEN3DBLURAYMVC_PLUGIN_CFLAGS) $(BLURAY_CFLAGS)
++libopen3dbluraymvc_plugin_la_LIBADD = $(OPEN3DBLURAYMVC_PLUGIN_LIBADD) $(BLURAY_LIBS)
++libopen3dbluraymvc_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(accessdir)'
+diff --git a/modules/codec/Makefile.am b/modules/codec/Makefile.am
+index dd04391..5de2705 100644
+--- a/modules/codec/Makefile.am
++++ b/modules/codec/Makefile.am
+@@ -6,6 +6,11 @@ AM_CPPFLAGS += -I$(srcdir)/codec
+ libddummy_plugin_la_SOURCES = codec/ddummy.c
+ codec_LTLIBRARIES += libddummy_plugin.la
+ 
++libedge264mvc_plugin_la_SOURCES = codec/edge264mvc.c
++libedge264mvc_plugin_la_CFLAGS = $(AM_CFLAGS) $(EDGE264MVC_PLUGIN_CFLAGS)
++libedge264mvc_plugin_la_LIBADD = $(LIBDL)
++codec_LTLIBRARIES += libedge264mvc_plugin.la
++
+ libedummy_plugin_la_SOURCES = codec/edummy.c
+ if ENABLE_SOUT
+ codec_LTLIBRARIES += libedummy_plugin.la
+diff --git a/modules/demux/Makefile.am b/modules/demux/Makefile.am
+index dbb6a10..0f33035 100644
+--- a/modules/demux/Makefile.am
++++ b/modules/demux/Makefile.am
+@@ -280,12 +280,23 @@ libts_plugin_la_SOURCES = demux/mpeg/ts.c demux/mpeg/ts.h \
+ 	codec/opus_header.c
+ libts_plugin_la_CFLAGS = $(AM_CFLAGS) $(DVBPSI_CFLAGS)
+ libts_plugin_la_LIBADD = $(DVBPSI_LIBS) $(SOCKET_LIBS)
++libts_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(demuxdir)'
+ if HAVE_ARIBB24
+ libts_plugin_la_CFLAGS += $(ARIBB24_CFLAGS)
+ libts_plugin_la_LIBADD += $(ARIBB24_LIBS)
+ endif
+ if HAVE_DVBPSI
+ demux_LTLIBRARIES += libts_plugin.la
++
++libtsmvc_plugin_la_SOURCES = $(libts_plugin_la_SOURCES)
++libtsmvc_plugin_la_CFLAGS = $(AM_CFLAGS) $(DVBPSI_CFLAGS)
++libtsmvc_plugin_la_LIBADD = $(DVBPSI_LIBS) $(SOCKET_LIBS)
++libtsmvc_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(demuxdir)'
++if HAVE_ARIBB24
++libtsmvc_plugin_la_CFLAGS += $(ARIBB24_CFLAGS)
++libtsmvc_plugin_la_LIBADD += $(ARIBB24_LIBS)
++endif
++demux_LTLIBRARIES += libtsmvc_plugin.la
+ endif
+ 
+ libvlc_adaptive_la_SOURCES = \
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 4449304..5b5551f 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -63,6 +63,40 @@
+ 
+ #include <assert.h>
+ 
++#if defined(__GNUC__) || defined(__clang__)
++# define OPEN3D_TSMVC_VISIBILITY __attribute__((visibility("default")))
++#else
++# define OPEN3D_TSMVC_VISIBILITY
++#endif
++
++#if defined(_WIN32)
++# define OPEN3D_TSMVC_EXPORT __declspec(dllexport)
++#else
++# define OPEN3D_TSMVC_EXPORT
++#endif
++
++extern int vlc_entry__3_0_0f( vlc_set_cb, void * );
++extern const char *vlc_entry_copyright__3_0_0f( void );
++extern const char *vlc_entry_license__3_0_0f( void );
++
++OPEN3D_TSMVC_EXPORT OPEN3D_TSMVC_VISIBILITY
++int vlc_entry__3_0_0ft64( vlc_set_cb vlc_set, void *opaque )
++{
++    return vlc_entry__3_0_0f( vlc_set, opaque );
++}
++
++OPEN3D_TSMVC_EXPORT OPEN3D_TSMVC_VISIBILITY
++const char *vlc_entry_copyright__3_0_0ft64( void )
++{
++    return vlc_entry_copyright__3_0_0f();
++}
++
++OPEN3D_TSMVC_EXPORT OPEN3D_TSMVC_VISIBILITY
++const char *vlc_entry_license__3_0_0ft64( void )
++{
++    return vlc_entry_license__3_0_0f();
++}
++
+ /*****************************************************************************
+  * Module descriptor
+  *****************************************************************************/
+@@ -169,7 +203,7 @@ vlc_module_begin ()
+ 
+     set_capability( "demux", 10 )
+     set_callbacks( Open, Close )
+-    add_shortcut( "ts" )
++    add_shortcut( "tsmvc", "ts" )
+ vlc_module_end ()
+ 
+ /*****************************************************************************
+@@ -365,6 +399,7 @@ static int Open( vlc_object_t *p_this )
+ {
+     demux_t     *p_demux = (demux_t*)p_this;
+     demux_sys_t *p_sys;
++    msg_Dbg( p_demux, "Open3D rebuild ts: Open() local libts_plugin active" );
+ 
+     int          i_packet_size;
+     unsigned     i_packet_header_size = 0;
+diff --git a/modules/demux/mpeg/ts_psi.c b/modules/demux/mpeg/ts_psi.c
+index c8e3eee..adfe951 100644
+--- a/modules/demux/mpeg/ts_psi.c
++++ b/modules/demux/mpeg/ts_psi.c
+@@ -1429,6 +1429,10 @@ static void PIDFillFormat( demux_t *p_demux, ts_stream_t *p_pes,
+     case 0x1B:  /* H264 <- check transport syntax/needed descriptor */
+         es_format_Change( fmt, VIDEO_ES, VLC_CODEC_H264 );
+         break;
++    case 0x20:  /* MVC video sub-bitstream (H.264 Annex H) */
++        es_format_Change( fmt, VIDEO_ES, VLC_CODEC_H264 );
++        msg_Dbg( p_demux, "Open3D rebuild ts_psi: PIDFillFormat mapped stream_type 0x20 to H264" );
++        break;
+     case 0x1C:  /* ISO/IEC 14496-3 Audio, without using any additional
+                    transport syntax, such as DST, ALS and SLS */
+         es_format_Change( fmt, AUDIO_ES, VLC_CODEC_MP4A );
+@@ -1551,6 +1555,9 @@ static void FillPESFromDvbpsiES( demux_t *p_demux,
+             SetupMetadataDescriptors( p_demux, p_pes, p_dvbpsies );
+             break;
+         case 0x1b:
++        case 0x20:
++            if( p_dvbpsies->i_type == 0x20 )
++                msg_Dbg( p_demux, "Open3D rebuild ts_psi: FillPESFromDvbpsiES applying AVC descriptors to stream_type 0x20 pid %d", p_dvbpsies->i_pid );
+             SetupAVCDescriptors( p_demux, p_pes->p_es, p_dvbpsies );
+             break;
+         case 0x21:
+diff --git a/modules/demux/playlist/playlist.c b/modules/demux/playlist/playlist.c
+index 449d5fd..9dfdecc 100644
+--- a/modules/demux/playlist/playlist.c
++++ b/modules/demux/playlist/playlist.c
+@@ -40,6 +40,33 @@
+ 
+ #include "playlist.h"
+ 
++#if defined(OPEN3D_VLC_ABI_ALIAS_T64)
++extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
++extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
++extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
++EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
++
++EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
++vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
++{
++    return vlc_entry__3_0_0f(vlc_set, opaque);
++}
++
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
++vlc_entry_copyright__3_0_0ft64(void)
++{
++    return vlc_entry_copyright__3_0_0f();
++}
++
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
++vlc_entry_license__3_0_0ft64(void)
++{
++    return vlc_entry_license__3_0_0f();
++}
++#endif
++
+ /*****************************************************************************
+  * Module descriptor
+  *****************************************************************************/
+diff --git a/modules/video_output/Makefile.am b/modules/video_output/Makefile.am
+index 6d75a1d..766d43b 100644
+--- a/modules/video_output/Makefile.am
++++ b/modules/video_output/Makefile.am
+@@ -83,6 +83,14 @@ libgl_plugin_la_CFLAGS += -DHAVE_GL_CORE_SYMBOLS
+ libgl_plugin_la_LIBADD += $(GL_LIBS)
+ endif
+ 
++libopen3d_plugin_la_SOURCES = $(OPENGL_COMMONSOURCES) video_output/open3d_display.c
++libopen3d_plugin_la_CFLAGS = $(AM_CFLAGS) $(GL_CFLAGS) $(OPENGL_COMMONCLFAGS) $(OPEN3D_PLUGIN_CFLAGS)
++libopen3d_plugin_la_LIBADD = $(LIBM) $(OPENGL_COMMONLIBS)
++if HAVE_WIN32
++libopen3d_plugin_la_CFLAGS += -DHAVE_GL_CORE_SYMBOLS
++libopen3d_plugin_la_LIBADD += $(GL_LIBS)
++endif
++
+ libglconv_vaapi_wl_plugin_la_SOURCES = video_output/opengl/converter_vaapi.c \
+ 	video_output/opengl/converter.h \
+ 	hw/vaapi/vlc_vaapi.c hw/vaapi/vlc_vaapi.h
+@@ -107,6 +115,7 @@ libglconv_vdpau_plugin_la_LIBADD = $(LIBDL) libvlc_vdpau.la $(X_LIBS) $(X_PRE_LI
+ 
+ if HAVE_GL
+ vout_LTLIBRARIES += libgl_plugin.la
++vout_LTLIBRARIES += libopen3d_plugin.la
+ if HAVE_EGL
+ if HAVE_VAAPI
+ if HAVE_WAYLAND_EGL
+diff --git a/modules/video_output/opengl/vout_helper.c b/modules/video_output/opengl/vout_helper.c
+index 13d65e0..5387d9e 100644
+--- a/modules/video_output/opengl/vout_helper.c
++++ b/modules/video_output/opengl/vout_helper.c
+@@ -1672,8 +1672,9 @@ static void TextureCropForStereo(vout_display_opengl_t *vgl,
+     }
+ }
+ 
+-int vout_display_opengl_Display(vout_display_opengl_t *vgl,
+-                                const video_format_t *source)
++static int vout_display_opengl_DisplayCommon(vout_display_opengl_t *vgl,
++                                             const video_format_t *source,
++                                             bool do_swap)
+ {
+     GL_ASSERT_NOERROR();
+ 
+@@ -1807,11 +1808,23 @@ int vout_display_opengl_Display(vout_display_opengl_t *vgl,
+     }
+     vgl->vt.Disable(GL_BLEND);
+ 
+-    /* Display */
+-    vlc_gl_Swap(vgl->gl);
++    if (do_swap)
++        vlc_gl_Swap(vgl->gl);
+ 
+     GL_ASSERT_NOERROR();
+ 
+     return VLC_SUCCESS;
+ }
+ 
++int vout_display_opengl_DisplayNoSwap(vout_display_opengl_t *vgl,
++                                      const video_format_t *source)
++{
++    return vout_display_opengl_DisplayCommon(vgl, source, false);
++}
++
++int vout_display_opengl_Display(vout_display_opengl_t *vgl,
++                                const video_format_t *source)
++{
++    return vout_display_opengl_DisplayCommon(vgl, source, true);
++}
++
+diff --git a/modules/video_output/opengl/vout_helper.h b/modules/video_output/opengl/vout_helper.h
+index 48014b4..32dadda 100644
+--- a/modules/video_output/opengl/vout_helper.h
++++ b/modules/video_output/opengl/vout_helper.h
+@@ -262,6 +262,8 @@ void vout_display_opengl_Viewport(vout_display_opengl_t *vgl, int x, int y,
+ 
+ int vout_display_opengl_Prepare(vout_display_opengl_t *vgl,
+                                 picture_t *picture, subpicture_t *subpicture);
++int vout_display_opengl_DisplayNoSwap(vout_display_opengl_t *vgl,
++                                      const video_format_t *source);
+ int vout_display_opengl_Display(vout_display_opengl_t *vgl,
+                                 const video_format_t *source);
+ 
