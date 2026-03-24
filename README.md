@@ -60,6 +60,33 @@ Merge targets:
 
 Do not push feature branches such as `open3doled_002_*` or `open3doled_003_*`.
 
+After switching the parent repo branch, use the tracked helper below to align
+the child repos to the expected working branches:
+
+```bash
+./scripts/sync_open3doled_repo_branches.sh
+```
+
+Expected branch map:
+- parent `main`
+  - `vendor/edge264` -> `open3doled_001`
+  - `vendor/libbluray` -> `open3doled_001`
+  - `local` -> `main`
+- parent `open3doled_*`
+  - each child repo uses the same branch name when it exists
+  - otherwise it falls back to the canonical branch above
+
+Use `--dry-run` to inspect the branch decisions without switching anything.
+
+To create and switch a new project branch across the whole VLCModule hierarchy:
+
+```bash
+./scripts/sync_open3doled_repo_branches.sh --new-project ui_cleanup
+```
+
+If the name does not already start with `open3doled_`, the helper adds that
+prefix automatically.
+
 Historical test/oracle/assembly helpers were moved to `local/scripts/` and are
 not part of the maintained tracked launch path anymore.
 
