@@ -20,9 +20,9 @@ DECODER_PLUGIN_SRC="${VLC_SRC}/modules/.libs/libedge264mvc_plugin.so"
 DECODER_PLUGIN_DST_DIR="${STAGE_DIR}/codec"
 DECODER_PLUGIN_DST="${DECODER_PLUGIN_DST_DIR}/libedge264mvc_plugin.so"
 
-OPEN3DMKV_PLUGIN_SRC="${VLC_SRC}/modules/.libs/libopen3dmkv_plugin.so"
-OPEN3DMKV_PLUGIN_DST_DIR="${STAGE_DIR}/demux"
-OPEN3DMKV_PLUGIN_DST="${OPEN3DMKV_PLUGIN_DST_DIR}/libopen3dmkv_plugin.so"
+OPEN3DANNEXB_PLUGIN_SRC="${VLC_SRC}/modules/.libs/libopen3dannexb_plugin.so"
+OPEN3DANNEXB_PLUGIN_DST_DIR="${STAGE_DIR}/demux"
+OPEN3DANNEXB_PLUGIN_DST="${OPEN3DANNEXB_PLUGIN_DST_DIR}/libopen3dannexb_plugin.so"
 
 TS_PLUGIN_SRC="${VLC_SRC}/modules/.libs/libts_plugin.so"
 TS_PLUGIN_DST_DIR="${STAGE_DIR}/demux"
@@ -45,7 +45,7 @@ find_nested_stage_plugins() {
   # and video_output/. Only flag deeper archived stage subdirectories.
   find "${STAGE_DIR}" -mindepth 3 -type f \
     \( -path '*/codec/libedge264mvc_plugin.so' \
-       -o -path '*/demux/libopen3dmkv_plugin.so' \
+       -o -path '*/demux/libopen3dannexb_plugin.so' \
        -o -path '*/video_output/libopen3d_plugin.so' \) \
     -print -quit 2>/dev/null
 }
@@ -82,13 +82,14 @@ else
 fi
 
 rm -f "${STAGE_DIR}/demux/libmvcasm_plugin.so"
+rm -f "${STAGE_DIR}/demux/libopen3dmkv_plugin.so"
 
-if [[ -f "${OPEN3DMKV_PLUGIN_SRC}" ]]; then
-  mkdir -p "${OPEN3DMKV_PLUGIN_DST_DIR}"
-  install -m 755 "${OPEN3DMKV_PLUGIN_SRC}" "${OPEN3DMKV_PLUGIN_DST}"
+if [[ -f "${OPEN3DANNEXB_PLUGIN_SRC}" ]]; then
+  mkdir -p "${OPEN3DANNEXB_PLUGIN_DST_DIR}"
+  install -m 755 "${OPEN3DANNEXB_PLUGIN_SRC}" "${OPEN3DANNEXB_PLUGIN_DST}"
 else
-  rm -f "${OPEN3DMKV_PLUGIN_DST}"
-  echo "Warning: open3dmkv demux plugin not found at source: ${OPEN3DMKV_PLUGIN_SRC}" >&2
+  rm -f "${OPEN3DANNEXB_PLUGIN_DST}"
+  echo "Warning: open3dannexb demux plugin not found at source: ${OPEN3DANNEXB_PLUGIN_SRC}" >&2
 fi
 
 if [[ -f "${TS_PLUGIN_SRC}" ]]; then
@@ -133,8 +134,8 @@ fi
 if [[ -f "${DECODER_PLUGIN_DST}" ]]; then
   echo "Staged edge264mvc decoder plugin: ${DECODER_PLUGIN_DST}"
 fi
-if [[ -f "${OPEN3DMKV_PLUGIN_DST}" ]]; then
-  echo "Staged open3dmkv demux plugin: ${OPEN3DMKV_PLUGIN_DST}"
+if [[ -f "${OPEN3DANNEXB_PLUGIN_DST}" ]]; then
+  echo "Staged open3dannexb demux plugin: ${OPEN3DANNEXB_PLUGIN_DST}"
 fi
 if [[ -f "${TS_PLUGIN_DST}" ]]; then
   echo "Staged TS demux plugin: ${TS_PLUGIN_DST}"

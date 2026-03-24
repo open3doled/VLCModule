@@ -16,13 +16,16 @@
 #include <inttypes.h>
 #include <errno.h>
 #include <limits.h>
+#include <ctype.h>
 #include <dlfcn.h>
 
 #include <vlc_common.h>
 #include <vlc_codec.h>
 #include <vlc_interrupt.h>
 #include <vlc_plugin.h>
+#include "../video_output/open3d_subtitle_bridge.h"
 #define OPEN3DBLURAYMVC_CODEC_MVC VLC_FOURCC('m','v','c','1')
+#define OPEN3DMKV_CODEC_H264 VLC_FOURCC('m','k','v','h')
 
 #define EDGE264MVC_LIB_PATH_TEXT N_("edge264 shared library path")
 #define EDGE264MVC_LIB_PATH_LONGTEXT N_( \
@@ -72,6 +75,10 @@
 #define EDGE264MVC_LOG_FRAMEIDS_LONGTEXT N_( \
     "If enabled, logs FrameId/FrameId_mvc deltas for queued stereo frames to help " \
     "diagnose right-eye lead/lag and frame-step jitter.")
+#define EDGE264MVC_LOG_SEI_TEXT N_("Log MVC/SEI core telemetry")
+#define EDGE264MVC_LOG_SEI_LONGTEXT N_( \
+    "If enabled, turns on edge264 core logging and forwards SEI-related lines. " \
+    "Intended for MVC metadata investigation only; disabled by default.")
 #define EDGE264MVC_FRAMEID_LOG_EVERY_TEXT N_("Frame-id periodic log interval")
 #define EDGE264MVC_FRAMEID_LOG_EVERY_LONGTEXT N_( \
     "When frame-id logging is enabled, emit one periodic telemetry line every N queued frames.")
@@ -95,6 +102,20 @@
 #define EDGE264MVC_HOLD_RIGHT_BACKSTEP_LONGTEXT N_( \
     "If enabled, when selected right-eye frame-id would go backwards, hold the " \
     "previous selected right-eye frame (from history) to preserve monotonic order.")
+#define EDGE264MVC_USE_PTS_DATES_TEXT N_("Use PTS for queued picture dates")
+#define EDGE264MVC_USE_PTS_DATES_LONGTEXT N_( \
+    "If enabled, queue decoded picture dates from packet PTS instead of DTS. " \
+    "This is a narrow diagnostic for native MKV pacing; disabled by default.")
+#define EDGE264MVC_TS_LOG_EVERY_TEXT N_("Timestamp cadence log interval")
+#define EDGE264MVC_TS_LOG_EVERY_LONGTEXT N_( \
+    "Emit timestamp cadence telemetry every N queued/popped picture dates, " \
+    "and also when cadence deviates materially from the expected frame period. " \
+    "Use 0 to disable.")
+#define EDGE264MVC_NORMALIZE_TS_CADENCE_TEXT N_("Normalize queued timestamp cadence")
+#define EDGE264MVC_NORMALIZE_TS_CADENCE_LONGTEXT N_( \
+    "If enabled, lightly normalize queued picture dates toward the expected " \
+    "frame period when native MKV packet timestamps oscillate or step backwards. " \
+    "Intended for MKV pacing diagnostics and disabled by default.")
 
 #define EDGE264MVC_TS_QUEUE_CAP 256
 #define EDGE264MVC_NAL_LOOP_MAX 512
@@ -113,6 +134,8 @@
 #define EDGE264MVC_POST_SEEK_REQUIRE_STEREO_DROPS 48u
 #define EDGE264MVC_RIGHT_HISTORY_MAX 16
 #define EDGE264MVC_SOFT_TRACE_MAX 32u
+#define EDGE264MVC_OFMD_LOG_MAX 32u
+#define EDGE264MVC_OFMD_ENTRY_SAMPLE_MAX 16u
 
 #define EDGE264MVC_SOFT_ACTION_NONE 0u
 #define EDGE264MVC_SOFT_ACTION_SKIP_VIEWEXT 1u
@@ -209,6 +232,20 @@ typedef struct
 
 typedef struct
 {
+    bool valid;
+    uint8_t fps_raw;
+    uint8_t fps_code;
+    uint8_t count_hint_raw;
+    uint8_t prefix[9];
+    size_t prefix_len;
+    uint8_t entries[EDGE264MVC_OFMD_ENTRY_SAMPLE_MAX];
+    size_t entry_count;
+    open3d_subtitle_depth_state_t candidate_depth[EDGE264MVC_OFMD_ENTRY_SAMPLE_MAX];
+    uint64_t generation;
+} edge264mvc_ofmd_state_t;
+
+typedef struct
+{
     vlc_mutex_t lock;
     edge264_api_t api;
     Edge264Decoder *decoder;
@@ -234,6 +271,12 @@ typedef struct
     unsigned ts_count;
     uint64_t ts_next_seq;
     uint64_t ts_last_seq;
+    vlc_tick_t ts_last_push;
+    vlc_tick_t ts_last_pop;
+    uint64_t ts_last_push_seq;
+    uint64_t ts_last_pop_seq;
+    vlc_tick_t ts_last_normalized;
+    uint64_t ts_normalized_count;
 
     bool warned_missing_layout;
     bool warned_ts_overflow;
@@ -327,6 +370,8 @@ typedef struct
     bool recover_viewext_errors;
     bool advertise_multiview;
     bool log_frameids;
+    bool log_sei;
+    unsigned sei_payload37_logs;
     unsigned frameid_log_every;
     unsigned right_hist_depth;
     unsigned right_hist_head;
@@ -334,6 +379,11 @@ typedef struct
     bool gate_type20_until_subset_sps;
     unsigned gate_type20_max_skips;
     bool hold_right_on_backstep;
+    bool use_pts_dates;
+    unsigned ts_log_every;
+    bool normalize_ts_cadence;
+    int mkv_subtitle_plane;
+    int mkv_subtitle_source_id;
     bool single_thread_mode;
     int alloc_thread_count;
     int current_thread_count;
@@ -370,6 +420,16 @@ typedef struct
     int32_t selected_right_last_frameid;
     uint32_t last_hard_reopen_flags;
     right_hist_entry_t right_hist[EDGE264MVC_RIGHT_HISTORY_MAX];
+    bool ofmd_last_valid;
+    uint8_t ofmd_last_prefix[9];
+    size_t ofmd_last_prefix_len;
+    uint8_t ofmd_last_entries[EDGE264MVC_OFMD_ENTRY_SAMPLE_MAX];
+    size_t ofmd_last_entry_count;
+    unsigned ofmd_change_logs;
+    uint64_t ofmd_samples_seen;
+    edge264mvc_ofmd_state_t ofmd_extracted;
+    open3d_subtitle_depth_state_t ofmd_selected_depth;
+    int ofmd_selected_entry;
 } edge264mvc_sys_t;
 
 static void Edge264CoreLogCb(const char *str, void *log_arg)
@@ -377,12 +437,790 @@ static void Edge264CoreLogCb(const char *str, void *log_arg)
     decoder_t *dec = (decoder_t *)log_arg;
     if (dec == NULL || str == NULL || *str == '\0')
         return;
+
+    edge264mvc_sys_t *sys = (edge264mvc_sys_t *)dec->p_sys;
+    if (sys == NULL || (!sys->log_frameids && !sys->log_sei))
+        return;
+
+    if (!sys->log_frameids && sys->log_sei)
+    {
+        if (strstr(str, "SEI") == NULL &&
+            strstr(str, "sei_messages") == NULL &&
+            strstr(str, "payloadType") == NULL &&
+            strstr(str, "parse_SEI_result") == NULL)
+            return;
+    }
+
     size_t len = strlen(str);
     while (len > 0 && (str[len - 1] == '\n' || str[len - 1] == '\r'))
         len--;
     if (len == 0)
         return;
     msg_Dbg(dec, "edge264 core: %.*s", (int)len, str);
+}
+
+static size_t BuildRbspSample(const uint8_t *src, size_t src_len,
+                              uint8_t *dst, size_t dst_cap)
+{
+    size_t out = 0;
+    unsigned zero_run = 0;
+
+    for (size_t i = 0; i < src_len && out < dst_cap; ++i)
+    {
+        const uint8_t byte = src[i];
+        if (zero_run >= 2 && byte == 0x03)
+        {
+            zero_run = 0;
+            continue;
+        }
+
+        dst[out++] = byte;
+        if (byte == 0x00)
+            zero_run++;
+        else
+            zero_run = 0;
+    }
+
+    return out;
+}
+
+typedef struct
+{
+    const uint8_t *buf;
+    size_t len;
+    size_t bitpos;
+} open3d_bitreader_t;
+
+static bool BitReadU(open3d_bitreader_t *br, unsigned bits, unsigned *out)
+{
+    if (br == NULL || out == NULL || bits > 31)
+        return false;
+    if ((br->len * 8u) - br->bitpos < bits)
+        return false;
+
+    unsigned value = 0;
+    for (unsigned i = 0; i < bits; ++i)
+    {
+        const uint8_t byte = br->buf[br->bitpos >> 3];
+        const unsigned shift = 7u - (unsigned)(br->bitpos & 7u);
+        value = (value << 1) | ((byte >> shift) & 0x01u);
+        br->bitpos++;
+    }
+
+    *out = value;
+    return true;
+}
+
+static bool BitReadUE(open3d_bitreader_t *br, unsigned *out)
+{
+    unsigned leading_zero_bits = 0;
+    unsigned bit = 0;
+    while (true)
+    {
+        if (!BitReadU(br, 1, &bit))
+            return false;
+        if (bit != 0)
+            break;
+        leading_zero_bits++;
+        if (leading_zero_bits > 30)
+            return false;
+    }
+
+    if (leading_zero_bits == 0)
+    {
+        *out = 0;
+        return true;
+    }
+
+    unsigned suffix = 0;
+    if (!BitReadU(br, leading_zero_bits, &suffix))
+        return false;
+    *out = ((1u << leading_zero_bits) - 1u) + suffix;
+    return true;
+}
+
+static size_t BitAlignZeroPad(open3d_bitreader_t *br)
+{
+    while ((br->bitpos & 7u) != 0)
+    {
+        unsigned pad = 0;
+        if (!BitReadU(br, 1, &pad))
+            break;
+        if (pad != 0)
+            break;
+    }
+    return br->bitpos >> 3;
+}
+
+static void BytesToHexSample(const uint8_t *buf, size_t len,
+                             char *out, size_t out_cap)
+{
+    size_t pos = 0;
+
+    if (out_cap == 0)
+        return;
+
+    out[0] = '\0';
+    for (size_t i = 0; i < len; ++i)
+    {
+        const int written = snprintf(out + pos, out_cap - pos,
+                                     "%s%02x", (i == 0) ? "" : " ", buf[i]);
+        if (written < 0)
+            break;
+        if ((size_t)written >= out_cap - pos)
+        {
+            pos = out_cap - 1;
+            break;
+        }
+        pos += (size_t)written;
+    }
+    out[pos] = '\0';
+}
+
+static void FormatUuid(const uint8_t *uuid, char *out, size_t out_cap)
+{
+    if (uuid == NULL || out == NULL || out_cap == 0)
+        return;
+
+    snprintf(out, out_cap,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             uuid[0], uuid[1], uuid[2], uuid[3],
+             uuid[4], uuid[5], uuid[6], uuid[7],
+             uuid[8], uuid[9], uuid[10], uuid[11],
+             uuid[12], uuid[13], uuid[14], uuid[15]);
+}
+
+static bool IsOfmdUuid(const uint8_t *uuid)
+{
+    static const uint8_t ofmd_uuid[16] = {
+        0x17, 0xee, 0x8c, 0x60, 0xf8, 0x4d, 0x11, 0xd9,
+        0x8c, 0xd6, 0x08, 0x00, 0x20, 0x0c, 0x9a, 0x66,
+    };
+    return uuid != NULL && memcmp(uuid, ofmd_uuid, sizeof(ofmd_uuid)) == 0;
+}
+
+static void ClearOfmdExtractedState(edge264mvc_ofmd_state_t *state)
+{
+    if (state == NULL)
+        return;
+
+    memset(state, 0, sizeof(*state));
+    for (size_t i = 0; i < EDGE264MVC_OFMD_ENTRY_SAMPLE_MAX; ++i)
+        Open3DSubtitleDepthStateClear(&state->candidate_depth[i]);
+}
+
+static void SetOfmdCandidateDepth(open3d_subtitle_depth_state_t *state,
+                                  uint8_t raw, uint8_t sequence)
+{
+    Open3DSubtitleDepthStateClear(state);
+
+    /*
+     * The tracked MakeMKV sample uses 0x80 as the neutral/unset OFMD value.
+     * Leave those entries invalid for now so later items can safely prefer the
+     * static MKV fallback until a non-neutral dynamic depth is proven.
+     */
+    if (raw == 0x80)
+        return;
+
+    Open3DSubtitleDepthStateSet(state, true, sequence, raw, (int8_t)raw, -1);
+}
+
+static bool BuildOfmdProbeDesc(const uint8_t *payload, size_t payload_len,
+                               int selected_plane,
+                               char *out, size_t out_cap)
+{
+    if (payload == NULL || out == NULL || out_cap == 0)
+        return false;
+    if (payload_len < 4 || memcmp(payload, "OFMD", 4) != 0)
+        return false;
+
+    const uint8_t *data = payload + 4;
+    const size_t data_len = payload_len - 4;
+    const unsigned fps_raw = data_len > 0 ? data[0] : 0;
+    const unsigned fps_code = fps_raw & 0x7f;
+    const unsigned count_hint_raw = data_len > 6 ? data[6] : 0;
+    const unsigned count_hint_entries = count_hint_raw & 0x7f;
+    const size_t depth_off = data_len > 9 ? 9 : data_len;
+    const size_t total_depth_bytes =
+        (data_len > depth_off) ? (data_len - depth_off) : 0;
+    size_t entry_count = total_depth_bytes;
+    if (count_hint_entries > 0 && count_hint_entries <= total_depth_bytes)
+        entry_count = count_hint_entries;
+    if (entry_count > EDGE264MVC_OFMD_ENTRY_SAMPLE_MAX)
+        entry_count = EDGE264MVC_OFMD_ENTRY_SAMPLE_MAX;
+    const size_t depth_count = entry_count;
+    const ssize_t direct_index =
+        (selected_plane >= 0 && (size_t)selected_plane < entry_count) ?
+        (ssize_t)selected_plane : -1;
+    const ssize_t plus1_index =
+        (selected_plane >= 0 && (size_t)(selected_plane + 1) < entry_count) ?
+        (ssize_t)(selected_plane + 1) : -1;
+    char depth_hex[3 * EDGE264MVC_OFMD_ENTRY_SAMPLE_MAX];
+    char prefix_hex[3 * 9];
+    char direct_hex[8];
+    char plus1_hex[8];
+    depth_hex[0] = '\0';
+    prefix_hex[0] = '\0';
+    strcpy(direct_hex, "n/a");
+    strcpy(plus1_hex, "n/a");
+    if (data_len > 0)
+    {
+        const size_t prefix_count = data_len < 9 ? data_len : 9;
+        BytesToHexSample(data, prefix_count, prefix_hex, sizeof(prefix_hex));
+    }
+    if (depth_count > 0)
+        BytesToHexSample(data + depth_off, depth_count, depth_hex, sizeof(depth_hex));
+    if (direct_index >= 0)
+        snprintf(direct_hex, sizeof(direct_hex), "0x%02x",
+                 data[depth_off + (size_t)direct_index]);
+    if (plus1_index >= 0)
+        snprintf(plus1_hex, sizeof(plus1_hex), "0x%02x",
+                 data[depth_off + (size_t)plus1_index]);
+
+    snprintf(out, out_cap,
+             "sig=OFMD payload=%zu fps_raw=0x%02x fps_code=%u count_hint@+6=0x%02x entries=%u prefix@+0=%s depth@+9=%s direct[p=%d]=%s plus1[p=%d]=%s tail=%zu",
+             payload_len, fps_raw, fps_code, count_hint_raw, count_hint_entries,
+             prefix_hex[0] != '\0' ? prefix_hex : "none",
+             depth_hex[0] != '\0' ? depth_hex : "none",
+             selected_plane, direct_hex,
+             selected_plane, plus1_hex,
+             total_depth_bytes > entry_count ? (total_depth_bytes - entry_count) : 0u);
+    return true;
+}
+
+static bool ParseOfmdEntrySample(const uint8_t *payload, size_t payload_len,
+                                 uint8_t prefix[9], size_t *prefix_len,
+                                 uint8_t entries[EDGE264MVC_OFMD_ENTRY_SAMPLE_MAX],
+                                 size_t *entry_count)
+{
+    if (prefix_len != NULL)
+        *prefix_len = 0;
+    if (entry_count != NULL)
+        *entry_count = 0;
+    if (payload == NULL || payload_len < 4 || memcmp(payload, "OFMD", 4) != 0)
+        return false;
+
+    const uint8_t *data = payload + 4;
+    const size_t data_len = payload_len - 4;
+    const unsigned count_hint_raw = data_len > 6 ? data[6] : 0;
+    const unsigned count_hint_entries = count_hint_raw & 0x7f;
+    const size_t depth_off = data_len > 9 ? 9 : data_len;
+    const size_t total_depth_bytes =
+        (data_len > depth_off) ? (data_len - depth_off) : 0;
+    size_t sampled_entries = total_depth_bytes;
+    if (count_hint_entries > 0 && count_hint_entries <= total_depth_bytes)
+        sampled_entries = count_hint_entries;
+    if (sampled_entries > EDGE264MVC_OFMD_ENTRY_SAMPLE_MAX)
+        sampled_entries = EDGE264MVC_OFMD_ENTRY_SAMPLE_MAX;
+
+    if (prefix != NULL && prefix_len != NULL)
+    {
+        *prefix_len = data_len < 9 ? data_len : 9;
+        if (*prefix_len > 0)
+            memcpy(prefix, data, *prefix_len);
+    }
+    if (entries != NULL && entry_count != NULL)
+    {
+        *entry_count = sampled_entries;
+        if (sampled_entries > 0)
+            memcpy(entries, data + depth_off, sampled_entries);
+    }
+    return true;
+}
+
+static bool ParseOfmdExtractedState(const uint8_t *payload, size_t payload_len,
+                                    edge264mvc_ofmd_state_t *state)
+{
+    if (state == NULL)
+        return false;
+
+    ClearOfmdExtractedState(state);
+    if (payload == NULL || payload_len < 4 || memcmp(payload, "OFMD", 4) != 0)
+        return false;
+
+    const uint8_t *data = payload + 4;
+    const size_t data_len = payload_len - 4;
+
+    state->valid = true;
+    state->fps_raw = data_len > 0 ? data[0] : 0;
+    state->fps_code = state->fps_raw & 0x7f;
+    state->count_hint_raw = data_len > 6 ? data[6] : 0;
+
+    if (!ParseOfmdEntrySample(payload, payload_len,
+                              state->prefix, &state->prefix_len,
+                              state->entries, &state->entry_count))
+    {
+        ClearOfmdExtractedState(state);
+        return false;
+    }
+
+    for (size_t i = 0; i < state->entry_count; ++i)
+        SetOfmdCandidateDepth(&state->candidate_depth[i], state->entries[i], (uint8_t)i);
+
+    return true;
+}
+
+static void BuildOfmdCandidateDepthDesc(const edge264mvc_ofmd_state_t *state,
+                                        char *out, size_t out_cap)
+{
+    size_t pos = 0;
+
+    if (out == NULL || out_cap == 0)
+        return;
+    out[0] = '\0';
+    if (state == NULL || !state->valid)
+        return;
+
+    for (size_t i = 0; i < state->entry_count; ++i)
+    {
+        const open3d_subtitle_depth_state_t *depth = &state->candidate_depth[i];
+        const int written = snprintf(out + pos, out_cap - pos,
+                                     "%s%zu:%s(raw=0x%02x signed=%d)",
+                                     (i == 0) ? "" : ", ",
+                                     i,
+                                     depth->valid ? "valid" : "neutral",
+                                     state->entries[i],
+                                     depth->valid ? depth->signed_offset : 0);
+        if (written < 0)
+            break;
+        if ((size_t)written >= out_cap - pos)
+        {
+            pos = out_cap - 1;
+            break;
+        }
+        pos += (size_t)written;
+    }
+    out[pos] = '\0';
+}
+
+static bool HasMkvSubtitleMapping(const edge264mvc_sys_t *sys)
+{
+    return sys != NULL &&
+           (sys->mkv_subtitle_plane >= 0 || sys->mkv_subtitle_source_id >= 0);
+}
+
+static void ReadMkvSubtitleMapping(decoder_t *dec,
+                                   bool *bridge_present_out,
+                                   int *plane_out,
+                                   int *source_id_out)
+{
+    if (bridge_present_out != NULL)
+        *bridge_present_out = false;
+    if (plane_out != NULL)
+        *plane_out = -1;
+    if (source_id_out != NULL)
+        *source_id_out = -1;
+
+    if (dec == NULL)
+        return;
+
+    vlc_object_t *bridge_owner =
+        dec->obj.libvlc != NULL ? VLC_OBJECT(dec->obj.libvlc) : NULL;
+    bool bridge_available = false;
+    bool bridge_force = false;
+    int plane = -1;
+    int source_id = -1;
+    if (Open3DMkvSubtitleBridgeReadFromObject(bridge_owner, &bridge_available,
+                                              &bridge_force, NULL,
+                                              &plane, &source_id) &&
+        bridge_available)
+    {
+        if (bridge_present_out != NULL)
+            *bridge_present_out = true;
+        if (plane_out != NULL)
+            *plane_out = bridge_force ? plane : -1;
+        if (source_id_out != NULL)
+            *source_id_out = bridge_force ? source_id : -1;
+        return;
+    }
+
+    if (plane_out != NULL)
+        *plane_out = var_InheritInteger(dec, "open3d-mkv-subtitle-plane");
+    if (source_id_out != NULL)
+        *source_id_out = var_InheritInteger(dec, "open3d-mkv-subtitle-source-id");
+}
+
+static bool RefreshMkvSubtitleMappingFromVars(decoder_t *dec,
+                                              edge264mvc_sys_t *sys,
+                                              bool log_changes)
+{
+    if (dec == NULL || sys == NULL)
+        return false;
+
+    bool bridge_present = false;
+    int plane = -1;
+    int source_id = -1;
+    ReadMkvSubtitleMapping(dec, &bridge_present, &plane, &source_id);
+    if (plane == sys->mkv_subtitle_plane &&
+        source_id == sys->mkv_subtitle_source_id)
+        return false;
+
+    sys->mkv_subtitle_plane = plane;
+    sys->mkv_subtitle_source_id = source_id;
+    if (log_changes)
+    {
+        msg_Dbg(dec,
+                "edge264mvc refreshed MKV subtitle mapping plane=%d source_id=%d via=%s",
+                sys->mkv_subtitle_plane,
+                sys->mkv_subtitle_source_id,
+                bridge_present ? "bridge" : "inherited");
+    }
+    return true;
+}
+
+static void PublishSelectedMkvOfmdDepth(decoder_t *dec, edge264mvc_sys_t *sys)
+{
+    if (dec == NULL || sys == NULL)
+        return;
+
+    /*
+     * The decoder and the active vout share the input thread as a common
+     * ancestor. Publish the selected MKV depth state there so the display
+     * side can inherit it without depending on non-exported input internals.
+     */
+    vlc_object_t *shared_owner = dec->obj.parent;
+    if (shared_owner != NULL)
+        Open3DSubtitleDepthPublishToObject(shared_owner, &sys->ofmd_selected_depth);
+
+    /*
+     * Keep one root-level safety anchor too. The display side already walks the
+     * VLC object ancestry, and this avoids depending on exact decoder/vout
+     * reuse details while the source-specific MKV mapping stays outside here.
+     */
+    if (dec->obj.libvlc != NULL &&
+        dec->obj.libvlc != (libvlc_int_t *)shared_owner)
+        Open3DSubtitleDepthPublishToObject(VLC_OBJECT(dec->obj.libvlc),
+                                           &sys->ofmd_selected_depth);
+}
+
+static void RefreshSelectedMkvOfmdDepth(decoder_t *dec, edge264mvc_sys_t *sys)
+{
+    RefreshMkvSubtitleMappingFromVars(dec, sys, true);
+    Open3DSubtitleDepthStateClear(&sys->ofmd_selected_depth);
+    sys->ofmd_selected_entry = -1;
+
+    if (!sys->ofmd_extracted.valid)
+    {
+        PublishSelectedMkvOfmdDepth(dec, sys);
+        return;
+    }
+    if (!Open3DMkvSubtitleDepthSelectPlane(sys->ofmd_extracted.candidate_depth,
+                                           sys->ofmd_extracted.entry_count,
+                                           sys->mkv_subtitle_plane,
+                                           &sys->ofmd_selected_depth,
+                                           &sys->ofmd_selected_entry))
+    {
+        msg_Dbg(dec,
+                "edge264mvc selected MKV OFMD depth unresolved generation=%" PRIu64
+                " plane=%d source_id=%d entries=%zu",
+                sys->ofmd_extracted.generation,
+                sys->mkv_subtitle_plane,
+                sys->mkv_subtitle_source_id,
+                sys->ofmd_extracted.entry_count);
+        PublishSelectedMkvOfmdDepth(dec, sys);
+        return;
+    }
+
+    msg_Dbg(dec,
+            "edge264mvc selected MKV OFMD depth generation=%" PRIu64
+            " plane=%d source_id=%d entry=%d valid=%d raw=0x%02x signed=%d",
+            sys->ofmd_extracted.generation,
+            sys->mkv_subtitle_plane,
+            sys->mkv_subtitle_source_id,
+            sys->ofmd_selected_entry,
+            sys->ofmd_selected_depth.valid ? 1 : 0,
+            sys->ofmd_selected_depth.raw,
+            sys->ofmd_selected_depth.valid ? sys->ofmd_selected_depth.signed_offset : 0);
+
+    PublishSelectedMkvOfmdDepth(dec, sys);
+}
+
+static void MaybeLogOfmdChange(decoder_t *dec, edge264mvc_sys_t *sys,
+                               const uint8_t *payload, size_t payload_len)
+{
+    if (dec == NULL || sys == NULL || payload == NULL || payload_len == 0)
+        return;
+
+    uint8_t prefix[9];
+    size_t prefix_len = 0;
+    uint8_t entries[EDGE264MVC_OFMD_ENTRY_SAMPLE_MAX];
+    size_t entry_count = 0;
+    if (!ParseOfmdEntrySample(payload, payload_len,
+                              prefix, &prefix_len,
+                              entries, &entry_count))
+        return;
+
+    sys->ofmd_samples_seen++;
+
+    bool changed = !sys->ofmd_last_valid ||
+                   sys->ofmd_last_prefix_len != prefix_len ||
+                   sys->ofmd_last_entry_count != entry_count ||
+                   (prefix_len > 0 &&
+                    memcmp(sys->ofmd_last_prefix, prefix, prefix_len) != 0) ||
+                   (entry_count > 0 &&
+                    memcmp(sys->ofmd_last_entries, entries, entry_count) != 0);
+    if (!changed)
+        return;
+
+    char desc[320];
+    char candidate_desc[256];
+    edge264mvc_ofmd_state_t extracted;
+    if (!BuildOfmdProbeDesc(payload, payload_len, sys->mkv_subtitle_plane,
+                            desc, sizeof(desc)))
+        return;
+    if (!ParseOfmdExtractedState(payload, payload_len, &extracted))
+        return;
+
+    sys->ofmd_last_valid = true;
+    sys->ofmd_last_prefix_len = prefix_len;
+    sys->ofmd_last_entry_count = entry_count;
+    if (prefix_len > 0)
+        memcpy(sys->ofmd_last_prefix, prefix, prefix_len);
+    if (entry_count > 0)
+        memcpy(sys->ofmd_last_entries, entries, entry_count);
+    extracted.generation = sys->ofmd_samples_seen;
+    sys->ofmd_extracted = extracted;
+    RefreshSelectedMkvOfmdDepth(dec, sys);
+
+    if (!sys->log_sei || sys->ofmd_change_logs >= EDGE264MVC_OFMD_LOG_MAX)
+        return;
+
+    sys->ofmd_change_logs++;
+    BuildOfmdCandidateDepthDesc(&sys->ofmd_extracted,
+                                candidate_desc, sizeof(candidate_desc));
+
+    msg_Info(dec,
+             "edge264mvc ofmd change=%u seen=%" PRIu64
+             " nals=%" PRIu64 " frames=%" PRIu64
+             " plane=%d source_id=%d %s",
+             sys->ofmd_change_logs, sys->ofmd_samples_seen,
+             sys->nals_seen, sys->frames_queued,
+             sys->mkv_subtitle_plane, sys->mkv_subtitle_source_id,
+             desc);
+    msg_Dbg(dec,
+            "edge264mvc ofmd extracted generation=%" PRIu64
+            " entries=%zu candidates=[%s]",
+            sys->ofmd_extracted.generation,
+            sys->ofmd_extracted.entry_count,
+            candidate_desc[0] != '\0' ? candidate_desc : "none");
+}
+
+static void MaybeLogSeiPayloadProbe(decoder_t *dec, edge264mvc_sys_t *sys,
+                                    const uint8_t *nal, const uint8_t *end)
+{
+    if (dec == NULL || sys == NULL || nal == NULL || end == NULL || nal >= end)
+        return;
+    RefreshMkvSubtitleMappingFromVars(dec, sys, false);
+    const bool want_ofmd_probe = HasMkvSubtitleMapping(sys) ||
+                                 (sys->log_sei && sys->ofmd_change_logs < EDGE264MVC_OFMD_LOG_MAX);
+    if (!sys->log_sei && !want_ofmd_probe)
+        return;
+    const bool want_sei37_summary = sys->log_sei && sys->sei_payload37_logs < 16;
+    const bool want_ofmd_change_log = want_ofmd_probe;
+    if (!want_sei37_summary && !want_ofmd_change_log)
+        return;
+    if ((nal[0] & 0x1f) != 6)
+        return;
+
+    uint8_t rbsp[1024];
+    const size_t nal_payload_len = (size_t)(end - nal - 1);
+    const size_t rbsp_len = BuildRbspSample(nal + 1, nal_payload_len,
+                                            rbsp, sizeof(rbsp));
+    size_t pos = 0;
+
+    while (pos + 1 < rbsp_len)
+    {
+        unsigned payload_type = 0;
+        unsigned payload_size = 0;
+
+        while (pos < rbsp_len)
+        {
+            const uint8_t byte = rbsp[pos++];
+            payload_type += byte;
+            if (byte != 0xff)
+                break;
+        }
+        while (pos < rbsp_len)
+        {
+            const uint8_t byte = rbsp[pos++];
+            payload_size += byte;
+            if (byte != 0xff)
+                break;
+        }
+
+        if (payload_size > rbsp_len - pos)
+            payload_size = (unsigned)(rbsp_len - pos);
+
+        if (payload_type == 37)
+        {
+            open3d_bitreader_t br = {
+                .buf = rbsp + pos,
+                .len = payload_size,
+                .bitpos = 0,
+            };
+            unsigned operation_point_flag = 0;
+            unsigned all_views_in_au_flag = 0;
+            unsigned num_view_components = 0;
+            unsigned view_ids[4] = { 0 };
+            unsigned sei_op_temporal_id = 0;
+            size_t view_count = 0;
+            const char *parse_state = "ok";
+            char nested_desc[192];
+            nested_desc[0] = '\0';
+
+            if (!BitReadU(&br, 1, &operation_point_flag))
+            {
+                parse_state = "truncated_op_flag";
+            }
+            else if (operation_point_flag == 0)
+            {
+                if (!BitReadU(&br, 1, &all_views_in_au_flag))
+                    parse_state = "truncated_all_views";
+                else if (all_views_in_au_flag == 0)
+                {
+                    if (!BitReadUE(&br, &num_view_components))
+                        parse_state = "truncated_num_views";
+                    else
+                    {
+                        view_count = (size_t)num_view_components + 1u;
+                        for (size_t i = 0; i < view_count; ++i)
+                        {
+                            unsigned ignored_flag = 0;
+                            if (!BitReadU(&br, 10, &view_ids[i < 4 ? i : 3]) ||
+                                !BitReadU(&br, 1, &ignored_flag))
+                            {
+                                parse_state = "truncated_view_list";
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                if (!BitReadUE(&br, &num_view_components))
+                    parse_state = "truncated_num_op_views";
+                else
+                {
+                    view_count = (size_t)num_view_components + 1u;
+                    for (size_t i = 0; i < view_count; ++i)
+                    {
+                        if (!BitReadU(&br, 10, &view_ids[i < 4 ? i : 3]))
+                        {
+                            parse_state = "truncated_op_view_list";
+                            break;
+                        }
+                    }
+                    if (strcmp(parse_state, "ok") == 0 &&
+                        !BitReadU(&br, 3, &sei_op_temporal_id))
+                        parse_state = "truncated_temporal_id";
+                }
+            }
+
+            size_t nested_pos = 0;
+            if (strcmp(parse_state, "ok") == 0)
+                nested_pos = BitAlignZeroPad(&br);
+
+            if (strcmp(parse_state, "ok") == 0 && nested_pos < payload_size)
+            {
+                size_t desc_pos = 0;
+                const uint8_t *nested = rbsp + pos + nested_pos;
+                size_t nested_len = payload_size - nested_pos;
+                size_t nested_off = 0;
+                unsigned nested_index = 0;
+                while (nested_off + 1 < nested_len && nested_index < 3)
+                {
+                    unsigned nested_type = 0;
+                    unsigned nested_size = 0;
+                    uint8_t byte = 0;
+
+                    do {
+                        byte = nested[nested_off++];
+                        nested_type += byte;
+                    } while (byte == 0xff && nested_off < nested_len);
+
+                    do {
+                        if (nested_off >= nested_len)
+                            break;
+                        byte = nested[nested_off++];
+                        nested_size += byte;
+                    } while (byte == 0xff && nested_off < nested_len);
+
+                    if (nested_size > nested_len - nested_off)
+                        nested_size = (unsigned)(nested_len - nested_off);
+
+                    if (nested_index > 0 && desc_pos + 2 < sizeof(nested_desc))
+                    {
+                        nested_desc[desc_pos++] = ',';
+                        nested_desc[desc_pos++] = ' ';
+                        nested_desc[desc_pos] = '\0';
+                    }
+
+                    if (nested_type == 5 && nested_size >= 16)
+                    {
+                        char uuid[40];
+                        char ofmd[256];
+                        ofmd[0] = '\0';
+                        FormatUuid(nested + nested_off, uuid, sizeof(uuid));
+                        if (IsOfmdUuid(nested + nested_off) && nested_size > 16)
+                        {
+                            MaybeLogOfmdChange(dec, sys,
+                                               nested + nested_off + 16,
+                                               nested_size - 16);
+                            if (want_sei37_summary)
+                            {
+                                BuildOfmdProbeDesc(nested + nested_off + 16,
+                                                   nested_size - 16,
+                                                   sys->mkv_subtitle_plane,
+                                                   ofmd, sizeof(ofmd));
+                            }
+                        }
+                        desc_pos += (size_t)snprintf(
+                            nested_desc + desc_pos, sizeof(nested_desc) - desc_pos,
+                            "type=5 uuid=%s %s", uuid,
+                            ofmd[0] != '\0' ? ofmd : "sig=n/a");
+                    }
+                    else
+                    {
+                        desc_pos += (size_t)snprintf(
+                            nested_desc + desc_pos, sizeof(nested_desc) - desc_pos,
+                            "type=%u size=%u", nested_type, nested_size);
+                    }
+
+                    nested_off += nested_size;
+                    nested_index++;
+                }
+            }
+
+            if (want_sei37_summary)
+            {
+                sys->sei_payload37_logs++;
+                if (strcmp(parse_state, "ok") == 0)
+                {
+                    msg_Info(dec,
+                             "edge264mvc sei37 sample=%u size=%u op=%u all_views=%u views=%zu first_view=%u temporal_id=%u nested=[%s]",
+                             sys->sei_payload37_logs, payload_size,
+                             operation_point_flag, all_views_in_au_flag,
+                             view_count, view_count > 0 ? view_ids[0] : 0,
+                             sei_op_temporal_id,
+                             nested_desc[0] != '\0' ? nested_desc : "none");
+                }
+                else
+                {
+                    char hex_sample[3 * 24];
+                    const size_t sample_len = payload_size < 24 ? payload_size : 24;
+                    BytesToHexSample(rbsp + pos, sample_len, hex_sample, sizeof(hex_sample));
+                    msg_Info(dec,
+                             "edge264mvc sei37 sample=%u size=%u parse=%s bytes=%s%s",
+                             sys->sei_payload37_logs, payload_size, parse_state,
+                             hex_sample[0] != '\0' ? hex_sample : "(empty)",
+                             (sample_len < payload_size) ? " ..." : "");
+                }
+            }
+        }
+
+        pos += payload_size;
+    }
 }
 
 static int OpenDecoder(vlc_object_t *);
@@ -425,6 +1263,9 @@ vlc_module_begin()
     add_bool("edge264mvc-log-frameids", false,
              EDGE264MVC_LOG_FRAMEIDS_TEXT,
              EDGE264MVC_LOG_FRAMEIDS_LONGTEXT, true)
+    add_bool("edge264mvc-log-sei", false,
+             EDGE264MVC_LOG_SEI_TEXT,
+             EDGE264MVC_LOG_SEI_LONGTEXT, true)
     add_integer("edge264mvc-frameid-log-every", 120,
                 EDGE264MVC_FRAMEID_LOG_EVERY_TEXT,
                 EDGE264MVC_FRAMEID_LOG_EVERY_LONGTEXT, true)
@@ -443,6 +1284,15 @@ vlc_module_begin()
     add_bool("edge264mvc-hold-right-on-backstep", false,
              EDGE264MVC_HOLD_RIGHT_BACKSTEP_TEXT,
              EDGE264MVC_HOLD_RIGHT_BACKSTEP_LONGTEXT, true)
+    add_bool("edge264mvc-use-pts-dates", false,
+             EDGE264MVC_USE_PTS_DATES_TEXT,
+             EDGE264MVC_USE_PTS_DATES_LONGTEXT, true)
+    add_integer("edge264mvc-ts-log-every", 0,
+                EDGE264MVC_TS_LOG_EVERY_TEXT,
+                EDGE264MVC_TS_LOG_EVERY_LONGTEXT, true)
+    add_bool("edge264mvc-normalize-ts-cadence", false,
+             EDGE264MVC_NORMALIZE_TS_CADENCE_TEXT,
+             EDGE264MVC_NORMALIZE_TS_CADENCE_LONGTEXT, true)
     set_callbacks(OpenDecoder, CloseDecoder)
 vlc_module_end()
 
@@ -481,7 +1331,8 @@ vlc_entry_license__3_0_0ft64(void)
 
 static bool IsExplicitOptIn(decoder_t *dec)
 {
-    if (dec->fmt_in.i_codec == OPEN3DBLURAYMVC_CODEC_MVC)
+    if (dec->fmt_in.i_codec == OPEN3DBLURAYMVC_CODEC_MVC ||
+        dec->fmt_in.i_codec == OPEN3DMKV_CODEC_H264)
         return true;
 
     char *codec_chain = var_InheritString(dec, "codec");
@@ -517,12 +1368,126 @@ static void TsQueueReset(edge264mvc_sys_t *sys)
     sys->ts_count = 0;
     sys->ts_next_seq = 0;
     sys->ts_last_seq = 0;
+    sys->ts_last_push = VLC_TICK_INVALID;
+    sys->ts_last_pop = VLC_TICK_INVALID;
+    sys->ts_last_push_seq = 0;
+    sys->ts_last_pop_seq = 0;
+    sys->ts_last_normalized = VLC_TICK_INVALID;
+    sys->ts_normalized_count = 0;
+}
+
+static vlc_tick_t ExpectedFramePeriod(const decoder_t *dec)
+{
+    unsigned rate = 0;
+    unsigned base = 0;
+
+    if (dec->fmt_out.video.i_frame_rate > 0 &&
+        dec->fmt_out.video.i_frame_rate_base > 0)
+    {
+        rate = dec->fmt_out.video.i_frame_rate;
+        base = dec->fmt_out.video.i_frame_rate_base;
+    }
+    else if (dec->fmt_in.video.i_frame_rate > 0 &&
+             dec->fmt_in.video.i_frame_rate_base > 0)
+    {
+        rate = dec->fmt_in.video.i_frame_rate;
+        base = dec->fmt_in.video.i_frame_rate_base;
+    }
+
+    if (rate == 0 || base == 0)
+        return VLC_TICK_INVALID;
+
+    return ((vlc_tick_t)VLC_TICK_FROM_SEC(1) * base) / rate;
+}
+
+static void MaybeLogTsCadence(decoder_t *dec, edge264mvc_sys_t *sys,
+                              bool push, uint64_t seq, vlc_tick_t ts,
+                              unsigned depth)
+{
+    if (sys->ts_log_every == 0 || ts <= VLC_TICK_INVALID || seq == 0)
+        return;
+
+    vlc_tick_t *last_ts = push ? &sys->ts_last_push : &sys->ts_last_pop;
+    uint64_t *last_seq = push ? &sys->ts_last_push_seq : &sys->ts_last_pop_seq;
+    const char *stage = push ? "push" : "pop";
+
+    if (*last_ts > VLC_TICK_INVALID && *last_seq > 0)
+    {
+        vlc_tick_t delta = ts - *last_ts;
+        uint64_t seq_delta = seq - *last_seq;
+        vlc_tick_t expected = ExpectedFramePeriod(dec);
+        bool anomaly = seq_delta != 1;
+
+        if (expected > VLC_TICK_INVALID)
+        {
+            vlc_tick_t abs_err = delta >= expected ? delta - expected : expected - delta;
+            if (abs_err > expected / 2)
+                anomaly = true;
+        }
+
+        if (anomaly || (seq % sys->ts_log_every) == 0)
+        {
+            msg_Dbg(dec,
+                    "edge264mvc ts cadence %s seq=%" PRIu64 " ts=%" PRId64
+                    " delta=%" PRId64 " seq_delta=%" PRIu64
+                    " expected=%" PRId64 " depth=%u anomaly=%d",
+                    stage, seq, (int64_t)ts, (int64_t)delta, seq_delta,
+                    (int64_t)expected, depth, anomaly ? 1 : 0);
+        }
+    }
+
+    *last_ts = ts;
+    *last_seq = seq;
+}
+
+static vlc_tick_t NormalizeQueuedTimestamp(decoder_t *dec, edge264mvc_sys_t *sys,
+                                           vlc_tick_t ts)
+{
+    if (!sys->normalize_ts_cadence || ts <= VLC_TICK_INVALID)
+        return ts;
+
+    vlc_tick_t expected = ExpectedFramePeriod(dec);
+    if (expected <= VLC_TICK_INVALID)
+        return ts;
+
+    if (sys->ts_last_normalized <= VLC_TICK_INVALID)
+    {
+        sys->ts_last_normalized = ts;
+        return ts;
+    }
+
+    vlc_tick_t delta = ts - sys->ts_last_normalized;
+    vlc_tick_t abs_err = delta >= expected ? delta - expected : expected - delta;
+    if (delta > 0 && abs_err <= expected / 2)
+    {
+        sys->ts_last_normalized = ts;
+        return ts;
+    }
+
+    vlc_tick_t normalized = sys->ts_last_normalized + expected;
+    sys->ts_last_normalized = normalized;
+    sys->ts_normalized_count++;
+
+    if (sys->ts_log_every > 0 &&
+        (sys->ts_normalized_count <= 16 ||
+         (sys->ts_normalized_count % sys->ts_log_every) == 0))
+    {
+        msg_Dbg(dec,
+                "edge264mvc normalized ts raw=%" PRId64 " delta=%" PRId64
+                " expected=%" PRId64 " normalized=%" PRId64 " count=%" PRIu64,
+                (int64_t)ts, (int64_t)delta, (int64_t)expected,
+                (int64_t)normalized, sys->ts_normalized_count);
+    }
+
+    return normalized;
 }
 
 static void TsQueuePush(decoder_t *dec, edge264mvc_sys_t *sys, vlc_tick_t ts)
 {
     if (ts <= VLC_TICK_INVALID)
         return;
+
+    ts = NormalizeQueuedTimestamp(dec, sys, ts);
 
     if (sys->ts_count == EDGE264MVC_TS_QUEUE_CAP)
     {
@@ -539,9 +1504,10 @@ static void TsQueuePush(decoder_t *dec, edge264mvc_sys_t *sys, vlc_tick_t ts)
     sys->ts_queue[tail] = ts;
     sys->ts_queue_seq[tail] = ++sys->ts_next_seq;
     sys->ts_count++;
+    MaybeLogTsCadence(dec, sys, true, sys->ts_next_seq, ts, sys->ts_count);
 }
 
-static vlc_tick_t TsQueuePop(edge264mvc_sys_t *sys, uint64_t *seq_out)
+static vlc_tick_t TsQueuePop(decoder_t *dec, edge264mvc_sys_t *sys, uint64_t *seq_out)
 {
     if (sys->ts_count == 0)
     {
@@ -557,6 +1523,7 @@ static vlc_tick_t TsQueuePop(edge264mvc_sys_t *sys, uint64_t *seq_out)
     sys->ts_last_seq = seq;
     if (seq_out != NULL)
         *seq_out = seq;
+    MaybeLogTsCadence(dec, sys, false, seq, ts, sys->ts_count);
     return ts;
 }
 
@@ -1233,6 +2200,12 @@ static bool EnsureOutputFormat(decoder_t *dec, edge264mvc_sys_t *sys,
         v->i_sar_den = 1;
     }
 
+    if (dec->fmt_in.video.i_frame_rate > 0 && dec->fmt_in.video.i_frame_rate_base > 0)
+    {
+        v->i_frame_rate = dec->fmt_in.video.i_frame_rate;
+        v->i_frame_rate_base = dec->fmt_in.video.i_frame_rate_base;
+    }
+
     if (has_stereo && sys->advertise_multiview)
         v->multiview_mode = MULTIVIEW_STEREO_SBS;
     else
@@ -1250,8 +2223,11 @@ static bool EnsureOutputFormat(decoder_t *dec, edge264mvc_sys_t *sys,
     sys->out_configured = true;
     RightHistoryReset(sys, false);
 
-    msg_Dbg(dec, "edge264mvc output format updated: %ux%u stereo=%d",
-            out_width, out_height, (int)has_stereo);
+    msg_Dbg(dec,
+            "edge264mvc output format updated: %ux%u stereo=%d fps=%u/%u sar=%u:%u",
+            out_width, out_height, (int)has_stereo,
+            v->i_frame_rate, v->i_frame_rate_base,
+            v->i_sar_num, v->i_sar_den);
     return true;
 }
 
@@ -1455,7 +2431,7 @@ static int QueueDecodedFrames(decoder_t *dec, edge264mvc_sys_t *sys)
         }
 
         uint64_t ts_seq = 0;
-        pic->date = TsQueuePop(sys, &ts_seq);
+        pic->date = TsQueuePop(dec, sys, &ts_seq);
         pic->b_progressive = true;
         pic->i_nb_fields = 2;
 
@@ -1847,6 +2823,7 @@ static int DecodeOneNAL(decoder_t *dec, edge264mvc_sys_t *sys,
     }
 
     DumpAnnexBNAL(dec, sys, nal, end);
+    MaybeLogSeiPayloadProbe(dec, sys, nal, end);
 
     const size_t nal_size = (size_t)(end - nal);
     edge264_nal_buf_t *nal_buf = Edge264NALBufAlloc(nal, nal_size);
@@ -2437,10 +3414,10 @@ static Edge264Decoder *AllocEdge264Decoder(decoder_t *dec, edge264mvc_sys_t *sys
 {
     Edge264Decoder *decoder =
         sys->api.alloc(thread_count,
-                       sys->log_frameids ? Edge264CoreLogCb : NULL,
-                       sys->log_frameids ? dec : NULL,
+                       (sys->log_frameids || sys->log_sei) ? Edge264CoreLogCb : NULL,
+                       (sys->log_frameids || sys->log_sei) ? dec : NULL,
                        0, NULL, NULL, NULL);
-    if (decoder == NULL && sys->log_frameids)
+    if (decoder == NULL && (sys->log_frameids || sys->log_sei))
     {
         msg_Warn(dec,
                  "edge264_alloc failed with core logger enabled; retrying without core logger");
@@ -2506,18 +3483,27 @@ static int OpenDecoder(vlc_object_t *obj)
 {
     decoder_t *dec = (decoder_t *)obj;
 
-    if (dec->fmt_in.i_codec != VLC_CODEC_H264 && dec->fmt_in.i_codec != OPEN3DBLURAYMVC_CODEC_MVC)
+    if (dec->fmt_in.i_codec != VLC_CODEC_H264 &&
+        dec->fmt_in.i_codec != OPEN3DBLURAYMVC_CODEC_MVC &&
+        dec->fmt_in.i_codec != OPEN3DMKV_CODEC_H264)
         return VLC_EGENERIC;
 
     msg_Dbg(dec,
-            "edge264mvc open request: codec=0x%8.8x id=%d width=%u height=%u packetized=%d",
+            "edge264mvc open request: codec=0x%8.8x id=%d width=%u height=%u packetized=%d fps=%u/%u sar=%u:%u",
             dec->fmt_in.i_codec,
             dec->fmt_in.i_id,
             dec->fmt_in.video.i_width,
             dec->fmt_in.video.i_height,
-            dec->fmt_in.b_packetized ? 1 : 0);
+            dec->fmt_in.b_packetized ? 1 : 0,
+            dec->fmt_in.video.i_frame_rate,
+            dec->fmt_in.video.i_frame_rate_base,
+            dec->fmt_in.video.i_sar_num,
+            dec->fmt_in.video.i_sar_den);
 
-    /* Keep this module opt-in only for now to avoid global AVC selection impact. */
+    /*
+     * Keep plain H.264 launcher-opt-in only, but allow our internal Matroska AVC
+     * tag and the Blu-ray MVC codec tag to route here automatically.
+     */
     if (!IsExplicitOptIn(dec))
         return VLC_EGENERIC;
 
@@ -2525,6 +3511,9 @@ static int OpenDecoder(vlc_object_t *obj)
     if (sys == NULL)
         return VLC_ENOMEM;
     vlc_mutex_init(&sys->lock);
+    ClearOfmdExtractedState(&sys->ofmd_extracted);
+    Open3DSubtitleDepthStateClear(&sys->ofmd_selected_depth);
+    sys->ofmd_selected_entry = -1;
 
     int ret = LoadEdge264Api(dec, sys);
     if (ret != VLC_SUCCESS)
@@ -2608,6 +3597,7 @@ static int OpenDecoder(vlc_object_t *obj)
     sys->recover_viewext_errors = var_InheritBool(dec, "edge264mvc-recover-viewext-errors");
     sys->advertise_multiview = var_InheritBool(dec, "edge264mvc-advertise-multiview");
     sys->log_frameids = var_InheritBool(dec, "edge264mvc-log-frameids");
+    sys->log_sei = var_InheritBool(dec, "edge264mvc-log-sei");
     int frameid_log_every = var_InheritInteger(dec, "edge264mvc-frameid-log-every");
     if (frameid_log_every < 0)
         frameid_log_every = 0;
@@ -2627,13 +3617,44 @@ static int OpenDecoder(vlc_object_t *obj)
     sys->gate_type20_max_skips = (unsigned)gate_max;
     sys->hold_right_on_backstep =
         var_InheritBool(dec, "edge264mvc-hold-right-on-backstep");
+    sys->use_pts_dates =
+        var_InheritBool(dec, "edge264mvc-use-pts-dates");
+    int ts_log_every = var_InheritInteger(dec, "edge264mvc-ts-log-every");
+    if (ts_log_every < 0)
+        ts_log_every = 0;
+    sys->ts_log_every = (unsigned)ts_log_every;
+    sys->normalize_ts_cadence =
+        var_InheritBool(dec, "edge264mvc-normalize-ts-cadence");
+    if (!sys->normalize_ts_cadence &&
+        dec->fmt_in.i_codec == OPEN3DMKV_CODEC_H264)
+    {
+        sys->normalize_ts_cadence = true;
+        msg_Dbg(dec,
+                "edge264mvc auto-enabled MKV timestamp normalization for internal mkv route");
+    }
+    bool mkv_bridge_present = false;
+    ReadMkvSubtitleMapping(dec, &mkv_bridge_present,
+                           &sys->mkv_subtitle_plane,
+                           &sys->mkv_subtitle_source_id);
+
+    if (sys->mkv_subtitle_plane >= 0 || sys->mkv_subtitle_source_id >= 0)
+    {
+        msg_Dbg(dec,
+                "edge264mvc selected MKV subtitle mapping plane=%d source_id=%d via=%s",
+                sys->mkv_subtitle_plane,
+                sys->mkv_subtitle_source_id,
+                mkv_bridge_present ? "bridge" : "inherited");
+        PublishSelectedMkvOfmdDepth(dec, sys);
+    }
     sys->seen_subset_sps = false;
     sys->warned_gate_limit = false;
     RightHistoryReset(sys, false);
 
     msg_Info(dec,
-             "edge264mvc open config: threads=%d frameid_log=%d frameid_every=%u",
-             thread_count, sys->log_frameids ? 1 : 0, sys->frameid_log_every);
+             "edge264mvc open config: threads=%d frameid_log=%d sei_log=%d frameid_every=%u use_pts_dates=%d ts_log_every=%u normalize_ts=%d",
+             thread_count, sys->log_frameids ? 1 : 0, sys->log_sei ? 1 : 0, sys->frameid_log_every,
+             sys->use_pts_dates ? 1 : 0, sys->ts_log_every,
+             sys->normalize_ts_cadence ? 1 : 0);
 
     sys->decoder = AllocEdge264Decoder(dec, sys, sys->current_thread_count);
     if (sys->decoder == NULL)
@@ -2770,12 +3791,16 @@ static int DecodeBlock(decoder_t *dec, block_t *block)
     }
 
     /*
-     * edge264 currently emits frames in decode-oriented order on this branch.
-     * Prefer DTS so queued picture dates stay monotonic with the emitted order;
-     * PTS can oscillate backwards on alternating B-picture output and visibly
-     * destabilize manual frame-step.
+     * Default to DTS because this branch emits frames in decode-oriented order.
+     * Keep PTS selection as an opt-in diagnostic for native MKV pacing work.
      */
-    vlc_tick_t ts = (block->i_dts > VLC_TICK_INVALID) ? block->i_dts : block->i_pts;
+    vlc_tick_t ts;
+    if (sys->use_pts_dates && block->i_pts > VLC_TICK_INVALID)
+        ts = block->i_pts;
+    else if (block->i_dts > VLC_TICK_INVALID)
+        ts = block->i_dts;
+    else
+        ts = block->i_pts;
     TsQueuePush(dec, sys, ts);
 
     const bool eos_hint = (block->i_flags & BLOCK_FLAG_END_OF_SEQUENCE) != 0;
@@ -2845,6 +3870,12 @@ static void CloseDecoder(vlc_object_t *obj)
 
     if (sys == NULL)
         return;
+
+    if (HasMkvSubtitleMapping(sys))
+    {
+        Open3DSubtitleDepthStateClear(&sys->ofmd_selected_depth);
+        PublishSelectedMkvOfmdDepth(dec, sys);
+    }
 
     if (sys->decoder != NULL)
         sys->api.free_decoder(&sys->decoder);

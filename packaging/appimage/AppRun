@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APPDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OPEN3D_SCRIPT_DIR="${APPDIR}/usr/lib/open3doled/scripts"
+isolation_prefix=()
+isolation_vlc_args=()
+selected_media=""
+selected_demux=""
+needs_edge264=0
+mkv_plane_map_tmp=""
+media_ext_lc=""
+user_codec_set=0
+user_vout_set=0
+user_intf_set=0
+user_demux_set=0
+user_extraintf_set=0
+user_mkv_static_offset_set=0
+user_mkv_subtitle_force_set=0
+user_mkv_plane_set=0
+user_mkv_source_id_set=0
+user_edge264mvc_normalize_ts_set=0
+media_arg_index=-1
+
+if [[ -f "${OPEN3D_SCRIPT_DIR}/open3d_process_isolation.sh" ]]; then
+  # shellcheck source=/dev/null
+  . "${OPEN3D_SCRIPT_DIR}/open3d_process_isolation.sh"
+fi
+if [[ -f "${OPEN3D_SCRIPT_DIR}/open3d_media_routing.sh" ]]; then
+  # shellcheck source=/dev/null
+  . "${OPEN3D_SCRIPT_DIR}/open3d_media_routing.sh"
+fi
+if [[ -f "${OPEN3D_SCRIPT_DIR}/open3d_launcher_media_helpers.sh" ]]; then
+  # shellcheck source=/dev/null
+  . "${OPEN3D_SCRIPT_DIR}/open3d_launcher_media_helpers.sh"
+fi
+
+cleanup() {
+  if [[ -n "${mkv_plane_map_tmp}" && -f "${mkv_plane_map_tmp}" ]]; then
+    rm -f "${mkv_plane_map_tmp}"
+  fi
+}
+trap cleanup EXIT
+
+seed_isolated_media_library() {
+  local media_library_path="$1"
+
+  [[ -n "${media_library_path}" ]] || return 0
+  if [[ -f "${media_library_path}" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "${media_library_path}")"
+  cat >"${media_library_path}" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<playlist version="1" xmlns="http://xspf.org/ns/0/">
+  <title>Media Library</title>
+  <trackList/>
+</playlist>
+EOF
+}
+
+prepare_isolated_state_dirs() {
+  local state_name config_home data_home cache_home state_home media_library_path
+
+  if [[ "${OPEN3D_APPIMAGE_ISOLATE_STATE:-1}" != "1" ]]; then
+    return 0
+  fi
+  if [[ -z "${HOME:-}" ]]; then
+    printf '%s\n' "open3d appimage: HOME is not set, skipping state isolation" >&2
+    return 0
+  fi
+
+  state_name="${OPEN3D_APPIMAGE_STATE_NAME:-open3doled-vlc-appimage}"
+  config_home="${OPEN3D_APPIMAGE_XDG_CONFIG_HOME:-${HOME}/.config/${state_name}}"
+  data_home="${OPEN3D_APPIMAGE_XDG_DATA_HOME:-${HOME}/.local/share/${state_name}}"
+  cache_home="${OPEN3D_APPIMAGE_XDG_CACHE_HOME:-${HOME}/.cache/${state_name}}"
+  state_home="${OPEN3D_APPIMAGE_XDG_STATE_HOME:-${HOME}/.local/state/${state_name}}"
+
+  mkdir -p \
+    "${config_home}" \
+    "${data_home}" \
+    "${cache_home}" \
+    "${state_home}" \
+    "${config_home}/vlc" \
+    "${data_home}/vlc"
+
+  export XDG_CONFIG_HOME="${config_home}"
+  export XDG_DATA_HOME="${data_home}"
+  export XDG_CACHE_HOME="${cache_home}"
+  export XDG_STATE_HOME="${state_home}"
+
+  media_library_path="${XDG_DATA_HOME}/vlc/ml.xspf"
+  seed_isolated_media_library "${media_library_path}"
+}
+
+append_unique_path() {
+  local var_name="$1"
+  local path_value="$2"
+  local current entry
+
+  [[ -n "${path_value}" ]] || return 0
+  [[ -d "${path_value}" ]] || return 0
+
+  current="${!var_name:-}"
+  IFS=':' read -r -a current_entries <<<"${current}"
+  for entry in "${current_entries[@]}"; do
+    if [[ "${entry}" == "${path_value}" ]]; then
+      return 0
+    fi
+  done
+
+  if [[ -n "${current}" ]]; then
+    printf -v "${var_name}" '%s:%s' "${current}" "${path_value}"
+  else
+    printf -v "${var_name}" '%s' "${path_value}"
+  fi
+}
+
+start_x11_window_tuner() {
+  if [[ "${OPEN3D_X11_BYPASS_COMPOSITOR:-0}" != "1" ]]; then
+    return 0
+  fi
+  if [[ -z "${DISPLAY:-}" ]]; then
+    printf '%s\n' "open3d appimage: DISPLAY is not set, skipping x11 tuner"
+    return 0
+  fi
+  if [[ ! -x "${OPEN3D_SCRIPT_DIR}/open3d_x11_window_tuner.sh" ]]; then
+    return 0
+  fi
+  "${OPEN3D_SCRIPT_DIR}/open3d_x11_window_tuner.sh" "$$" bypass_compositor &
+}
+
+prepare_launcher_log() {
+  local log_tag="$1"
+  local log_root="${OPEN3D_VLC_LOG_DIR:-}"
+  local timestamp
+  timestamp="$(date +%Y%m%d_%H%M%S)"
+
+  if [[ -n "${OPEN3D_VLC_LOG_PATH:-}" ]]; then
+    printf '%s\n' "${OPEN3D_VLC_LOG_PATH}"
+    return 0
+  fi
+
+  if [[ -z "${log_root}" ]]; then
+    return 1
+  fi
+
+  mkdir -p "${log_root}"
+  printf '%s/%s_%s_pid%s.log\n' "${log_root}" "${log_tag}" "${timestamp}" "$$"
+}
+
+export VLC_PLUGIN_PATH="${APPDIR}/usr/lib/vlc/plugins"
+export VLC_DATA_PATH="${APPDIR}/usr/share/vlc"
+export LD_LIBRARY_PATH="${APPDIR}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export QT_PLUGIN_PATH="${APPDIR}/usr/lib/qt5/plugins"
+export QT_QPA_PLATFORM_PLUGIN_PATH="${APPDIR}/usr/lib/qt5/plugins/platforms"
+export QT_QPA_PLATFORMTHEME="${QT_QPA_PLATFORMTHEME:-}"
+export QT_STYLE_OVERRIDE="${QT_STYLE_OVERRIDE:-}"
+export QT_IM_MODULE="${QT_IM_MODULE:-compose}"
+if [[ -z "${QT_QPA_PLATFORM:-}" ]]; then
+  if [[ "${XDG_SESSION_TYPE:-}" == "wayland" && -n "${WAYLAND_DISPLAY:-}" ]]; then
+    export QT_QPA_PLATFORM=wayland
+  elif [[ "${XDG_SESSION_TYPE:-}" == "x11" && -n "${DISPLAY:-}" ]]; then
+    export QT_QPA_PLATFORM=xcb
+  fi
+fi
+prepare_isolated_state_dirs
+if [[ "${OPEN3D_APPIMAGE_ENABLE_BDJ:-0}" == "1" ]]; then
+  if [[ -d "${APPDIR}/usr/share/java" ]]; then
+    export LIBBLURAY_CP="${APPDIR}/usr/share/java/"
+  fi
+else
+  unset LIBBLURAY_CP || true
+fi
+export EDGE264MVC_LIB="${EDGE264MVC_LIB:-${APPDIR}/usr/lib/libedge264.so.1}"
+export OPEN3D_MVC_FORCE_SEPARATE_INSTANCE="${OPEN3D_MVC_FORCE_SEPARATE_INSTANCE:-1}"
+export OPEN3D_MVC_ENABLE_VOUT="${OPEN3D_MVC_ENABLE_VOUT:-1}"
+export OPEN3D_MVC_NO_PLUGINS_CACHE="${OPEN3D_MVC_NO_PLUGINS_CACHE:-1}"
+export OPEN3D_MVC_IGNORE_CONFIG="${OPEN3D_MVC_IGNORE_CONFIG:-1}"
+export OPEN3D_PROCESS_CPUSET="${OPEN3D_PROCESS_CPUSET:-4-7}"
+export OPEN3D_PROCESS_CPU_BACKEND="${OPEN3D_PROCESS_CPU_BACKEND:-auto}"
+export OPEN3D_PRESENTER_PREFERRED_CPU="${OPEN3D_PRESENTER_PREFERRED_CPU:-auto}"
+export OPEN3D_PROCESS_IO_CLASS="${OPEN3D_PROCESS_IO_CLASS:-best-effort}"
+export OPEN3D_PROCESS_IO_PRIORITY="${OPEN3D_PROCESS_IO_PRIORITY:-0}"
+export OPEN3DBLURAYMVC_HOOK_LOG="${OPEN3DBLURAYMVC_HOOK_LOG:-1}"
+export OPEN3D_MVC_VLC_VERBOSE="${OPEN3D_MVC_VLC_VERBOSE:-3}"
+export EDGE264MVC_THREADS="${EDGE264MVC_THREADS:--1}"
+if [[ -z "${EDGE264MVC_EXTRA_ARGS:-}" ]]; then
+  export EDGE264MVC_EXTRA_ARGS="--no-edge264mvc-advertise-multiview"
+elif ! grep -Eq -- '(^|[[:space:]])--(no-)?edge264mvc-advertise-multiview([[:space:]]|$)' <<<"${EDGE264MVC_EXTRA_ARGS}"; then
+  export EDGE264MVC_EXTRA_ARGS="${EDGE264MVC_EXTRA_ARGS} --no-edge264mvc-advertise-multiview"
+fi
+
+user_args=("$@")
+open3d_scan_user_args app_scan "${user_args[@]}"
+media_arg_index="${app_scan_media_arg_index}"
+user_codec_set="${app_scan_user_codec_set}"
+user_vout_set="${app_scan_user_vout_set}"
+user_intf_set="${app_scan_user_intf_set}"
+user_demux_set="${app_scan_user_demux_set}"
+user_extraintf_set="${app_scan_user_extraintf_set}"
+user_mkv_static_offset_set="${app_scan_user_mkv_static_offset_set}"
+user_mkv_subtitle_force_set="${app_scan_user_mkv_subtitle_force_set}"
+user_mkv_plane_set="${app_scan_user_mkv_plane_set}"
+user_mkv_source_id_set="${app_scan_user_mkv_source_id_set}"
+user_edge264mvc_normalize_ts_set="${app_scan_user_edge264mvc_normalize_ts_set}"
+
+if (( media_arg_index >= 0 )); then
+  selected_media="${user_args[media_arg_index]}"
+  if declare -F open3d_media_route_path >/dev/null 2>&1 &&
+     open3d_media_route_path "${selected_media}"; then
+    selected_media="${OPEN3D_MEDIA_SELECTED}"
+    selected_demux="${OPEN3D_MEDIA_DEMUX}"
+    needs_edge264="${OPEN3D_MEDIA_NEEDS_EDGE264}"
+    media_ext_lc="${OPEN3D_MEDIA_EXT_LC}"
+    user_args[media_arg_index]="${selected_media}"
+  fi
+fi
+
+vlc_args=(
+  --no-metadata-network-access
+  --no-video-title-show
+  --no-qt-privacy-ask
+  --no-qt-error-dialogs
+)
+
+if [[ "${OPEN3D_MVC_FORCE_SEPARATE_INSTANCE}" == "1" ]]; then
+  vlc_args+=(--no-one-instance)
+fi
+if [[ "${user_intf_set}" == "0" ]]; then
+  vlc_args+=(--intf qt)
+fi
+if [[ "${user_extraintf_set}" == "0" ]]; then
+  vlc_args+=(--extraintf=)
+fi
+if [[ "${user_vout_set}" == "0" ]]; then
+  if [[ "${OPEN3D_MVC_ENABLE_VOUT}" == "1" ]]; then
+    vlc_args+=(--vout=open3d)
+  else
+    vlc_args+=(--vout=gl)
+  fi
+fi
+if [[ "${OPEN3D_MVC_NO_PLUGINS_CACHE}" == "1" ]]; then
+  vlc_args+=(--no-plugins-cache)
+fi
+if [[ "${OPEN3D_MVC_IGNORE_CONFIG}" == "1" ]]; then
+  vlc_args+=(--ignore-config)
+fi
+if [[ "${OPEN3D_MVC_ENABLE_VOUT}" == "1" ]]; then
+  vlc_args+=(
+    --open3d-enable
+    --open3d-emitter-enable
+    --open3d-emitter-tty=auto
+  )
+fi
+if [[ -n "${EDGE264MVC_EXTRA_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  extra_decoder_args=( ${EDGE264MVC_EXTRA_ARGS} )
+  vlc_args+=("${extra_decoder_args[@]}")
+fi
+if [[ -n "${selected_demux}" && "${user_demux_set}" == "0" ]]; then
+  vlc_args+=("--demux=${selected_demux}")
+fi
+if [[ "${needs_edge264}" == "1" && "${user_codec_set}" == "0" ]]; then
+  vlc_args+=("--codec=edge264mvc,avcodec")
+fi
+if [[ "${media_ext_lc}" == "mkv" &&
+      "${user_edge264mvc_normalize_ts_set}" == "0" ]]; then
+  vlc_args+=(--edge264mvc-normalize-ts-cadence)
+  printf '%s\n' "open3d appimage: MKV timestamp normalization enabled"
+fi
+
+if [[ "${media_ext_lc}" == "mkv" &&
+      "${OPEN3D_MVC_ENABLE_VOUT}" == "1" &&
+      ( "${user_mkv_static_offset_set}" == "0" ||
+        "${user_mkv_subtitle_force_set}" == "0" ||
+        "${user_mkv_plane_set}" == "0" ||
+        "${user_mkv_source_id_set}" == "0" ) ]]; then
+  if user_sub_track="$(open3d_extract_user_sub_track user_args 2>/dev/null)" &&
+     [[ "${user_sub_track}" =~ ^-?[0-9]+$ ]] &&
+     (( user_sub_track >= 0 )); then
+    if plane_map_path="$(open3d_resolve_mkv_plane_map_path "${OPEN3D_SCRIPT_DIR}" "${selected_media}")"; then
+      mkv_plane_map_tmp="${plane_map_path}"
+      mkv_offset_info="$(open3d_lookup_mkv_subtitle_static_offset "${plane_map_path}" "${user_sub_track}" || true)"
+      IFS='|' read -r mkv_static_units mkv_plane mkv_language mkv_stream_index mkv_source_id <<<"${mkv_offset_info}"
+      if [[ -n "${mkv_stream_index:-}" ]]; then
+        mkv_source_id_normalized="${mkv_source_id:-}"
+        if [[ -n "${mkv_source_id_normalized}" && "${mkv_source_id_normalized}" =~ ^[0-9]+$ ]]; then
+          mkv_source_id_normalized="$((10#${mkv_source_id_normalized}))"
+        fi
+        if [[ "${user_mkv_subtitle_force_set}" == "0" ]]; then
+          vlc_args+=("--open3d-mkv-subtitle-force")
+        fi
+        if [[ -n "${mkv_static_units:-}" && "${user_mkv_static_offset_set}" == "0" ]]; then
+          vlc_args+=("--open3d-mkv-subtitle-static-offset-units=${mkv_static_units}")
+        fi
+        if [[ -n "${mkv_plane:-}" && "${user_mkv_plane_set}" == "0" ]]; then
+          vlc_args+=("--open3d-mkv-subtitle-plane=${mkv_plane}")
+        fi
+        if [[ -n "${mkv_source_id_normalized:-}" && "${user_mkv_source_id_set}" == "0" ]]; then
+          vlc_args+=("--open3d-mkv-subtitle-source-id=${mkv_source_id_normalized}")
+        fi
+        printf '%s\n' \
+          "open3d appimage: MKV subtitle metadata sub_track=${user_sub_track} stream_index=${mkv_stream_index:-} language=${mkv_language:-} plane=${mkv_plane:-} source_id=${mkv_source_id_normalized:-${mkv_source_id:-}} units=${mkv_static_units:-} map=${plane_map_path}"
+      fi
+    fi
+  fi
+fi
+
+if declare -F open3d_isolation_build_exec_prefix >/dev/null 2>&1; then
+  open3d_isolation_build_exec_prefix isolation_prefix
+fi
+if declare -F open3d_isolation_append_presenter_args >/dev/null 2>&1; then
+  open3d_isolation_append_presenter_args isolation_vlc_args "${vlc_args[@]}" "${user_args[@]}"
+fi
+
+start_x11_window_tuner
+
+if log_path="$(prepare_launcher_log appimage_playback 2>/dev/null)"; then
+  mkdir -p "$(dirname "${log_path}")"
+  printf '%s\n' "Playback log: ${log_path}"
+  exec > >(tee -a "${log_path}") 2>&1
+fi
+
+exec "${isolation_prefix[@]}" "${OPEN3D_SCRIPT_DIR}/open3d_exec_with_state_log.sh" \
+  "${APPDIR}/usr/bin/vlc" \
+  "${vlc_args[@]}" \
+  "${isolation_vlc_args[@]}" \
+  "${user_args[@]}"

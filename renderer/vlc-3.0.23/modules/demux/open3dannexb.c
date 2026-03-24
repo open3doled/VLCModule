@@ -1,5 +1,5 @@
 /**
- * @file open3dmkv.c
+ * @file open3dannexb.c
  * @brief Minimal Open3D MVC Annex-B passthrough demux for VLC 3.0.23
  */
 
@@ -17,7 +17,7 @@
 #include <vlc_plugin.h>
 #include <vlc_stream.h>
 
-#define OPEN3DMKV_PASSTHROUGH_BLOCK (64u * 1024u)
+#define OPEN3DANNEXB_PASSTHROUGH_BLOCK (64u * 1024u)
 
 typedef struct
 {
@@ -36,7 +36,7 @@ typedef struct
     uint64_t ctrl_set_time;
     uint64_t ctrl_set_pos;
     uint64_t ctrl_other;
-} open3dmkv_sys_t;
+} open3dannexb_sys_t;
 
 static int Open(vlc_object_t *);
 static void Close(vlc_object_t *);
@@ -44,12 +44,12 @@ static int Demux(demux_t *);
 static int Control(demux_t *, int, va_list);
 
 vlc_module_begin()
-    set_shortname(N_("Open3D MKV"))
+    set_shortname(N_("Open3D Annex-B"))
     set_description(N_("Open3D MVC Annex-B passthrough demux"))
     set_capability("demux", 7)
     set_category(CAT_INPUT)
     set_subcategory(SUBCAT_INPUT_DEMUX)
-    add_shortcut("open3dmkv")
+    add_shortcut("open3dannexb")
     set_callbacks(Open, Close)
 vlc_module_end()
 
@@ -100,13 +100,13 @@ static int64_t tick_to_ms_or_neg1(vlc_tick_t tick)
     return (tick == VLC_TICK_INVALID) ? -1 : MS_FROM_VLC_TICK(tick);
 }
 
-static void arm_output_discontinuity(open3dmkv_sys_t *sys)
+static void arm_output_discontinuity(open3dannexb_sys_t *sys)
 {
     if (sys != NULL)
         sys->mark_next_discontinuity = true;
 }
 
-static void apply_output_discontinuity(open3dmkv_sys_t *sys, block_t *out)
+static void apply_output_discontinuity(open3dannexb_sys_t *sys, block_t *out)
 {
     if (sys == NULL || out == NULL || !sys->mark_next_discontinuity)
         return;
@@ -116,7 +116,7 @@ static void apply_output_discontinuity(open3dmkv_sys_t *sys, block_t *out)
     sys->output_discontinuity_marks++;
 }
 
-static void seed_seek_target_clock(demux_t *demux, open3dmkv_sys_t *sys, vlc_tick_t target_time)
+static void seed_seek_target_clock(demux_t *demux, open3dannexb_sys_t *sys, vlc_tick_t target_time)
 {
     if (demux == NULL || sys == NULL || target_time == VLC_TICK_INVALID || target_time < 0)
         return;
@@ -128,11 +128,11 @@ static void seed_seek_target_clock(demux_t *demux, open3dmkv_sys_t *sys, vlc_tic
     sys->next_pts = target_time;
     arm_output_discontinuity(sys);
 
-    msg_Info(demux, "open3dmkv seek clock preseed: target_ms=%" PRId64,
+    msg_Info(demux, "open3dannexb seek clock preseed: target_ms=%" PRId64,
              tick_to_ms_or_neg1(target_time));
 }
 
-static void reset_runtime_state(open3dmkv_sys_t *sys)
+static void reset_runtime_state(open3dannexb_sys_t *sys)
 {
     if (sys == NULL)
         return;
@@ -154,7 +154,7 @@ static int Open(vlc_object_t *obj)
     if (!demux->obj.force && !has_annexb_extension(demux->psz_file))
         return VLC_EGENERIC;
 
-    open3dmkv_sys_t *sys = calloc(1, sizeof(*sys));
+    open3dannexb_sys_t *sys = calloc(1, sizeof(*sys));
     if (sys == NULL)
         return VLC_ENOMEM;
 
@@ -174,7 +174,7 @@ static int Open(vlc_object_t *obj)
     demux->pf_demux = Demux;
     demux->pf_control = Control;
 
-    msg_Info(demux, "open3dmkv Annex-B passthrough mode enabled");
+    msg_Info(demux, "open3dannexb Annex-B passthrough mode enabled");
     return VLC_SUCCESS;
 
 error:
@@ -189,13 +189,13 @@ error:
 static void Close(vlc_object_t *obj)
 {
     demux_t *demux = (demux_t *)obj;
-    open3dmkv_sys_t *sys = (open3dmkv_sys_t *)demux->p_sys;
+    open3dannexb_sys_t *sys = (open3dannexb_sys_t *)demux->p_sys;
 
     if (sys == NULL)
         return;
 
     msg_Info(demux,
-             "open3dmkv summary: passthrough_blocks=%" PRIu64
+             "open3dannexb summary: passthrough_blocks=%" PRIu64
              " output_discont=%" PRIu64
              " ctrl(get_time=%" PRIu64 ",get_len=%" PRIu64 ",get_pos=%" PRIu64
              ",set_time=%" PRIu64 ",set_pos=%" PRIu64 ",other=%" PRIu64 ")",
@@ -213,9 +213,9 @@ static void Close(vlc_object_t *obj)
 
 static int Demux(demux_t *demux)
 {
-    open3dmkv_sys_t *sys = (open3dmkv_sys_t *)demux->p_sys;
+    open3dannexb_sys_t *sys = (open3dannexb_sys_t *)demux->p_sys;
 
-    block_t *chunk = vlc_stream_Block(demux->s, OPEN3DMKV_PASSTHROUGH_BLOCK);
+    block_t *chunk = vlc_stream_Block(demux->s, OPEN3DANNEXB_PASSTHROUGH_BLOCK);
     if (chunk == NULL || chunk->i_buffer == 0)
     {
         if (chunk != NULL)
@@ -244,7 +244,7 @@ static int Demux(demux_t *demux)
 
 static int Control(demux_t *demux, int query, va_list args)
 {
-    open3dmkv_sys_t *sys = (open3dmkv_sys_t *)demux->p_sys;
+    open3dannexb_sys_t *sys = (open3dannexb_sys_t *)demux->p_sys;
 
     switch (query)
     {
@@ -326,7 +326,7 @@ static int Control(demux_t *demux, int query, va_list args)
             const uint64_t from_off = vlc_stream_Tell(demux->s);
             if (target_time == 0 && vlc_stream_Seek(demux->s, 0) == 0)
             {
-                msg_Info(demux, "open3dmkv seek_time: mode=origin from_off=%" PRIu64, from_off);
+                msg_Info(demux, "open3dannexb seek_time: mode=origin from_off=%" PRIu64, from_off);
                 seed_seek_target_clock(demux, sys, 0);
                 va_end(helper_args);
                 return VLC_SUCCESS;
@@ -349,7 +349,7 @@ static int Control(demux_t *demux, int query, va_list args)
                     if (vlc_stream_Seek(demux->s, target) == 0)
                     {
                         msg_Info(demux,
-                                 "open3dmkv seek_time: mode=ratio from_off=%" PRIu64
+                                 "open3dannexb seek_time: mode=ratio from_off=%" PRIu64
                                  " target_off=%" PRIu64 " target_ms=%" PRId64,
                                  from_off, target, MS_FROM_VLC_TICK(target_time));
                         seed_seek_target_clock(demux, sys, (vlc_tick_t)target_time);
@@ -364,7 +364,7 @@ static int Control(demux_t *demux, int query, va_list args)
             if (ret == VLC_SUCCESS)
             {
                 msg_Info(demux,
-                         "open3dmkv seek_time: mode=helper from_off=%" PRIu64
+                         "open3dannexb seek_time: mode=helper from_off=%" PRIu64
                          " target_ms=%" PRId64 " landed_off=%" PRIu64,
                          from_off, MS_FROM_VLC_TICK(target_time), vlc_stream_Tell(demux->s));
                 seed_seek_target_clock(demux, sys, (vlc_tick_t)target_time);
@@ -406,7 +406,7 @@ static int Control(demux_t *demux, int query, va_list args)
                 return VLC_EGENERIC;
 
             msg_Info(demux,
-                     "open3dmkv seek_pos: from_off=%" PRIu64
+                     "open3dannexb seek_pos: from_off=%" PRIu64
                      " target_off=%" PRIu64 " position=%.5f target_ms=%" PRId64,
                      from_off, target, f, tick_to_ms_or_neg1(target_time));
 

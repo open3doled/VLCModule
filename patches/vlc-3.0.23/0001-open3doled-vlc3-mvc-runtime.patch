@@ -28,10 +28,198 @@ index dd04391..5de2705 100644
  libedummy_plugin_la_SOURCES = codec/edummy.c
  if ENABLE_SOUT
  codec_LTLIBRARIES += libedummy_plugin.la
+diff --git a/modules/control/Makefile.am b/modules/control/Makefile.am
+index 2469a86..7557dac 100644
+--- a/modules/control/Makefile.am
++++ b/modules/control/Makefile.am
+@@ -1,8 +1,10 @@
+ controldir = $(pluginsdir)/control
+ 
+ libdummy_plugin_la_SOURCES = control/dummy.c control/intromsg.h
++libdummy_plugin_la_CFLAGS = $(AM_CFLAGS) $(DUMMY_PLUGIN_CFLAGS)
+ libgestures_plugin_la_SOURCES = control/gestures.c
+ libhotkeys_plugin_la_SOURCES = control/hotkeys.c
++libhotkeys_plugin_la_CFLAGS = $(AM_CFLAGS) $(HOTKEYS_PLUGIN_CFLAGS)
+ libhotkeys_plugin_la_LIBADD = $(LIBM)
+ libnetsync_plugin_la_SOURCES = control/netsync.c
+ libnetsync_plugin_la_LIBADD = $(SOCKET_LIBS)
+@@ -53,7 +55,7 @@ control_LTLIBRARIES += libdbus_plugin.la
+ endif
+ 
+ libxcb_hotkeys_plugin_la_SOURCES = control/globalhotkeys/xcb.c
+-libxcb_hotkeys_plugin_la_CFLAGS = $(AM_CFLAGS) \
++libxcb_hotkeys_plugin_la_CFLAGS = $(AM_CFLAGS) $(XCB_HOTKEYS_PLUGIN_CFLAGS) \
+ 	$(XCB_KEYSYMS_CFLAGS) $(XCB_CFLAGS)
+ libxcb_hotkeys_plugin_la_LIBADD = $(XCB_KEYSYMS_LIBS) $(XCB_LIBS)
+ if HAVE_XCB_KEYSYMS
+diff --git a/modules/control/dummy.c b/modules/control/dummy.c
+index 4e0406d..633d896 100644
+--- a/modules/control/dummy.c
++++ b/modules/control/dummy.c
+@@ -33,6 +33,44 @@
+ #include <vlc_common.h>
+ #include <vlc_plugin.h>
+ #include <vlc_interface.h>
++/*
++ * Host distro VLC 3.0.x builds may look for the Debian/Ubuntu t64 module
++ * entry symbol even when building against the upstream 3.0.23 source tree.
++ * Export both entry names so the staged plugin can be loaded by the host
++ * launcher without affecting the AppImage runtime.
++ */
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
++extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
++extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
++EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
++
++EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
++vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
++{
++    return vlc_entry__3_0_0f(vlc_set, opaque);
++}
++
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
++vlc_entry_copyright__3_0_0ft64(void)
++{
++    return vlc_entry_copyright__3_0_0f();
++}
++
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
++vlc_entry_license__3_0_0ft64(void)
++{
++    return vlc_entry_license__3_0_0f();
++}
++#ifdef __cplusplus
++}
++#endif
++
++
+ 
+ #ifdef _WIN32
+ #define QUIET_TEXT N_("Do not open a DOS command box interface")
+diff --git a/modules/control/globalhotkeys/xcb.c b/modules/control/globalhotkeys/xcb.c
+index 3fa8a10..74f8caa 100644
+--- a/modules/control/globalhotkeys/xcb.c
++++ b/modules/control/globalhotkeys/xcb.c
+@@ -36,6 +36,44 @@
+ #include <X11/XF86keysym.h>
+ 
+ #include <poll.h>
++/*
++ * Host distro VLC 3.0.x builds may look for the Debian/Ubuntu t64 module
++ * entry symbol even when building against the upstream 3.0.23 source tree.
++ * Export both entry names so the staged plugin can be loaded by the host
++ * launcher without affecting the AppImage runtime.
++ */
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
++extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
++extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
++EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
++
++EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
++vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
++{
++    return vlc_entry__3_0_0f(vlc_set, opaque);
++}
++
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
++vlc_entry_copyright__3_0_0ft64(void)
++{
++    return vlc_entry_copyright__3_0_0f();
++}
++
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
++vlc_entry_license__3_0_0ft64(void)
++{
++    return vlc_entry_license__3_0_0f();
++}
++#ifdef __cplusplus
++}
++#endif
++
++
+ 
+ /*****************************************************************************
+  * Local prototypes
+@@ -225,7 +263,6 @@ end:
+     return 0;
+ }
+ 
+-
+ static unsigned GetX11Modifier( xcb_connection_t *p_connection,
+         xcb_key_symbols_t *p_symbols, unsigned i_vlc )
+ {
+diff --git a/modules/control/hotkeys.c b/modules/control/hotkeys.c
+index a699d4f..bdadfe6 100644
+--- a/modules/control/hotkeys.c
++++ b/modules/control/hotkeys.c
+@@ -41,6 +41,44 @@
+ #include <vlc_playlist.h>
+ #include <vlc_actions.h>
+ #include "math.h"
++/*
++ * Host distro VLC 3.0.x builds may look for the Debian/Ubuntu t64 module
++ * entry symbol even when building against the upstream 3.0.23 source tree.
++ * Export both entry names so the staged plugin can be loaded by the host
++ * launcher without affecting the AppImage runtime.
++ */
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
++extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
++extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
++EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
++
++EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
++vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
++{
++    return vlc_entry__3_0_0f(vlc_set, opaque);
++}
++
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
++vlc_entry_copyright__3_0_0ft64(void)
++{
++    return vlc_entry_copyright__3_0_0f();
++}
++
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
++vlc_entry_license__3_0_0ft64(void)
++{
++    return vlc_entry_license__3_0_0f();
++}
++#ifdef __cplusplus
++}
++#endif
++
++
+ 
+ #include <assert.h>
+ 
 diff --git a/modules/demux/Makefile.am b/modules/demux/Makefile.am
-index dbb6a10..0f33035 100644
+index dbb6a10..948d8fc 100644
 --- a/modules/demux/Makefile.am
 +++ b/modules/demux/Makefile.am
+@@ -199,7 +199,7 @@ libmkv_plugin_la_SOURCES = \
+         demux/av1_unpack.h codec/webvtt/helpers.h \
+ 	demux/windows_audio_commons.h
+ libmkv_plugin_la_SOURCES += packetizer/dts_header.h packetizer/dts_header.c
+-libmkv_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) $(CFLAGS_mkv)
++libmkv_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) $(CFLAGS_mkv) $(MKV_PLUGIN_CFLAGS)
+ libmkv_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(demuxdir)'
+ libmkv_plugin_la_LIBADD = $(LIBS_mkv)
+ if HAVE_ZLIB
 @@ -280,12 +280,23 @@ libts_plugin_la_SOURCES = demux/mpeg/ts.c demux/mpeg/ts.h \
  	codec/opus_header.c
  libts_plugin_la_CFLAGS = $(AM_CFLAGS) $(DVBPSI_CFLAGS)
@@ -56,25 +244,575 @@ index dbb6a10..0f33035 100644
  endif
  
  libvlc_adaptive_la_SOURCES = \
+diff --git a/modules/demux/mkv/matroska_segment.cpp b/modules/demux/mkv/matroska_segment.cpp
+index 2f66525..078e7fe 100644
+--- a/modules/demux/mkv/matroska_segment.cpp
++++ b/modules/demux/mkv/matroska_segment.cpp
+@@ -32,6 +32,147 @@
+ #include <new>
+ #include <iterator>
+ #include <limits>
++#include <cstdlib>
++#include <cerrno>
++#include <cctype>
++
++
++static std::string Open3DMkvTagUpper(const std::string &input)
++{
++    std::string out = input;
++    for (size_t i = 0; i < out.size(); ++i)
++        out[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(out[i])));
++    return out;
++}
++
++static bool Open3DMkvTagPlaneKey(const std::string &key)
++{
++    const std::string upper = Open3DMkvTagUpper(key);
++    if (upper == "3D-PLANE")
++        return true;
++    return upper.size() > 9 && upper.compare(0, 9, "3D-PLANE-") == 0;
++}
++
++static bool Open3DMkvTagSourceIdKey(const std::string &key)
++{
++    const std::string upper = Open3DMkvTagUpper(key);
++    if (upper == "SOURCE_ID")
++        return true;
++    return upper.size() > 10 && upper.compare(0, 10, "SOURCE_ID-") == 0;
++}
++
++static bool Open3DMkvParseInt(const std::string &value, int *out)
++{
++    if (out == NULL || value.empty())
++        return false;
++
++    char *end = NULL;
++    errno = 0;
++    long parsed = std::strtol(value.c_str(), &end, 10);
++    if (errno != 0 || end == value.c_str() || *end != '\0' ||
++        parsed < INT_MIN || parsed > INT_MAX)
++        return false;
++
++    *out = static_cast<int>(parsed);
++    return true;
++}
++
++static void Open3DMkvCollectTrackMetadataFromSimpleTag(
++    const SimpleTag &simple,
++    bool *have_plane,
++    int *plane,
++    bool *have_source_id,
++    int *source_id)
++{
++    if (Open3DMkvTagPlaneKey(simple.tag_name))
++    {
++        int parsed_plane = -1;
++        if (Open3DMkvParseInt(simple.value, &parsed_plane))
++        {
++            if (plane != NULL)
++                *plane = parsed_plane;
++            if (have_plane != NULL)
++                *have_plane = true;
++        }
++    }
++    else if (Open3DMkvTagSourceIdKey(simple.tag_name))
++    {
++        int parsed_source_id = -1;
++        if (Open3DMkvParseInt(simple.value, &parsed_source_id))
++        {
++            if (source_id != NULL)
++                *source_id = parsed_source_id;
++            if (have_source_id != NULL)
++                *have_source_id = true;
++        }
++    }
++
++    for (size_t i = 0; i < simple.sub_tags.size(); ++i)
++    {
++        Open3DMkvCollectTrackMetadataFromSimpleTag(simple.sub_tags[i],
++                                                   have_plane, plane,
++                                                   have_source_id, source_id);
++    }
++}
++
++static mkv_track_t *Open3DMkvFindTrackByUid(matroska_segment_c::tracks_map_t &tracks,
++                                            uint64_t uid)
++{
++    if (uid == 0)
++        return NULL;
++
++    for (matroska_segment_c::tracks_map_t::iterator it = tracks.begin();
++         it != tracks.end(); ++it)
++    {
++        mkv_track_t *track = it->second.get();
++        if (track != NULL && track->i_uid == uid)
++            return track;
++    }
++    return NULL;
++}
++
++static void Open3DMkvApplyTrackSubtitleTag(matroska_segment_c &segment,
++                                           const Tag &tag)
++{
++    if (tag.i_tag_type != TRACK_UID)
++        return;
++
++    mkv_track_t *track = Open3DMkvFindTrackByUid(segment.tracks, tag.i_uid);
++    if (track == NULL || track->fmt.i_cat != SPU_ES)
++        return;
++
++    bool have_plane = false;
++    bool have_source_id = false;
++    int plane = -1;
++    int source_id = -1;
++    for (size_t i = 0; i < tag.simple_tags.size(); ++i)
++    {
++        Open3DMkvCollectTrackMetadataFromSimpleTag(tag.simple_tags[i],
++                                                   &have_plane, &plane,
++                                                   &have_source_id, &source_id);
++    }
++    if (!have_plane && !have_source_id)
++        return;
++
++    track->b_open3d_mkv_subtitle_metadata = true;
++    track->i_open3d_mkv_subtitle_plane = have_plane ? plane : -1;
++    track->i_open3d_mkv_subtitle_source_id = have_source_id ? source_id : -1;
++    track->i_open3d_mkv_subtitle_static_offset_units = have_plane ? plane : 0;
++
++    msg_Dbg(&segment.sys.demuxer,
++            "open3d mkv subtitle metadata track=%u uid=%" PRIu64 " plane=%d source_id=%d static_units=%d",
++            track->i_number, track->i_uid,
++            track->i_open3d_mkv_subtitle_plane,
++            track->i_open3d_mkv_subtitle_source_id,
++            track->i_open3d_mkv_subtitle_static_offset_units);
++}
++
++static void Open3DMkvApplyTrackSubtitleTags(matroska_segment_c &segment)
++{
++    for (size_t i = 0; i < segment.tags.size(); ++i)
++        Open3DMkvApplyTrackSubtitleTag(segment, segment.tags[i]);
++}
++
+ 
+ matroska_segment_c::matroska_segment_c( demux_sys_t & demuxer, EbmlStream & estream, KaxSegment *p_seg )
+     :segment(p_seg)
+@@ -456,6 +597,7 @@ void matroska_segment_c::LoadTags( KaxTags *tags )
+         }
+     }
+ 
++    Open3DMkvApplyTrackSubtitleTags(*this);
+     msg_Dbg( &sys.demuxer, "loading tags done." );
+ }
+ 
+diff --git a/modules/demux/mkv/matroska_segment_parse.cpp b/modules/demux/mkv/matroska_segment_parse.cpp
+index 9e5e985..c35681e 100644
+--- a/modules/demux/mkv/matroska_segment_parse.cpp
++++ b/modules/demux/mkv/matroska_segment_parse.cpp
+@@ -38,6 +38,7 @@ extern "C" {
+ }
+ 
+ #include <vlc_codecs.h>
++#define OPEN3DMKV_CODEC_H264 VLC_FOURCC('m','k','v','h')
+ #include <stdexcept>
+ #include <limits>
+ #include <algorithm>
+@@ -267,11 +268,13 @@ void matroska_segment_c::ParseTrackEntry( const KaxTrackEntry *m )
+         E_CASE( KaxTrackNumber, tnum )
+         {
+             vars.tk->i_number = static_cast<uint32>( tnum );
++            vars.tk->fmt.i_id = static_cast<int>( vars.tk->i_number );
+             debug( vars, "Track Number=%u", vars.tk->i_number );
+         }
+         E_CASE( KaxTrackUID, tuid )
+         {
+-            debug( vars, "Track UID=%x", static_cast<uint32>( tuid ) );
++            vars.tk->i_uid = static_cast<uint64>( tuid );
++            debug( vars, "Track UID=%" PRIu64, vars.tk->i_uid );
+         }
+         E_CASE( KaxTrackType, ttype )
+         {
+@@ -1546,7 +1549,7 @@ bool matroska_segment_c::TrackInit( mkv_track_t * p_tk )
+             vars.p_fmt->i_codec = VLC_CODEC_DIV3;
+         }
+         S_CASE("V_MPEG4/ISO/AVC") {
+-            vars.p_fmt->i_codec = VLC_FOURCC( 'a','v','c','1' );
++            vars.p_fmt->i_codec = OPEN3DMKV_CODEC_H264;
+             fill_extra_data( vars.p_tk, 0 );
+         }
+         S_CASE_GLOB("V_MPEG4/ISO*") {
+diff --git a/modules/demux/mkv/mkv.cpp b/modules/demux/mkv/mkv.cpp
+index 2a252a1..bcb5070 100644
+--- a/modules/demux/mkv/mkv.cpp
++++ b/modules/demux/mkv/mkv.cpp
+@@ -43,6 +43,278 @@ extern "C" {
+ #include <vlc_fs.h>
+ #include <vlc_url.h>
+ 
++#if defined(OPEN3D_VLC_ABI_ALIAS_T64)
++/*
++ * Host distro VLC 3.0.x builds may look for the Debian/Ubuntu t64 module
++ * entry symbol even when building against the upstream 3.0.23 source tree.
++ * Export both entry names so the staged mkv plugin can be loaded by the host
++ * launcher without affecting the AppImage runtime.
++ */
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
++extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
++extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
++EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
++
++EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
++vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
++{
++    return vlc_entry__3_0_0f(vlc_set, opaque);
++}
++
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
++vlc_entry_copyright__3_0_0ft64(void)
++{
++    return vlc_entry_copyright__3_0_0f();
++}
++
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
++vlc_entry_license__3_0_0ft64(void)
++{
++    return vlc_entry_license__3_0_0f();
++}
++#ifdef __cplusplus
++}
++#endif
++#endif
++
++#include <vlc_variables.h>
++#include "../../video_output/open3d_subtitle_bridge.h"
++
++
++static void Open3DMkvSubtitlePublishSelection(demux_sys_t *p_sys,
++                                              bool available,
++                                              bool force,
++                                              int static_units,
++                                              int plane,
++                                              int source_id)
++{
++    if (p_sys == NULL || p_sys->demuxer.obj.libvlc == NULL)
++        return;
++
++    Open3DMkvSubtitleBridgePublishToObject(
++        VLC_OBJECT(p_sys->demuxer.obj.libvlc),
++        available, force, static_units, plane, source_id);
++}
++
++static bool Open3DMkvSubtitleResolveTrackByEsId(const demux_sys_t *p_sys,
++                                                int i_spu_es_id,
++                                                int *plane_out,
++                                                int *source_id_out,
++                                                int *static_units_out)
++{
++    if (plane_out != NULL)
++        *plane_out = -1;
++    if (source_id_out != NULL)
++        *source_id_out = -1;
++    if (static_units_out != NULL)
++        *static_units_out = 0;
++
++    if (p_sys == NULL || i_spu_es_id < 0)
++        return false;
++
++    for (size_t i_stream = 0; i_stream < p_sys->streams.size(); ++i_stream)
++    {
++        const matroska_stream_c *stream = p_sys->streams[i_stream];
++        if (stream == NULL)
++            continue;
++
++        for (size_t i_segment = 0; i_segment < stream->segments.size(); ++i_segment)
++        {
++            const matroska_segment_c *segment = stream->segments[i_segment];
++            if (segment == NULL)
++                continue;
++
++            for (matroska_segment_c::tracks_map_t::const_iterator it = segment->tracks.begin();
++                 it != segment->tracks.end(); ++it)
++            {
++                const mkv_track_t &track = *it->second;
++                if (track.fmt.i_cat != SPU_ES || track.fmt.i_id != i_spu_es_id)
++                    continue;
++
++                if (!track.b_open3d_mkv_subtitle_metadata)
++                    return false;
++
++                if (plane_out != NULL)
++                    *plane_out = track.i_open3d_mkv_subtitle_plane;
++                if (source_id_out != NULL)
++                    *source_id_out = track.i_open3d_mkv_subtitle_source_id;
++                if (static_units_out != NULL)
++                    *static_units_out = track.i_open3d_mkv_subtitle_static_offset_units;
++                return true;
++            }
++        }
++    }
++
++    return false;
++}
++
++static bool Open3DMkvSubtitleResolveTrackByStartupPrefs(
++    const demux_sys_t *p_sys,
++    int *plane_out,
++    int *source_id_out,
++    int *static_units_out,
++    int *track_id_out,
++    int *track_index_out)
++{
++    if (plane_out != NULL)
++        *plane_out = -1;
++    if (source_id_out != NULL)
++        *source_id_out = -1;
++    if (static_units_out != NULL)
++        *static_units_out = 0;
++    if (track_id_out != NULL)
++        *track_id_out = -1;
++    if (track_index_out != NULL)
++        *track_index_out = -1;
++
++    if (p_sys == NULL)
++        return false;
++
++    const int sub_track_id = var_InheritInteger(&p_sys->demuxer, "sub-track-id");
++    if (sub_track_id >= 0)
++    {
++        int plane = -1;
++        int source_id = -1;
++        int static_units = 0;
++        if (Open3DMkvSubtitleResolveTrackByEsId(p_sys, sub_track_id,
++                                                &plane, &source_id, &static_units))
++        {
++            if (plane_out != NULL)
++                *plane_out = plane;
++            if (source_id_out != NULL)
++                *source_id_out = source_id;
++            if (static_units_out != NULL)
++                *static_units_out = static_units;
++            if (track_id_out != NULL)
++                *track_id_out = sub_track_id;
++            return true;
++        }
++    }
++
++    const int sub_track = var_InheritInteger(&p_sys->demuxer, "sub-track");
++    if (sub_track < 0)
++        return false;
++
++    int subtitle_index = 0;
++    for (size_t i_stream = 0; i_stream < p_sys->streams.size(); ++i_stream)
++    {
++        const matroska_stream_c *stream = p_sys->streams[i_stream];
++        if (stream == NULL)
++            continue;
++
++        for (size_t i_segment = 0; i_segment < stream->segments.size(); ++i_segment)
++        {
++            const matroska_segment_c *segment = stream->segments[i_segment];
++            if (segment == NULL)
++                continue;
++
++            for (matroska_segment_c::tracks_map_t::const_iterator it = segment->tracks.begin();
++                 it != segment->tracks.end(); ++it)
++            {
++                const mkv_track_t &track = *it->second;
++                if (track.fmt.i_cat != SPU_ES)
++                    continue;
++                if (subtitle_index++ != sub_track)
++                    continue;
++
++                if (!track.b_open3d_mkv_subtitle_metadata)
++                    return false;
++
++                if (plane_out != NULL)
++                    *plane_out = track.i_open3d_mkv_subtitle_plane;
++                if (source_id_out != NULL)
++                    *source_id_out = track.i_open3d_mkv_subtitle_source_id;
++                if (static_units_out != NULL)
++                    *static_units_out = track.i_open3d_mkv_subtitle_static_offset_units;
++                if (track_id_out != NULL)
++                    *track_id_out = track.fmt.i_id;
++                if (track_index_out != NULL)
++                    *track_index_out = sub_track;
++                return true;
++            }
++        }
++    }
++
++    return false;
++}
++
++static void Open3DMkvSubtitleSyncSelection(demux_sys_t *p_sys)
++{
++    if (p_sys == NULL)
++        return;
++
++    int plane = -1;
++    int source_id = -1;
++    int static_units = 0;
++    if (p_sys->p_input != NULL)
++    {
++        const int i_spu_es_id = var_GetInteger(p_sys->p_input, "spu-es");
++        if (Open3DMkvSubtitleResolveTrackByEsId(p_sys, i_spu_es_id,
++                                                &plane, &source_id, &static_units))
++        {
++            Open3DMkvSubtitlePublishSelection(p_sys, true, true,
++                                             static_units, plane, source_id);
++            msg_Dbg(&p_sys->demuxer,
++                    "open3d mkv subtitle mapping synced: spu-es=%d plane=%d source_id=%d static_units=%d",
++                    i_spu_es_id, plane, source_id, static_units);
++            return;
++        }
++    }
++
++    int startup_track_id = -1;
++    int startup_track_index = -1;
++    if (Open3DMkvSubtitleResolveTrackByStartupPrefs(
++            p_sys, &plane, &source_id, &static_units,
++            &startup_track_id, &startup_track_index))
++    {
++        Open3DMkvSubtitlePublishSelection(p_sys, true, true,
++                                         static_units, plane, source_id);
++        if (startup_track_id >= 0)
++        {
++            msg_Dbg(&p_sys->demuxer,
++                    "open3d mkv startup subtitle preference: sub-track-id=%d plane=%d source_id=%d static_units=%d",
++                    startup_track_id, plane, source_id, static_units);
++        }
++        else
++        {
++            msg_Dbg(&p_sys->demuxer,
++                    "open3d mkv startup subtitle preference: sub-track=%d plane=%d source_id=%d static_units=%d",
++                    startup_track_index, plane, source_id, static_units);
++        }
++        return;
++    }
++
++    Open3DMkvSubtitlePublishSelection(p_sys, true, false, 0, -1, -1);
++    if (p_sys->p_input != NULL)
++    {
++        const int i_spu_es_id = var_GetInteger(p_sys->p_input, "spu-es");
++        if (i_spu_es_id >= 0)
++        {
++            msg_Dbg(&p_sys->demuxer,
++                    "open3d mkv subtitle mapping cleared for spu-es=%d",
++                    i_spu_es_id);
++        }
++    }
++}
++
++static int Open3DMkvSubtitleTrackCallback(vlc_object_t *obj, char const *name,
++                                          vlc_value_t oldval, vlc_value_t newval,
++                                          void *opaque)
++{
++    VLC_UNUSED(obj);
++    VLC_UNUSED(name);
++    VLC_UNUSED(oldval);
++    VLC_UNUSED(newval);
++
++    Open3DMkvSubtitleSyncSelection(static_cast<demux_sys_t *>(opaque));
++    return VLC_SUCCESS;
++}
++
+ /*****************************************************************************
+  * Module descriptor
+  *****************************************************************************/
+@@ -52,7 +324,7 @@ static void Close( vlc_object_t * );
+ vlc_module_begin ()
+     set_shortname( "Matroska" )
+     set_description( N_("Matroska stream demuxer" ) )
+-    set_capability( "demux", 50 )
++    set_capability( "demux", 60 )
+     set_callbacks( Open, Close )
+     set_category( CAT_INPUT )
+     set_subcategory( SUBCAT_INPUT_DEMUX )
+@@ -115,6 +387,12 @@ static int Open( vlc_object_t * p_this )
+     p_demux->pf_control = Control;
+     p_demux->p_sys      = p_sys = new demux_sys_t( *p_demux );
+ 
++    p_sys->p_input = p_demux->p_input;
++    Open3DMkvSubtitlePublishSelection(p_sys, false, false, 0, -1, -1);
++    if (p_sys->p_input != NULL)
++        var_AddCallback(p_sys->p_input, "spu-es",
++                        Open3DMkvSubtitleTrackCallback, p_sys);
++
+     p_stream = new matroska_stream_c( p_demux->s, false );
+     if ( unlikely(p_stream == NULL) )
+     {
+@@ -251,6 +529,7 @@ static int Open( vlc_object_t * p_this )
+         goto error;
+     }
+ 
++    Open3DMkvSubtitleSyncSelection(p_sys);
+     p_sys->InitUi();
+ 
+     return VLC_SUCCESS;
+@@ -267,6 +546,10 @@ static void Close( vlc_object_t *p_this )
+ {
+     demux_t     *p_demux = reinterpret_cast<demux_t*>( p_this );
+     demux_sys_t *p_sys   = p_demux->p_sys;
++    if (p_sys != NULL && p_sys->p_input != NULL)
++        var_DelCallback(p_sys->p_input, "spu-es",
++                        Open3DMkvSubtitleTrackCallback, p_sys);
++    Open3DMkvSubtitlePublishSelection(p_sys, false, false, 0, -1, -1);
+     virtual_segment_c *p_vsegment = p_sys->p_current_vsegment;
+     if( p_vsegment )
+     {
+@@ -832,6 +1115,11 @@ mkv_track_t::mkv_track_t(enum es_format_category_e es_cat) :
+   ,b_enabled(true)
+   ,b_forced(false)
+   ,i_number(0)
++  ,i_uid(0)
++  ,b_open3d_mkv_subtitle_metadata(false)
++  ,i_open3d_mkv_subtitle_plane(-1)
++  ,i_open3d_mkv_subtitle_source_id(-1)
++  ,i_open3d_mkv_subtitle_static_offset_units(0)
+   ,i_extra_data(0)
+   ,p_extra_data(NULL)
+   ,b_dts_only(false)
+diff --git a/modules/demux/mkv/mkv.hpp b/modules/demux/mkv/mkv.hpp
+index 8497d08..9a9de04 100644
+--- a/modules/demux/mkv/mkv.hpp
++++ b/modules/demux/mkv/mkv.hpp
+@@ -203,6 +203,12 @@ class mkv_track_t
+         bool         b_enabled;
+         bool         b_forced;
+         track_id_t   i_number;
++        uint64_t     i_uid;
++
++        bool         b_open3d_mkv_subtitle_metadata;
++        int          i_open3d_mkv_subtitle_plane;
++        int          i_open3d_mkv_subtitle_source_id;
++        int          i_open3d_mkv_subtitle_static_offset_units;
+ 
+         unsigned int i_extra_data;
+         uint8_t      *p_extra_data;
 diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
-index 4449304..5b5551f 100644
+index 4449304..f1d04bc 100644
 --- a/modules/demux/mpeg/ts.c
 +++ b/modules/demux/mpeg/ts.c
-@@ -63,6 +63,40 @@
+@@ -63,6 +63,42 @@
  
  #include <assert.h>
  
-+#if defined(__GNUC__) || defined(__clang__)
-+# define OPEN3D_TSMVC_VISIBILITY __attribute__((visibility("default")))
-+#else
-+# define OPEN3D_TSMVC_VISIBILITY
-+#endif
++#if defined(OPEN3D_VLC_ABI_ALIAS_T64)
++# if defined(__GNUC__) || defined(__clang__)
++#  define OPEN3D_TSMVC_VISIBILITY __attribute__((visibility("default")))
++# else
++#  define OPEN3D_TSMVC_VISIBILITY
++# endif
 +
-+#if defined(_WIN32)
-+# define OPEN3D_TSMVC_EXPORT __declspec(dllexport)
-+#else
-+# define OPEN3D_TSMVC_EXPORT
-+#endif
++# if defined(_WIN32)
++#  define OPEN3D_TSMVC_EXPORT __declspec(dllexport)
++# else
++#  define OPEN3D_TSMVC_EXPORT
++# endif
 +
 +extern int vlc_entry__3_0_0f( vlc_set_cb, void * );
 +extern const char *vlc_entry_copyright__3_0_0f( void );
@@ -97,11 +835,12 @@ index 4449304..5b5551f 100644
 +{
 +    return vlc_entry_license__3_0_0f();
 +}
++#endif
 +
  /*****************************************************************************
   * Module descriptor
   *****************************************************************************/
-@@ -169,7 +203,7 @@ vlc_module_begin ()
+@@ -169,7 +205,7 @@ vlc_module_begin ()
  
      set_capability( "demux", 10 )
      set_callbacks( Open, Close )
@@ -110,7 +849,7 @@ index 4449304..5b5551f 100644
  vlc_module_end ()
  
  /*****************************************************************************
-@@ -365,6 +399,7 @@ static int Open( vlc_object_t *p_this )
+@@ -365,6 +401,7 @@ static int Open( vlc_object_t *p_this )
  {
      demux_t     *p_demux = (demux_t*)p_this;
      demux_sys_t *p_sys;
@@ -181,11 +920,406 @@ index 449d5fd..9dfdecc 100644
  /*****************************************************************************
   * Module descriptor
   *****************************************************************************/
+diff --git a/modules/gui/qt/Makefile.am b/modules/gui/qt/Makefile.am
+index 2d59ded..0953a43 100644
+--- a/modules/gui/qt/Makefile.am
++++ b/modules/gui/qt/Makefile.am
+@@ -16,7 +16,7 @@ libqt_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) \
+ 	-DQT_USE_QSTRINGBUILDER \
+ 	-DQT_NO_CAST_FROM_BYTEARRAY \
+ 	-I$(srcdir)/gui/qt -I$(builddir)/gui/qt
+-libqt_plugin_la_CXXFLAGS = $(AM_CXXFLAGS) $(QT_CFLAGS) $(CXXFLAGS_qt)
++libqt_plugin_la_CXXFLAGS = $(AM_CXXFLAGS) $(QT_CFLAGS) $(QT_PLUGIN_CFLAGS) $(CXXFLAGS_qt)
+ libqt_plugin_la_LIBADD = $(QT_LIBS) $(LIBS_qt) $(LIBM)
+ libqt_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(guidir)'
+ if HAVE_DARWIN
+diff --git a/modules/gui/qt/components/open_panels.cpp b/modules/gui/qt/components/open_panels.cpp
+index 6a9bf6c..fa4f4a1 100644
+--- a/modules/gui/qt/components/open_panels.cpp
++++ b/modules/gui/qt/components/open_panels.cpp
+@@ -41,6 +41,7 @@
+ #include <vlc_plugin.h>
+ 
+ #include <QFileDialog>
++#include <QFileInfo>
+ #include <QDialogButtonBox>
+ #include <QLineEdit>
+ #include <QStackedLayout>
+@@ -342,10 +343,12 @@ DiscOpenPanel::DiscOpenPanel( QWidget *_parent, intf_thread_t *_p_intf ) :
+     /* CONNECTs */
+     BUTTONACT( ui.dvdRadioButton,     updateButtons() );
+     BUTTONACT( ui.bdRadioButton,      updateButtons() );
++    BUTTONACT( ui.open3dBluRayIsoRadioButton, updateButtons() );
+     BUTTONACT( ui.vcdRadioButton,     updateButtons() );
+     BUTTONACT( ui.audioCDRadioButton, updateButtons() );
+     BUTTONACT( ui.dvdsimple,          updateButtons() );
+     BUTTONACT( ui.browseDiscButton, browseDevice() );
++    BUTTONACT( ui.browseImageButton, browseImage() );
+     BUTTON_SET_ACT_I( ui.ejectButton, "", toolbar/eject, qtr( "Eject the disc" ),
+             eject() );
+ 
+@@ -477,6 +480,8 @@ void DiscOpenPanel::clear()
+ /* update the buttons according the type of device */
+ void DiscOpenPanel::updateButtons()
+ {
++    const bool is_open3d_bluray = isOpen3DBluRaySelection();
++
+     if ( ui.dvdRadioButton->isChecked() )
+     {
+         if( m_discType != Dvd )
+@@ -490,12 +495,13 @@ void DiscOpenPanel::updateButtons()
+         ui.diskOptionBox_2->show();
+         ui.dvdsimple->setEnabled( true );
+     }
+-    else if ( ui.bdRadioButton->isChecked() )
++    else if ( ui.bdRadioButton->isChecked() || is_open3d_bluray )
+     {
+-        if( m_discType != BRD )
++        const DiscType bluray_type = is_open3d_bluray ? Open3dBRD : BRD;
++        if( m_discType != bluray_type )
+         {
+             setDrive( psz_dvddiscpath );
+-            m_discType = BRD;
++            m_discType = bluray_type;
+             ui.dvdsimple->setChecked( !var_InheritBool( p_intf, "bluray-menu" ) );
+         }
+         ui.titleLabel->setText( qtr("Title") );
+@@ -531,6 +537,8 @@ void DiscOpenPanel::updateButtons()
+         ui.dvdsimple->setEnabled( false );
+     }
+ 
++    ui.browseImageButton->setVisible( is_open3d_bluray );
++    ui.browseImageButton->setEnabled( is_open3d_bluray );
+     updateMRL();
+ }
+ 
+@@ -548,6 +556,9 @@ void DiscOpenPanel::updateMRL()
+     if( tmp != -1 &&  ui.deviceCombo->itemData( tmp ) != QVariant::Invalid )
+         discPath = ui.deviceCombo->itemData( tmp ).toString();
+ 
++    if( isOpen3DBluRaySelection() )
++        discPath = normalizeOpen3DBlurayPath( discPath );
++
+     /* MRL scheme */
+     const char *scheme;
+     /* DVD */
+@@ -558,6 +569,8 @@ void DiscOpenPanel::updateMRL()
+             scheme = "dvdsimple";
+     } else if ( ui.bdRadioButton->isChecked() )
+         scheme = "bluray";
++    else if ( isOpen3DBluRaySelection() )
++        scheme = "open3dbluraymvc";
+     /* VCD */
+     else if ( ui.vcdRadioButton->isChecked() )
+         scheme = "vcd";
+@@ -572,7 +585,7 @@ void DiscOpenPanel::updateMRL()
+     /* Title/chapter encoded in MRL */
+     QString anchor = "";
+     if( ui.titleSpin->value() > 0 ) {
+-        if( ui.dvdRadioButton->isChecked() || ui.bdRadioButton->isChecked() ) {
++        if( ui.dvdRadioButton->isChecked() || ui.bdRadioButton->isChecked() || isOpen3DBluRaySelection() ) {
+             anchor = QString("#%1").arg( ui.titleSpin->value() );
+             if ( ui.chapterSpin->value() > 0 )
+                 anchor += QString(":%1").arg( ui.chapterSpin->value() );
+@@ -603,7 +616,7 @@ void DiscOpenPanel::updateMRL()
+         if( ui.titleSpin->value() > 0 )
+             opts += QString(" :cdda-track=%1").arg( ui.titleSpin->value() );
+     }
+-    else if ( ui.bdRadioButton->isChecked() )
++    else if ( ui.bdRadioButton->isChecked() || isOpen3DBluRaySelection() )
+     {
+         if ( ui.dvdsimple->isChecked() )
+             opts += " :no-bluray-menu";
+@@ -611,6 +624,47 @@ void DiscOpenPanel::updateMRL()
+     emit mrlUpdated( fileList, opts );
+ }
+ 
++bool DiscOpenPanel::isOpen3DBluRaySelection() const
++{
++    return ui.open3dBluRayIsoRadioButton->isChecked();
++}
++
++QString DiscOpenPanel::normalizeOpen3DBlurayPath( const QString& inputPath ) const
++{
++    QFileInfo info( inputPath );
++    if( !info.exists() )
++        return inputPath;
++
++    if( info.isFile() )
++    {
++        if( info.suffix().compare( QStringLiteral( "iso" ), Qt::CaseInsensitive ) == 0 )
++            return info.canonicalFilePath();
++
++        if( info.fileName().compare( QStringLiteral( "index.bdmv" ), Qt::CaseInsensitive ) == 0 )
++        {
++            const QDir bdmvDir = info.dir();
++            if( bdmvDir.dirName().compare( QStringLiteral( "BDMV" ), Qt::CaseInsensitive ) == 0 )
++                return QFileInfo( QDir( bdmvDir.absolutePath() ).filePath( QStringLiteral( ".." ) ) ).canonicalFilePath();
++        }
++        return info.canonicalFilePath();
++    }
++
++    if( info.isDir() )
++    {
++        QDir dir( info.canonicalFilePath() );
++        if( dir.dirName().compare( QStringLiteral( "BDMV" ), Qt::CaseInsensitive ) == 0 &&
++            QFileInfo( dir.filePath( QStringLiteral( "index.bdmv" ) ) ).exists() )
++        {
++            return QFileInfo( dir.filePath( QStringLiteral( ".." ) ) ).canonicalFilePath();
++        }
++
++        if( QFileInfo( dir.filePath( QStringLiteral( "BDMV/index.bdmv" ) ) ).exists() )
++            return dir.absolutePath();
++    }
++
++    return info.canonicalFilePath();
++}
++
+ void DiscOpenPanel::browseDevice()
+ {
+     const QStringList schemes = QStringList(QStringLiteral("file"));
+@@ -626,6 +680,26 @@ void DiscOpenPanel::browseDevice()
+     updateMRL();
+ }
+ 
++void DiscOpenPanel::browseImage()
++{
++    const QStringList schemes = QStringList(QStringLiteral("file"));
++    const QUrl startUrl = p_intf->p_sys->filepath;
++    const QUrl fileUrl = QFileDialog::getOpenFileUrl( this,
++            qtr( "Select a Blu-ray ISO image" ), startUrl,
++            qtr( "Blu-ray ISO image (*.iso);;All files (*)" ), nullptr,
++            QFileDialog::DontUseNativeDialog, schemes );
++    const QString path = fileUrl.toLocalFile();
++    if( path.isEmpty() )
++        return;
++
++    p_intf->p_sys->filepath = fileUrl;
++    ui.open3dBluRayIsoRadioButton->setChecked( true );
++    const QString nativePath = toNativeSepNoSlash( path );
++    ui.deviceCombo->addItem( nativePath );
++    ui.deviceCombo->setCurrentIndex( ui.deviceCombo->findText( nativePath ) );
++    updateMRL();
++}
++
+ void DiscOpenPanel::eject()
+ {
+     intf_Eject( p_intf, qtu( ui.deviceCombo->currentText() ) );
+diff --git a/modules/gui/qt/components/open_panels.hpp b/modules/gui/qt/components/open_panels.hpp
+index 70b10b7..a5e4b6e 100644
+--- a/modules/gui/qt/components/open_panels.hpp
++++ b/modules/gui/qt/components/open_panels.hpp
+@@ -169,7 +169,8 @@ class DiscOpenPanel: public OpenPanel
+         Dvd,
+         Vcd,
+         Cdda,
+-        BRD
++        BRD,
++        Open3dBRD
+     };
+ public:
+     DiscOpenPanel( QWidget *, intf_thread_t * );
+@@ -181,6 +182,8 @@ public:
+ #endif
+     void updateContext(int) Q_DECL_OVERRIDE;
+ private:
++    QString normalizeOpen3DBlurayPath( const QString& ) const;
++    bool isOpen3DBluRaySelection() const;
+     Ui::OpenDisk ui;
+     char *psz_dvddiscpath, *psz_vcddiscpath, *psz_cddadiscpath;
+     DiscType m_discType;
+@@ -188,6 +191,7 @@ public slots:
+     void updateMRL() Q_DECL_OVERRIDE;
+ private slots:
+     void browseDevice();
++    void browseImage();
+     void updateButtons() ;
+     void eject();
+ };
+diff --git a/modules/gui/qt/qt.cpp b/modules/gui/qt/qt.cpp
+index 9da91e5..f7c1638 100644
+--- a/modules/gui/qt/qt.cpp
++++ b/modules/gui/qt/qt.cpp
+@@ -51,6 +51,44 @@
+ 
+ #include <vlc_plugin.h>
+ #include <vlc_vout_window.h>
++/*
++ * Host distro VLC 3.0.x builds may look for the Debian/Ubuntu t64 module
++ * entry symbol even when building against the upstream 3.0.23 source tree.
++ * Export both entry names so the staged plugin can be loaded by the host
++ * launcher without affecting the AppImage runtime.
++ */
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
++extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
++extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
++EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
++
++EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
++vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
++{
++    return vlc_entry__3_0_0f(vlc_set, opaque);
++}
++
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
++vlc_entry_copyright__3_0_0ft64(void)
++{
++    return vlc_entry_copyright__3_0_0f();
++}
++
++EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
++vlc_entry_license__3_0_0ft64(void)
++{
++    return vlc_entry_license__3_0_0f();
++}
++#ifdef __cplusplus
++}
++#endif
++
++
+ 
+ #ifdef _WIN32 /* For static builds */
+  #include <QtPlugin>
+@@ -281,7 +319,6 @@ vlc_module_begin ()
+     add_bool( "qt-embedded-open", false, QT_NATIVEOPEN_TEXT,
+                QT_NATIVEOPEN_TEXT, false )
+ 
+-
+     add_bool( "qt-advanced-pref", false, ADVANCED_PREFS_TEXT,
+               ADVANCED_PREFS_LONGTEXT, false )
+     add_bool( "qt-error-dialogs", true, ERROR_TEXT,
+@@ -605,7 +642,6 @@ static void *ThreadPlatform( void *obj, char *platform_name )
+ 
+     p_sys->p_app = &app;
+ 
+-
+     /* All the settings are in the .conf/.ini style */
+ #ifdef _WIN32
+     char *cConfigDir = config_GetUserDir( VLC_CONFIG_DIR );
+diff --git a/modules/gui/qt/ui/open_disk.ui b/modules/gui/qt/ui/open_disk.ui
+index 7b4c5d2..5246001 100644
+--- a/modules/gui/qt/ui/open_disk.ui
++++ b/modules/gui/qt/ui/open_disk.ui
+@@ -106,29 +106,19 @@
+         </property>
+        </spacer>
+       </item>
+-      <item row="1" column="1" colspan="4">
+-       <widget class="QCheckBox" name="dvdsimple">
+-        <property name="toolTip">
+-         <string>Disable Disc Menus</string>
+-        </property>
+-        <property name="text">
+-         <string>No disc menus</string>
+-        </property>
+-       </widget>
+-      </item>
+-      <item row="2" column="3" colspan="6">
++      <item row="3" column="3" colspan="6">
+        <widget class="Line" name="line">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+        </widget>
+       </item>
+-      <item row="3" column="0" colspan="9">
++      <item row="4" column="0" colspan="9">
+        <layout class="QHBoxLayout" name="horizontalLayout_5">
+         <item>
+          <widget class="QLabel" name="deviceLabel">
+           <property name="text">
+-           <string>Disc device</string>
++           <string>Disc device / root / ISO</string>
+           </property>
+           <property name="buddy">
+            <cstring>deviceCombo</cstring>
+@@ -171,6 +161,19 @@
+           </property>
+          </widget>
+         </item>
++        <item>
++         <widget class="QPushButton" name="browseImageButton">
++          <property name="sizePolicy">
++           <sizepolicy hsizetype="Maximum" vsizetype="Fixed">
++            <horstretch>0</horstretch>
++            <verstretch>0</verstretch>
++           </sizepolicy>
++          </property>
++          <property name="text">
++           <string>Browse ISO...</string>
++          </property>
++         </widget>
++        </item>
+        </layout>
+       </item>
+       <item row="0" column="4">
+@@ -186,6 +189,23 @@
+         </property>
+        </spacer>
+       </item>
++      <item row="1" column="1" colspan="4">
++       <widget class="QRadioButton" name="open3dBluRayIsoRadioButton">
++        <property name="text">
++         <string>3D Blu-ray / ISO (Open3DOLED)</string>
++        </property>
++       </widget>
++      </item>
++      <item row="1" column="5" colspan="4">
++       <widget class="QCheckBox" name="dvdsimple">
++        <property name="toolTip">
++         <string>Disable Disc Menus</string>
++        </property>
++        <property name="text">
++         <string>No disc menus</string>
++        </property>
++       </widget>
++      </item>
+      </layout>
+     </widget>
+    </item>
+@@ -345,7 +365,7 @@
+          <set>Qt::AlignRight</set>
+         </property>
+         <property name="suffix">
+-         <string/>
++         <string />
+         </property>
+         <property name="minimum">
+          <number>-1</number>
+@@ -382,17 +402,19 @@
+  <tabstops>
+   <tabstop>dvdRadioButton</tabstop>
+   <tabstop>bdRadioButton</tabstop>
++  <tabstop>open3dBluRayIsoRadioButton</tabstop>
+   <tabstop>audioCDRadioButton</tabstop>
+   <tabstop>vcdRadioButton</tabstop>
+   <tabstop>dvdsimple</tabstop>
+   <tabstop>deviceCombo</tabstop>
+   <tabstop>ejectButton</tabstop>
+   <tabstop>browseDiscButton</tabstop>
++  <tabstop>browseImageButton</tabstop>
+   <tabstop>titleSpin</tabstop>
+   <tabstop>chapterSpin</tabstop>
+   <tabstop>audioSpin</tabstop>
+   <tabstop>subtitlesSpin</tabstop>
+  </tabstops>
+- <resources/>
+- <connections/>
+-</ui>
++ <resources />
++ <connections />
++</ui>
+\ No newline at end of file
 diff --git a/modules/video_output/Makefile.am b/modules/video_output/Makefile.am
-index 6d75a1d..766d43b 100644
+index 6d75a1d..015517e 100644
 --- a/modules/video_output/Makefile.am
 +++ b/modules/video_output/Makefile.am
-@@ -83,6 +83,14 @@ libgl_plugin_la_CFLAGS += -DHAVE_GL_CORE_SYMBOLS
+@@ -83,6 +83,16 @@ libgl_plugin_la_CFLAGS += -DHAVE_GL_CORE_SYMBOLS
  libgl_plugin_la_LIBADD += $(GL_LIBS)
  endif
  
@@ -195,12 +1329,14 @@ index 6d75a1d..766d43b 100644
 +if HAVE_WIN32
 +libopen3d_plugin_la_CFLAGS += -DHAVE_GL_CORE_SYMBOLS
 +libopen3d_plugin_la_LIBADD += $(GL_LIBS)
++else
++libopen3d_plugin_la_LIBADD += -lpthread
 +endif
 +
  libglconv_vaapi_wl_plugin_la_SOURCES = video_output/opengl/converter_vaapi.c \
  	video_output/opengl/converter.h \
  	hw/vaapi/vlc_vaapi.c hw/vaapi/vlc_vaapi.h
-@@ -107,6 +115,7 @@ libglconv_vdpau_plugin_la_LIBADD = $(LIBDL) libvlc_vdpau.la $(X_LIBS) $(X_PRE_LI
+@@ -107,6 +117,7 @@ libglconv_vdpau_plugin_la_LIBADD = $(LIBDL) libvlc_vdpau.la $(X_LIBS) $(X_PRE_LI
  
  if HAVE_GL
  vout_LTLIBRARIES += libgl_plugin.la
@@ -263,3 +1399,140 @@ index 48014b4..32dadda 100644
  int vout_display_opengl_Display(vout_display_opengl_t *vgl,
                                  const video_format_t *source);
  
+diff --git a/src/input/input.c b/src/input/input.c
+index fcd3ecb..7a4c2b4 100644
+--- a/src/input/input.c
++++ b/src/input/input.c
+@@ -55,6 +55,7 @@
+ #include <vlc_stream.h>
+ #include <vlc_stream_extractor.h>
+ #include <vlc_renderer_discovery.h>
++#include <strings.h>
+ 
+ /*****************************************************************************
+  * Local prototypes
+@@ -2658,6 +2659,104 @@ error:
+     return NULL;
+ }
+ 
++
++static bool Open3DPathEndsWithIcase(const char *psz_path, const char *psz_suffix)
++{
++    if (psz_path == NULL || psz_suffix == NULL)
++        return false;
++
++    const size_t path_len = strlen(psz_path);
++    const size_t suffix_len = strlen(psz_suffix);
++    if (path_len < suffix_len)
++        return false;
++
++    return strcasecmp(psz_path + path_len - suffix_len, psz_suffix) == 0;
++}
++
++static char *Open3DNormalizeBlurayPath(const char *psz_path)
++{
++    if (psz_path == NULL || *psz_path == '\0')
++        return NULL;
++
++    char *psz_real = realpath(psz_path, NULL);
++    if (psz_real == NULL)
++        return NULL;
++
++    struct stat st;
++    if (vlc_stat(psz_real, &st) != 0)
++    {
++        free(psz_real);
++        return NULL;
++    }
++
++    if (S_ISREG(st.st_mode))
++    {
++        if (Open3DPathEndsWithIcase(psz_real, ".iso"))
++            return psz_real;
++
++        if (Open3DPathEndsWithIcase(psz_real, "/BDMV/index.bdmv"))
++        {
++            psz_real[strlen(psz_real) - strlen("/BDMV/index.bdmv")] = '\0';
++            return psz_real;
++        }
++        return NULL;
++    }
++
++    if (!S_ISDIR(st.st_mode))
++    {
++        free(psz_real);
++        return NULL;
++    }
++
++    if (Open3DPathEndsWithIcase(psz_real, "/BDMV"))
++    {
++        psz_real[strlen(psz_real) - strlen("/BDMV")] = '\0';
++        return psz_real;
++    }
++
++    char *psz_probe = NULL;
++    if (asprintf(&psz_probe, "%s/BDMV/index.bdmv", psz_real) < 0)
++    {
++        free(psz_real);
++        return NULL;
++    }
++
++    const bool has_index = (vlc_stat(psz_probe, &st) == 0 && S_ISREG(st.st_mode));
++    free(psz_probe);
++    if (has_index)
++        return psz_real;
++
++    free(psz_real);
++    return NULL;
++}
++
++static bool Open3DMaybeRouteDirectBlurayPath(input_thread_t *p_input,
++                                             const char **ppsz_access,
++                                             const char **ppsz_demux,
++                                             const char **ppsz_path)
++{
++    if (ppsz_access == NULL || ppsz_demux == NULL || ppsz_path == NULL ||
++        *ppsz_access == NULL || *ppsz_path == NULL)
++        return false;
++
++    if (strcasecmp(*ppsz_access, "file") != 0)
++        return false;
++
++    char *psz_bluray_path = Open3DNormalizeBlurayPath(*ppsz_path);
++    if (psz_bluray_path == NULL)
++        return false;
++
++    *ppsz_access = "open3dbluraymvc";
++    *ppsz_demux = "any";
++    *ppsz_path = psz_bluray_path;
++    var_Create(p_input, "bluray-menu", VLC_VAR_BOOL);
++    var_SetBool(p_input, "bluray-menu", false);
++    msg_Dbg(p_input, "open3d direct path routing '%s' -> access=open3dbluraymvc",
++            psz_bluray_path);
++    return true;
++}
++
++
+ /*****************************************************************************
+  * InputSourceNew:
+  *****************************************************************************/
+@@ -2696,6 +2795,11 @@ static input_source_t *InputSourceNew( input_thread_t *p_input,
+     if( psz_demux == NULL )
+         psz_demux = "any";
+ 
++    char *psz_open3d_bluray_path = NULL;
++    if( Open3DMaybeRouteDirectBlurayPath( p_input, &psz_access, &psz_demux,
++                                          &psz_path ) )
++        psz_open3d_bluray_path = (char *)psz_path;
++
+     msg_Dbg( p_input, "`%s' gives access `%s' demux `%s' path `%s'",
+              psz_mrl, psz_access, psz_demux, psz_path );
+ 
+@@ -2756,6 +2860,7 @@ static input_source_t *InputSourceNew( input_thread_t *p_input,
+ 
+     free( psz_demux_var );
+     free( psz_dup );
++    free( psz_open3d_bluray_path );
+ 
+     if( in->p_demux == NULL )
+     {

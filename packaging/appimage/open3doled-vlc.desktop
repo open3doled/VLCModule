@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Open3DOLED VLC
+GenericName=3D Video Player
+Comment=Open3DOLED VLC runtime prototype
+Exec=AppRun %U
+Icon=open3doled-vlc
+Terminal=false
+Categories=AudioVideo;Video;Player;
+MimeType=application/x-cd-image;video/x-matroska;video/mp4;video/x-h264;
+StartupNotify=true

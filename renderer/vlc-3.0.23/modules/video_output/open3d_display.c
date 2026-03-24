@@ -27,7 +27,10 @@
 #include <termios.h>
 #include <unistd.h>
 #include <glob.h>
+#include <alloca.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #ifdef __linux__
 # include <pthread.h>
@@ -43,6 +46,7 @@
 
 #include "opengl/vout_helper.h"
 #include "open3d_font8x16_basic.h"
+#include "open3d_subtitle_bridge.h"
 
 typedef enum
 {
@@ -68,6 +72,7 @@ static int Open3DHotkeyVarCallback(vlc_object_t *, char const *,
                                    vlc_value_t, vlc_value_t, void *);
 static void Open3DRegionChainAppend(subpicture_region_t **, subpicture_region_t *);
 static int Open3DCopyRegionChain(subpicture_region_t **, const subpicture_region_t *);
+static int Open3DCloneRegionChainShallow(subpicture_region_t **, const subpicture_region_t *);
 static subpicture_region_t *Open3DCreateBitmapTextRegion(const char *,
                                                          int, int,
                                                          int, int,
@@ -135,6 +140,67 @@ static void Open3DStatusSetMessage(vout_display_t *, vout_display_sys_t *, vlc_t
 #define OPEN3D_DEBUG_STATUS_TEXT N_("Debug status logs")
 #define OPEN3D_DEBUG_STATUS_LONGTEXT N_( \
     "Log periodic Open3D eye/layout/scheduler status to the VLC debug log.")
+
+#define OPEN3D_PRESENTER_TELEMETRY_TEXT N_("Presenter telemetry")
+#define OPEN3D_PRESENTER_TELEMETRY_LONGTEXT N_( \
+    "Log low-overhead periodic presenter telemetry and exact miss/over clocks without enabling the heavier per-frame debug-status path.")
+
+#define OPEN3D_PRESENTER_TELEMETRY_INTERVAL_TEXT N_("Presenter telemetry interval (frames)")
+#define OPEN3D_PRESENTER_TELEMETRY_INTERVAL_LONGTEXT N_( \
+    "How many presenter frames to skip between periodic telemetry lines when presenter telemetry is enabled.")
+
+#define OPEN3D_STAGE_PROFILE_TEXT N_("Presenter stage profiling")
+#define OPEN3D_STAGE_PROFILE_LONGTEXT N_( \
+    "Measure presenter-thread stage wall time, thread CPU time, and scheduler delay for Prepare/Display/Swap. Disabled by default and intended only for investigation.")
+
+#define OPEN3D_PRESENTER_RT_ENABLE_TEXT N_("Presenter realtime scheduling")
+#define OPEN3D_PRESENTER_RT_ENABLE_LONGTEXT N_( \
+    "Attempt to raise the presenter thread to SCHED_FIFO on Linux. Enabled by default, but may fall back automatically if the host does not permit realtime scheduling.")
+
+#define OPEN3D_PRESENTER_RT_PRIORITY_TEXT N_("Presenter realtime priority")
+#define OPEN3D_PRESENTER_RT_PRIORITY_LONGTEXT N_( \
+    "Requested SCHED_FIFO priority for the presenter thread on Linux. Set to -1 to use max-1, which preserves the previous default behavior.")
+
+#define OPEN3D_PRESENTER_AFFINITY_ENABLE_TEXT N_("Presenter CPU pinning")
+#define OPEN3D_PRESENTER_AFFINITY_ENABLE_LONGTEXT N_( \
+    "Attempt to pin the presenter thread to a single allowed CPU on Linux. Enabled by default, but may fall back automatically if affinity changes are unavailable.")
+
+#define OPEN3D_PRESENTER_AFFINITY_CPU_TEXT N_("Presenter pinned CPU")
+#define OPEN3D_PRESENTER_AFFINITY_CPU_LONGTEXT N_( \
+    "Requested CPU for presenter-thread pinning on Linux. Set to -1 to auto-select the current CPU or the first allowed CPU.")
+
+#define OPEN3D_PRESENTER_MLOCKALL_TEXT N_("Presenter memory lock")
+#define OPEN3D_PRESENTER_MLOCKALL_LONGTEXT N_( \
+    "Attempt to lock current and future process mappings with mlockall() on Linux to reduce page-fault jitter. Disabled by default because it may fail without elevated limits.")
+
+#define OPEN3D_PRESENTER_PREFAULT_KB_TEXT N_("Presenter prefault buffer (KiB)")
+#define OPEN3D_PRESENTER_PREFAULT_KB_LONGTEXT N_( \
+    "Touched heap+stack warmup size for the presenter thread on Linux when memory lock is enabled. Set to 0 to disable prefault warmup.")
+
+#define OPEN3D_PRESENTER_LEAD_US_TEXT N_("Presenter render lead (us)")
+#define OPEN3D_PRESENTER_LEAD_US_LONGTEXT N_( \
+    "Start presenter Prepare/Display/Swap this many microseconds before the nominal present tick so swap and scheduler jitter are absorbed before the deadline. Set to 0 to disable this mitigation.")
+
+#define OPEN3D_SUBTITLE_DEPTH_ENABLE_TEXT N_("Enable 3D subtitle placement")
+#define OPEN3D_SUBTITLE_DEPTH_ENABLE_LONGTEXT N_( \
+    "Apply eye-specific horizontal subtitle placement when Blu-ray subtitle depth metadata or MKV static subtitle fallback metadata is available.")
+
+#define OPEN3D_SUBTITLE_DEPTH_UNIT_TEXT N_("3D subtitle unit shift (px)")
+#define OPEN3D_SUBTITLE_DEPTH_UNIT_LONGTEXT N_( \
+    "Horizontal pixel shift per subtitle depth unit at 1920 eye width. Negative values invert the disparity direction for both Blu-ray depth metadata and MKV static subtitle fallback.")
+
+#define OPEN3D_MKV_SUBTITLE_STATIC_OFFSET_TEXT N_("MKV static subtitle offset units")
+#define OPEN3D_MKV_SUBTITLE_STATIC_OFFSET_LONGTEXT N_( \
+    "Fallback static subtitle offset units for MKV subtitle tracks when only per-track plane metadata is available. Used only when Blu-ray subtitle offset metadata is absent. Set to 0 to disable this MKV fallback.")
+#define OPEN3D_MKV_SUBTITLE_FORCE_TEXT N_("Force MKV bitmap subtitle ownership")
+#define OPEN3D_MKV_SUBTITLE_FORCE_LONGTEXT N_( \
+    "Treat incoming bitmap subtitle subpictures as Open3D subtitle content for MKV playback when the selected MKV subtitle track has known stereo metadata. This keeps PF/SBS subtitle ownership even if VLC core does not mark the incoming composed subpicture with b_subtitle.")
+#define OPEN3D_MKV_SUBTITLE_PLANE_TEXT N_("MKV subtitle plane id")
+#define OPEN3D_MKV_SUBTITLE_PLANE_LONGTEXT N_( \
+    "Selected MKV subtitle plane identifier derived from Matroska 3d-plane metadata. Used to associate the selected subtitle track with future MVC-side dynamic depth metadata while keeping the current static fallback path.")
+#define OPEN3D_MKV_SUBTITLE_SOURCE_ID_TEXT N_("MKV subtitle source id")
+#define OPEN3D_MKV_SUBTITLE_SOURCE_ID_LONGTEXT N_( \
+    "Selected MKV subtitle source identifier derived from Matroska SOURCE_ID metadata. Used only for MKV subtitle-depth association and ignored when unset.")
 
 #define OPEN3D_TRIGGER_ENABLE_TEXT N_("Enable optical trigger boxes")
 #define OPEN3D_TRIGGER_ENABLE_LONGTEXT N_( \
@@ -512,7 +578,6 @@ static const char open3d_emitter_cmd_apply_var[] = "open3d-emitter-cmd-apply";
 static const char open3d_emitter_cmd_save_var[] = "open3d-emitter-cmd-save";
 static const char open3d_emitter_cmd_reconnect_var[] = "open3d-emitter-cmd-reconnect";
 static const char open3d_emitter_cmd_fw_update_var[] = "open3d-emitter-cmd-firmware-update";
-
 vlc_module_begin()
     set_shortname(N_("Open3D"))
     set_description(N_("Open3DOLED page-flipping OpenGL video output"))
@@ -549,6 +614,47 @@ vlc_module_begin()
              OPEN3D_GPU_OVERLAY_TEXT, OPEN3D_GPU_OVERLAY_LONGTEXT, true)
     add_bool("open3d-debug-status", false,
              OPEN3D_DEBUG_STATUS_TEXT, OPEN3D_DEBUG_STATUS_LONGTEXT, true)
+    add_bool("open3d-presenter-telemetry", false,
+             OPEN3D_PRESENTER_TELEMETRY_TEXT, OPEN3D_PRESENTER_TELEMETRY_LONGTEXT, true)
+    add_integer("open3d-presenter-telemetry-interval", 120,
+                OPEN3D_PRESENTER_TELEMETRY_INTERVAL_TEXT, OPEN3D_PRESENTER_TELEMETRY_INTERVAL_LONGTEXT, true)
+        change_integer_range(1, 3600)
+    add_bool("open3d-presenter-stage-profile", false,
+             OPEN3D_STAGE_PROFILE_TEXT, OPEN3D_STAGE_PROFILE_LONGTEXT, true)
+    add_bool("open3d-presenter-rt-enable", true,
+             OPEN3D_PRESENTER_RT_ENABLE_TEXT, OPEN3D_PRESENTER_RT_ENABLE_LONGTEXT, true)
+    add_integer("open3d-presenter-rt-priority", -1,
+                OPEN3D_PRESENTER_RT_PRIORITY_TEXT, OPEN3D_PRESENTER_RT_PRIORITY_LONGTEXT, true)
+        change_integer_range(-1, 99)
+    add_bool("open3d-presenter-affinity-enable", true,
+             OPEN3D_PRESENTER_AFFINITY_ENABLE_TEXT, OPEN3D_PRESENTER_AFFINITY_ENABLE_LONGTEXT, true)
+    add_integer("open3d-presenter-affinity-cpu", -1,
+                OPEN3D_PRESENTER_AFFINITY_CPU_TEXT, OPEN3D_PRESENTER_AFFINITY_CPU_LONGTEXT, true)
+        change_integer_range(-1, 4096)
+    add_bool("open3d-presenter-memory-lock", false,
+             OPEN3D_PRESENTER_MLOCKALL_TEXT, OPEN3D_PRESENTER_MLOCKALL_LONGTEXT, true)
+    add_integer("open3d-presenter-prefault-kb", 256,
+                OPEN3D_PRESENTER_PREFAULT_KB_TEXT, OPEN3D_PRESENTER_PREFAULT_KB_LONGTEXT, true)
+        change_integer_range(0, 65536)
+    add_integer("open3d-presenter-lead-us", 0,
+                OPEN3D_PRESENTER_LEAD_US_TEXT, OPEN3D_PRESENTER_LEAD_US_LONGTEXT, true)
+        change_integer_range(0, 20000)
+    add_bool("open3d-subtitle-depth-enable", true,
+             OPEN3D_SUBTITLE_DEPTH_ENABLE_TEXT, OPEN3D_SUBTITLE_DEPTH_ENABLE_LONGTEXT, true)
+    add_integer("open3d-subtitle-depth-unit-px", 2,
+                OPEN3D_SUBTITLE_DEPTH_UNIT_TEXT, OPEN3D_SUBTITLE_DEPTH_UNIT_LONGTEXT, true)
+        change_integer_range(-128, 128)
+    add_integer("open3d-mkv-subtitle-static-offset-units", 0,
+                OPEN3D_MKV_SUBTITLE_STATIC_OFFSET_TEXT, OPEN3D_MKV_SUBTITLE_STATIC_OFFSET_LONGTEXT, true)
+        change_integer_range(-128, 128)
+    add_bool("open3d-mkv-subtitle-force", false,
+             OPEN3D_MKV_SUBTITLE_FORCE_TEXT, OPEN3D_MKV_SUBTITLE_FORCE_LONGTEXT, true)
+    add_integer("open3d-mkv-subtitle-plane", -1,
+                OPEN3D_MKV_SUBTITLE_PLANE_TEXT, OPEN3D_MKV_SUBTITLE_PLANE_LONGTEXT, true)
+        change_integer_range(-1, 255)
+    add_integer("open3d-mkv-subtitle-source-id", -1,
+                OPEN3D_MKV_SUBTITLE_SOURCE_ID_TEXT, OPEN3D_MKV_SUBTITLE_SOURCE_ID_LONGTEXT, true)
+        change_integer_range(-1, 65535)
 
     set_section(N_("Trigger Overlay"), NULL)
     add_bool("open3d-trigger-enable", true,
@@ -827,6 +933,13 @@ typedef enum
     OPEN3D_PACK_TB_HALF,
 } open3d_pack_t;
 
+static void Open3DApplySubtitleStereoShift(vout_display_t *, vout_display_sys_t *,
+                                           subpicture_t *, unsigned, bool);
+static subpicture_t *Open3DBuildPackedStereoSubtitleSubpicture(vout_display_t *,
+                                                               vout_display_sys_t *,
+                                                               const subpicture_t *,
+                                                               open3d_pack_t);
+
 typedef enum
 {
     OPEN3D_HALF_LAYOUT_SBS = 0,
@@ -923,6 +1036,76 @@ typedef struct
     subpicture_t *subpicture;
 } open3d_overlay_subpicture_cache_t;
 
+typedef struct
+{
+    bool valid;
+    uint64_t signature;
+    open3d_pack_t pack_mode;
+    unsigned packed_width;
+    unsigned packed_height;
+    bool subtitle_depth_enable;
+    int subtitle_depth_unit_px;
+    int offset_signed;
+    int offset_seq;
+    subpicture_t *pf_left;
+    subpicture_t *pf_right;
+    subpicture_t *packed;
+} open3d_bluray_subtitle_cache_t;
+
+#define OPEN3D_BLURAY_SUBTITLE_OFFSET_HISTORY_CAP 64
+
+typedef struct
+{
+    uint64_t wall_ns;
+    uint64_t cpu_ns;
+    uint64_t runq_ns;
+    bool runq_valid;
+} open3d_presenter_stage_stamp_t;
+
+typedef struct
+{
+    uint64_t wall_ns;
+    uint64_t cpu_ns;
+    uint64_t runq_ns;
+    bool runq_valid;
+} open3d_presenter_stage_metric_t;
+
+typedef struct
+{
+    bool valid;
+    bool explicit_swap;
+    open3d_presenter_stage_metric_t prelude;
+    open3d_presenter_stage_metric_t emitter_queue;
+    open3d_presenter_stage_metric_t status_log;
+    open3d_presenter_stage_metric_t compose;
+    open3d_presenter_stage_metric_t gl_lock;
+    open3d_presenter_stage_metric_t make_current;
+    open3d_presenter_stage_metric_t total;
+    open3d_presenter_stage_metric_t prepare;
+    open3d_presenter_stage_metric_t display;
+    open3d_presenter_stage_metric_t swap;
+    open3d_presenter_stage_metric_t cleanup;
+} open3d_presenter_stage_profile_t;
+
+typedef struct
+{
+    bool valid;
+    vlc_tick_t wallclock;
+    int seq;
+    int signed_offset;
+    int frame_index;
+} open3d_bluray_subtitle_offset_sample_t;
+
+typedef struct
+{
+    bool valid;
+    uint64_t content_signature;
+    int seq;
+    int signed_offset;
+    int frame_index;
+    vlc_tick_t latched_at;
+} open3d_bluray_subtitle_offset_latch_t;
+
 #define OPEN3D_GL_BLEND               0x0BE2u
 #define OPEN3D_GL_SCISSOR_TEST        0x0C11u
 #define OPEN3D_GL_SRC_ALPHA           0x0302u
@@ -1018,6 +1201,18 @@ struct vout_display_sys_t
     vlc_tick_t presenter_period;
     bool gpu_overlay_enable;
     bool gpu_overlay_ready;
+    bool presenter_telemetry;
+    int presenter_telemetry_interval;
+    bool presenter_stage_profile;
+    bool presenter_rt_request;
+    int presenter_rt_priority_request;
+    bool presenter_affinity_request;
+    int presenter_affinity_cpu_request;
+    bool presenter_memory_lock_request;
+    int presenter_prefault_kb_request;
+    int presenter_lead_us_request;
+    vlc_tick_t presenter_lead;
+    int presenter_schedstat_fd;
     open3d_gl_overlay_api_t gl_overlay;
     bool presenter_stop;
     _Atomic bool presenter_stop_atomic;
@@ -1042,6 +1237,12 @@ struct vout_display_sys_t
     bool warned_missing_pack;
     bool warned_overlay_alloc;
     bool warned_flip_rate_limited;
+    bool subtitle_depth_enable;
+    int subtitle_depth_unit_px;
+    int mkv_subtitle_static_offset_units;
+    bool mkv_subtitle_force;
+    int mkv_subtitle_plane;
+    int mkv_subtitle_source_id;
     uint64_t late_flip_events;
     uint64_t late_flip_steps_total;
     uint64_t presenter_early_wake_events;
@@ -1051,17 +1252,79 @@ struct vout_display_sys_t
     uint64_t presenter_deadline_miss_events;
     uint64_t presenter_deadline_miss_steps_total;
     vlc_tick_t presenter_deadline_miss_max;
+    uint64_t presenter_profiled_frame_count;
     uint64_t presenter_render_total;
     vlc_tick_t presenter_render_max;
+    uint64_t presenter_render_over_budget_events;
+    vlc_tick_t presenter_render_over_budget_max;
+    uint64_t presenter_prelude_wall_total_ns;
+    uint64_t presenter_prelude_cpu_total_ns;
+    uint64_t presenter_emitter_queue_wall_total_ns;
+    uint64_t presenter_emitter_queue_cpu_total_ns;
+    uint64_t presenter_status_log_wall_total_ns;
+    uint64_t presenter_status_log_cpu_total_ns;
+    uint64_t presenter_compose_wall_total_ns;
+    uint64_t presenter_compose_cpu_total_ns;
+    uint64_t presenter_gl_lock_wall_total_ns;
+    uint64_t presenter_gl_lock_cpu_total_ns;
+    uint64_t presenter_make_current_wall_total_ns;
+    uint64_t presenter_make_current_cpu_total_ns;
+    uint64_t presenter_prepare_wall_total_ns;
+    uint64_t presenter_prepare_cpu_total_ns;
+    uint64_t presenter_display_wall_total_ns;
+    uint64_t presenter_display_cpu_total_ns;
+    uint64_t presenter_swap_wall_total_ns;
+    uint64_t presenter_swap_cpu_total_ns;
+    uint64_t presenter_cleanup_wall_total_ns;
+    uint64_t presenter_cleanup_cpu_total_ns;
+    uint64_t presenter_prelude_wall_max_ns;
+    uint64_t presenter_prelude_cpu_max_ns;
+    uint64_t presenter_emitter_queue_wall_max_ns;
+    uint64_t presenter_emitter_queue_cpu_max_ns;
+    uint64_t presenter_status_log_wall_max_ns;
+    uint64_t presenter_status_log_cpu_max_ns;
+    uint64_t presenter_compose_wall_max_ns;
+    uint64_t presenter_compose_cpu_max_ns;
+    uint64_t presenter_gl_lock_wall_max_ns;
+    uint64_t presenter_gl_lock_cpu_max_ns;
+    uint64_t presenter_make_current_wall_max_ns;
+    uint64_t presenter_make_current_cpu_max_ns;
+    uint64_t presenter_prepare_wall_max_ns;
+    uint64_t presenter_prepare_cpu_max_ns;
+    uint64_t presenter_display_wall_max_ns;
+    uint64_t presenter_display_cpu_max_ns;
+    uint64_t presenter_swap_wall_max_ns;
+    uint64_t presenter_swap_cpu_max_ns;
+    uint64_t presenter_cleanup_wall_max_ns;
+    uint64_t presenter_cleanup_cpu_max_ns;
     uint64_t presenter_sleep_overshoot_events;
     uint64_t presenter_sleep_overshoot_total;
     vlc_tick_t presenter_sleep_overshoot_max;
     bool presenter_rt_enabled;
     bool presenter_affinity_enabled;
     int presenter_affinity_cpu;
+    bool presenter_mlockall_enabled;
+    size_t presenter_prefault_bytes;
+    uint8_t *presenter_prefault_buffer;
     open3d_pack_t last_logged_pack;
     bool last_logged_eye;
     uint64_t frame_count;
+    uint64_t bluray_subtitle_cache_hits;
+    uint64_t bluray_subtitle_cache_misses;
+    open3d_bluray_subtitle_offset_sample_t bluray_subtitle_offset_history[OPEN3D_BLURAY_SUBTITLE_OFFSET_HISTORY_CAP];
+    unsigned bluray_subtitle_offset_history_head;
+    bool bluray_subtitle_offset_last_valid;
+    int bluray_subtitle_offset_last_seq;
+    int bluray_subtitle_offset_last_signed;
+    int bluray_subtitle_offset_last_frame;
+    open3d_bluray_subtitle_offset_latch_t bluray_subtitle_offset_latch;
+    bool debug_bluray_subtitle_active;
+    bool debug_bluray_subtitle_cache_hit;
+    int debug_bluray_subtitle_offset_seq;
+    int debug_bluray_subtitle_offset_signed;
+    uint64_t debug_bluray_subtitle_signature;
+    vlc_tick_t debug_bluray_subtitle_pts;
+    vlc_tick_t debug_bluray_subtitle_last_change;
 
     bool trigger_enable;
     unsigned trigger_size;
@@ -1102,6 +1365,8 @@ struct vout_display_sys_t
     open3d_trigger_region_cache_t trigger_region_cache;
     open3d_calibration_region_cache_t calibration_region_cache;
     open3d_overlay_subpicture_cache_t presenter_overlay_cache[2];
+    open3d_bluray_subtitle_cache_t bluray_subtitle_cache;
+    open3d_presenter_stage_profile_t presenter_stage_profile_last;
 
     bool hotkeys_enable;
     bool hotkeys_registered;
@@ -1354,6 +1619,148 @@ static void Open3DOverlayCacheClear(vout_display_sys_t *sys)
         return;
     Open3DOverlayCacheEntryClear(&sys->presenter_overlay_cache[0]);
     Open3DOverlayCacheEntryClear(&sys->presenter_overlay_cache[1]);
+}
+
+static void Open3DBluraySubtitleCacheClear(open3d_bluray_subtitle_cache_t *cache)
+{
+    if (cache == NULL)
+        return;
+    if (cache->pf_left != NULL)
+        subpicture_Delete(cache->pf_left);
+    if (cache->pf_right != NULL)
+        subpicture_Delete(cache->pf_right);
+    if (cache->packed != NULL)
+        subpicture_Delete(cache->packed);
+    memset(cache, 0, sizeof(*cache));
+}
+
+#ifdef __linux__
+static bool Open3DReadPresenterSchedstatRunqNs(int fd, uint64_t *runq_ns_out)
+{
+    if (runq_ns_out == NULL || fd < 0)
+        return false;
+
+    char buf[128];
+    if (lseek(fd, 0, SEEK_SET) < 0)
+        return false;
+
+    const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    if (n <= 0)
+        return false;
+    buf[n] = '\0';
+
+    uint64_t exec_ns = 0;
+    uint64_t runq_ns = 0;
+    if (sscanf(buf, "%" SCNu64 " %" SCNu64, &exec_ns, &runq_ns) < 2)
+        return false;
+
+    *runq_ns_out = runq_ns;
+    return true;
+}
+#endif
+
+static void Open3DPresenterStageStampNow(vout_display_sys_t *sys,
+                                         open3d_presenter_stage_stamp_t *stamp)
+{
+    if (stamp == NULL)
+        return;
+
+    memset(stamp, 0, sizeof(*stamp));
+
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        stamp->wall_ns = (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0)
+        stamp->cpu_ns = (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+
+#ifdef __linux__
+    stamp->runq_valid = Open3DReadPresenterSchedstatRunqNs(sys != NULL ? sys->presenter_schedstat_fd : -1,
+                                                           &stamp->runq_ns);
+#else
+    VLC_UNUSED(sys);
+#endif
+}
+
+static open3d_presenter_stage_metric_t
+Open3DPresenterStageMetricDiff(const open3d_presenter_stage_stamp_t *start,
+                               const open3d_presenter_stage_stamp_t *end)
+{
+    open3d_presenter_stage_metric_t metric;
+    memset(&metric, 0, sizeof(metric));
+
+    if (start == NULL || end == NULL)
+        return metric;
+
+    metric.wall_ns = end->wall_ns >= start->wall_ns ? end->wall_ns - start->wall_ns : 0;
+    metric.cpu_ns = end->cpu_ns >= start->cpu_ns ? end->cpu_ns - start->cpu_ns : 0;
+    metric.runq_valid = start->runq_valid && end->runq_valid;
+    if (metric.runq_valid)
+        metric.runq_ns = end->runq_ns >= start->runq_ns ? end->runq_ns - start->runq_ns : 0;
+
+    return metric;
+}
+
+static uint64_t Open3DPresenterStageMetricWaitNs(const open3d_presenter_stage_metric_t *metric)
+{
+    if (metric == NULL || metric->wall_ns <= metric->cpu_ns)
+        return 0;
+    return metric->wall_ns - metric->cpu_ns;
+}
+
+static void Open3DLogPresenterStageProfile(vout_display_t *vd,
+                                           const char *reason,
+                                           const open3d_presenter_stage_profile_t *profile)
+{
+    if (vd == NULL || reason == NULL || profile == NULL || !profile->valid)
+        return;
+
+    msg_Warn(vd,
+             "open3d presenter stage profile reason=%s prelude(w=%" PRIu64 "us cpu=%" PRIu64 "us wait=%" PRIu64 "us rq=%" PRIu64 "us) "
+             "emitter_queue(w=%" PRIu64 "us cpu=%" PRIu64 "us wait=%" PRIu64 "us rq=%" PRIu64 "us) "
+             "status_log(w=%" PRIu64 "us cpu=%" PRIu64 "us wait=%" PRIu64 "us rq=%" PRIu64 "us) "
+             "compose(w=%" PRIu64 "us cpu=%" PRIu64 "us wait=%" PRIu64 "us rq=%" PRIu64 "us) "
+             "gl_lock(w=%" PRIu64 "us cpu=%" PRIu64 "us wait=%" PRIu64 "us rq=%" PRIu64 "us) "
+             "make_current(w=%" PRIu64 "us cpu=%" PRIu64 "us wait=%" PRIu64 "us rq=%" PRIu64 "us) "
+             "total(w=%" PRIu64 "us cpu=%" PRIu64 "us wait=%" PRIu64 "us rq=%" PRIu64 "us) "
+             "prepare(w=%" PRIu64 "us cpu=%" PRIu64 "us wait=%" PRIu64 "us rq=%" PRIu64 "us) "
+             "display(w=%" PRIu64 "us cpu=%" PRIu64 "us wait=%" PRIu64 "us rq=%" PRIu64 "us) "
+             "swap_mode=%s swap(w=%" PRIu64 "us cpu=%" PRIu64 "us wait=%" PRIu64 "us rq=%" PRIu64 "us) "
+             "cleanup(w=%" PRIu64 "us cpu=%" PRIu64 "us wait=%" PRIu64 "us rq=%" PRIu64 "us)",
+             reason,
+             profile->prelude.wall_ns / 1000, profile->prelude.cpu_ns / 1000,
+             Open3DPresenterStageMetricWaitNs(&profile->prelude) / 1000,
+             profile->prelude.runq_valid ? profile->prelude.runq_ns / 1000 : 0,
+             profile->emitter_queue.wall_ns / 1000, profile->emitter_queue.cpu_ns / 1000,
+             Open3DPresenterStageMetricWaitNs(&profile->emitter_queue) / 1000,
+             profile->emitter_queue.runq_valid ? profile->emitter_queue.runq_ns / 1000 : 0,
+             profile->status_log.wall_ns / 1000, profile->status_log.cpu_ns / 1000,
+             Open3DPresenterStageMetricWaitNs(&profile->status_log) / 1000,
+             profile->status_log.runq_valid ? profile->status_log.runq_ns / 1000 : 0,
+             profile->compose.wall_ns / 1000, profile->compose.cpu_ns / 1000,
+             Open3DPresenterStageMetricWaitNs(&profile->compose) / 1000,
+             profile->compose.runq_valid ? profile->compose.runq_ns / 1000 : 0,
+             profile->gl_lock.wall_ns / 1000, profile->gl_lock.cpu_ns / 1000,
+             Open3DPresenterStageMetricWaitNs(&profile->gl_lock) / 1000,
+             profile->gl_lock.runq_valid ? profile->gl_lock.runq_ns / 1000 : 0,
+             profile->make_current.wall_ns / 1000, profile->make_current.cpu_ns / 1000,
+             Open3DPresenterStageMetricWaitNs(&profile->make_current) / 1000,
+             profile->make_current.runq_valid ? profile->make_current.runq_ns / 1000 : 0,
+             profile->total.wall_ns / 1000, profile->total.cpu_ns / 1000,
+             Open3DPresenterStageMetricWaitNs(&profile->total) / 1000,
+             profile->total.runq_valid ? profile->total.runq_ns / 1000 : 0,
+             profile->prepare.wall_ns / 1000, profile->prepare.cpu_ns / 1000,
+             Open3DPresenterStageMetricWaitNs(&profile->prepare) / 1000,
+             profile->prepare.runq_valid ? profile->prepare.runq_ns / 1000 : 0,
+             profile->display.wall_ns / 1000, profile->display.cpu_ns / 1000,
+             Open3DPresenterStageMetricWaitNs(&profile->display) / 1000,
+             profile->display.runq_valid ? profile->display.runq_ns / 1000 : 0,
+             profile->explicit_swap ? "explicit" : "embedded",
+             profile->swap.wall_ns / 1000, profile->swap.cpu_ns / 1000,
+             Open3DPresenterStageMetricWaitNs(&profile->swap) / 1000,
+             profile->swap.runq_valid ? profile->swap.runq_ns / 1000 : 0,
+             profile->cleanup.wall_ns / 1000, profile->cleanup.cpu_ns / 1000,
+             Open3DPresenterStageMetricWaitNs(&profile->cleanup) / 1000,
+             profile->cleanup.runq_valid ? profile->cleanup.runq_ns / 1000 : 0);
 }
 
 static int Open3DConfigVarCallback(vlc_object_t *obj, char const *varname,
@@ -2975,6 +3382,67 @@ static void Open3DMaybeLogStatus(vout_display_t *vd, vout_display_sys_t *sys,
     const uint64_t avg_sleep_overshoot_us = presenter_ticks > 0
                                           ? (sys->presenter_sleep_overshoot_total / presenter_ticks)
                                           : 0;
+    const uint64_t profiled_frames = sys->presenter_profiled_frame_count;
+    const uint64_t prelude_avg_wall_us = profiled_frames > 0
+                                       ? (sys->presenter_prelude_wall_total_ns / profiled_frames) / 1000
+                                       : 0;
+    const uint64_t prelude_avg_cpu_us = profiled_frames > 0
+                                      ? (sys->presenter_prelude_cpu_total_ns / profiled_frames) / 1000
+                                      : 0;
+    const uint64_t emitter_queue_avg_wall_us = profiled_frames > 0
+                                             ? (sys->presenter_emitter_queue_wall_total_ns / profiled_frames) / 1000
+                                             : 0;
+    const uint64_t emitter_queue_avg_cpu_us = profiled_frames > 0
+                                            ? (sys->presenter_emitter_queue_cpu_total_ns / profiled_frames) / 1000
+                                            : 0;
+    const uint64_t status_log_avg_wall_us = profiled_frames > 0
+                                          ? (sys->presenter_status_log_wall_total_ns / profiled_frames) / 1000
+                                          : 0;
+    const uint64_t status_log_avg_cpu_us = profiled_frames > 0
+                                         ? (sys->presenter_status_log_cpu_total_ns / profiled_frames) / 1000
+                                         : 0;
+    const uint64_t compose_avg_wall_us = profiled_frames > 0
+                                       ? (sys->presenter_compose_wall_total_ns / profiled_frames) / 1000
+                                       : 0;
+    const uint64_t compose_avg_cpu_us = profiled_frames > 0
+                                      ? (sys->presenter_compose_cpu_total_ns / profiled_frames) / 1000
+                                      : 0;
+    const uint64_t gl_lock_avg_wall_us = profiled_frames > 0
+                                       ? (sys->presenter_gl_lock_wall_total_ns / profiled_frames) / 1000
+                                       : 0;
+    const uint64_t gl_lock_avg_cpu_us = profiled_frames > 0
+                                      ? (sys->presenter_gl_lock_cpu_total_ns / profiled_frames) / 1000
+                                      : 0;
+    const uint64_t make_current_avg_wall_us = profiled_frames > 0
+                                            ? (sys->presenter_make_current_wall_total_ns / profiled_frames) / 1000
+                                            : 0;
+    const uint64_t make_current_avg_cpu_us = profiled_frames > 0
+                                           ? (sys->presenter_make_current_cpu_total_ns / profiled_frames) / 1000
+                                           : 0;
+    const uint64_t prepare_avg_wall_us = profiled_frames > 0
+                                       ? (sys->presenter_prepare_wall_total_ns / profiled_frames) / 1000
+                                       : 0;
+    const uint64_t prepare_avg_cpu_us = profiled_frames > 0
+                                      ? (sys->presenter_prepare_cpu_total_ns / profiled_frames) / 1000
+                                      : 0;
+    const uint64_t display_avg_wall_us = profiled_frames > 0
+                                       ? (sys->presenter_display_wall_total_ns / profiled_frames) / 1000
+                                       : 0;
+    const uint64_t display_avg_cpu_us = profiled_frames > 0
+                                      ? (sys->presenter_display_cpu_total_ns / profiled_frames) / 1000
+                                      : 0;
+    const uint64_t swap_avg_wall_us = profiled_frames > 0
+                                    ? (sys->presenter_swap_wall_total_ns / profiled_frames) / 1000
+                                    : 0;
+    const uint64_t swap_avg_cpu_us = profiled_frames > 0
+                                   ? (sys->presenter_swap_cpu_total_ns / profiled_frames) / 1000
+                                   : 0;
+    const uint64_t cleanup_avg_wall_us = profiled_frames > 0
+                                       ? (sys->presenter_cleanup_wall_total_ns / profiled_frames) / 1000
+                                       : 0;
+    const uint64_t cleanup_avg_cpu_us = profiled_frames > 0
+                                      ? (sys->presenter_cleanup_cpu_total_ns / profiled_frames) / 1000
+                                      : 0;
 
     if (eye_source != NULL)
     {
@@ -2994,6 +3462,7 @@ static void Open3DMaybeLogStatus(vout_display_t *vd, vout_display_sys_t *sys,
                 eye_source->i_sar_num,
                 eye_source->i_sar_den);
         if (sys->presenter_enable)
+        {
             msg_Dbg(vd,
                     "open3d presenter stats ticks=%" PRIu64 " late_events=%" PRIu64 " late_steps=%" PRIu64 " miss_events=%" PRIu64 " miss_steps=%" PRIu64 " miss_max=%" PRId64 "us render_avg=%" PRIu64 "us render_max=%" PRId64 "us sleep_overshoot_avg=%" PRIu64 "us sleep_overshoot_max=%" PRId64 "us rt=%s affinity=%s cpu=%d",
                     presenter_ticks,
@@ -3009,6 +3478,53 @@ static void Open3DMaybeLogStatus(vout_display_t *vd, vout_display_sys_t *sys,
                     sys->presenter_rt_enabled ? "on" : "off",
                     sys->presenter_affinity_enabled ? "on" : "off",
                     sys->presenter_affinity_cpu);
+            if (profiled_frames > 0)
+                msg_Dbg(vd,
+                        "open3d presenter outer stage stats profiled=%" PRIu64 " prelude_avg=%" PRIu64 "us prelude_cpu_avg=%" PRIu64 "us prelude_max=%" PRIu64 "us cleanup_avg=%" PRIu64 "us cleanup_cpu_avg=%" PRIu64 "us cleanup_max=%" PRIu64 "us",
+                        profiled_frames,
+                        prelude_avg_wall_us,
+                        prelude_avg_cpu_us,
+                        sys->presenter_prelude_wall_max_ns / 1000,
+                        cleanup_avg_wall_us,
+                        cleanup_avg_cpu_us,
+                        sys->presenter_cleanup_wall_max_ns / 1000);
+            if (profiled_frames > 0)
+                msg_Dbg(vd,
+                        "open3d presenter prelude stage stats profiled=%" PRIu64 " emitter_queue_avg=%" PRIu64 "us emitter_queue_cpu_avg=%" PRIu64 "us emitter_queue_max=%" PRIu64 "us status_log_avg=%" PRIu64 "us status_log_cpu_avg=%" PRIu64 "us status_log_max=%" PRIu64 "us",
+                        profiled_frames,
+                        emitter_queue_avg_wall_us,
+                        emitter_queue_avg_cpu_us,
+                        sys->presenter_emitter_queue_wall_max_ns / 1000,
+                        status_log_avg_wall_us,
+                        status_log_avg_cpu_us,
+                        sys->presenter_status_log_wall_max_ns / 1000);
+            if (profiled_frames > 0)
+                msg_Dbg(vd,
+                        "open3d presenter pregl stage stats profiled=%" PRIu64 " compose_avg=%" PRIu64 "us compose_cpu_avg=%" PRIu64 "us compose_max=%" PRIu64 "us gl_lock_avg=%" PRIu64 "us gl_lock_cpu_avg=%" PRIu64 "us gl_lock_max=%" PRIu64 "us make_current_avg=%" PRIu64 "us make_current_cpu_avg=%" PRIu64 "us make_current_max=%" PRIu64 "us",
+                        profiled_frames,
+                        compose_avg_wall_us,
+                        compose_avg_cpu_us,
+                        sys->presenter_compose_wall_max_ns / 1000,
+                        gl_lock_avg_wall_us,
+                        gl_lock_avg_cpu_us,
+                        sys->presenter_gl_lock_wall_max_ns / 1000,
+                        make_current_avg_wall_us,
+                        make_current_avg_cpu_us,
+                        sys->presenter_make_current_wall_max_ns / 1000);
+            if (profiled_frames > 0)
+                msg_Dbg(vd,
+                        "open3d presenter stage stats profiled=%" PRIu64 " prepare_avg=%" PRIu64 "us prepare_cpu_avg=%" PRIu64 "us prepare_max=%" PRIu64 "us display_avg=%" PRIu64 "us display_cpu_avg=%" PRIu64 "us display_max=%" PRIu64 "us swap_avg=%" PRIu64 "us swap_cpu_avg=%" PRIu64 "us swap_max=%" PRIu64 "us",
+                        profiled_frames,
+                        prepare_avg_wall_us,
+                        prepare_avg_cpu_us,
+                        sys->presenter_prepare_wall_max_ns / 1000,
+                        display_avg_wall_us,
+                        display_avg_cpu_us,
+                        sys->presenter_display_wall_max_ns / 1000,
+                        swap_avg_wall_us,
+                        swap_avg_cpu_us,
+                        sys->presenter_swap_wall_max_ns / 1000);
+        }
     }
     else
     {
@@ -3022,6 +3538,7 @@ static void Open3DMaybeLogStatus(vout_display_t *vd, vout_display_sys_t *sys,
                 sys->late_flip_steps_total,
                 frame_clock);
         if (sys->presenter_enable)
+        {
             msg_Dbg(vd,
                     "open3d presenter stats ticks=%" PRIu64 " late_events=%" PRIu64 " late_steps=%" PRIu64 " miss_events=%" PRIu64 " miss_steps=%" PRIu64 " miss_max=%" PRId64 "us render_avg=%" PRIu64 "us render_max=%" PRId64 "us sleep_overshoot_avg=%" PRIu64 "us sleep_overshoot_max=%" PRId64 "us rt=%s affinity=%s cpu=%d",
                     presenter_ticks,
@@ -3037,10 +3554,107 @@ static void Open3DMaybeLogStatus(vout_display_t *vd, vout_display_sys_t *sys,
                     sys->presenter_rt_enabled ? "on" : "off",
                     sys->presenter_affinity_enabled ? "on" : "off",
                     sys->presenter_affinity_cpu);
+            if (profiled_frames > 0)
+                msg_Dbg(vd,
+                        "open3d presenter outer stage stats profiled=%" PRIu64 " prelude_avg=%" PRIu64 "us prelude_cpu_avg=%" PRIu64 "us prelude_max=%" PRIu64 "us cleanup_avg=%" PRIu64 "us cleanup_cpu_avg=%" PRIu64 "us cleanup_max=%" PRIu64 "us",
+                        profiled_frames,
+                        prelude_avg_wall_us,
+                        prelude_avg_cpu_us,
+                        sys->presenter_prelude_wall_max_ns / 1000,
+                        cleanup_avg_wall_us,
+                        cleanup_avg_cpu_us,
+                        sys->presenter_cleanup_wall_max_ns / 1000);
+            if (profiled_frames > 0)
+                msg_Dbg(vd,
+                        "open3d presenter prelude stage stats profiled=%" PRIu64 " emitter_queue_avg=%" PRIu64 "us emitter_queue_cpu_avg=%" PRIu64 "us emitter_queue_max=%" PRIu64 "us status_log_avg=%" PRIu64 "us status_log_cpu_avg=%" PRIu64 "us status_log_max=%" PRIu64 "us",
+                        profiled_frames,
+                        emitter_queue_avg_wall_us,
+                        emitter_queue_avg_cpu_us,
+                        sys->presenter_emitter_queue_wall_max_ns / 1000,
+                        status_log_avg_wall_us,
+                        status_log_avg_cpu_us,
+                        sys->presenter_status_log_wall_max_ns / 1000);
+            if (profiled_frames > 0)
+                msg_Dbg(vd,
+                        "open3d presenter pregl stage stats profiled=%" PRIu64 " compose_avg=%" PRIu64 "us compose_cpu_avg=%" PRIu64 "us compose_max=%" PRIu64 "us gl_lock_avg=%" PRIu64 "us gl_lock_cpu_avg=%" PRIu64 "us gl_lock_max=%" PRIu64 "us make_current_avg=%" PRIu64 "us make_current_cpu_avg=%" PRIu64 "us make_current_max=%" PRIu64 "us",
+                        profiled_frames,
+                        compose_avg_wall_us,
+                        compose_avg_cpu_us,
+                        sys->presenter_compose_wall_max_ns / 1000,
+                        gl_lock_avg_wall_us,
+                        gl_lock_avg_cpu_us,
+                        sys->presenter_gl_lock_wall_max_ns / 1000,
+                        make_current_avg_wall_us,
+                        make_current_avg_cpu_us,
+                        sys->presenter_make_current_wall_max_ns / 1000);
+            if (profiled_frames > 0)
+                msg_Dbg(vd,
+                        "open3d presenter stage stats profiled=%" PRIu64 " prepare_avg=%" PRIu64 "us prepare_cpu_avg=%" PRIu64 "us prepare_max=%" PRIu64 "us display_avg=%" PRIu64 "us display_cpu_avg=%" PRIu64 "us display_max=%" PRIu64 "us swap_avg=%" PRIu64 "us swap_cpu_avg=%" PRIu64 "us swap_max=%" PRIu64 "us",
+                        profiled_frames,
+                        prepare_avg_wall_us,
+                        prepare_avg_cpu_us,
+                        sys->presenter_prepare_wall_max_ns / 1000,
+                        display_avg_wall_us,
+                        display_avg_cpu_us,
+                        sys->presenter_display_wall_max_ns / 1000,
+                        swap_avg_wall_us,
+                        swap_avg_cpu_us,
+                        sys->presenter_swap_wall_max_ns / 1000);
+        }
     }
 
     sys->last_logged_pack = pack_mode;
     sys->last_logged_eye = show_right_eye;
+}
+
+static bool Open3DShouldLogPresenterEvents(const vout_display_sys_t *sys)
+{
+    return sys != NULL &&
+           (sys->debug_status || sys->presenter_telemetry || sys->presenter_stage_profile);
+}
+
+static void Open3DMaybeLogPresenterTelemetry(vout_display_t *vd, vout_display_sys_t *sys,
+                                             open3d_pack_t pack_mode, bool show_right_eye,
+                                             vlc_tick_t frame_clock, unsigned flips)
+{
+    if (!sys->presenter_telemetry)
+        return;
+
+    const unsigned interval = sys->presenter_telemetry_interval > 0
+                            ? (unsigned)sys->presenter_telemetry_interval
+                            : 120U;
+    const bool periodic = (sys->frame_count % interval) == 0;
+    const bool late = flips > 1;
+    const bool first = sys->frame_count == 0;
+
+    if (!(periodic || late || first))
+        return;
+
+    const uint64_t presenter_ticks = sys->presenter_tick_count;
+    const uint64_t avg_render_us = presenter_ticks > 0
+                                 ? (sys->presenter_render_total / presenter_ticks)
+                                 : 0;
+    const uint64_t avg_sleep_overshoot_us = presenter_ticks > 0
+                                          ? (sys->presenter_sleep_overshoot_total / presenter_ticks)
+                                          : 0;
+
+    msg_Dbg(vd,
+            "open3d presenter telemetry frame=%" PRIu64 " pack=%s eye=%s flips=%u clock=%" PRId64
+            " ticks=%" PRIu64 " miss_events=%" PRIu64 " over_budget=%" PRIu64
+            " render_avg=%" PRIu64 "us sleep_overshoot_avg=%" PRIu64 "us rt=%s affinity=%s cpu=%d",
+            sys->frame_count,
+            Open3DPackName(pack_mode),
+            show_right_eye ? "right" : "left",
+            flips,
+            frame_clock,
+            presenter_ticks,
+            sys->presenter_deadline_miss_events,
+            sys->presenter_render_over_budget_events,
+            avg_render_us,
+            avg_sleep_overshoot_us,
+            sys->presenter_rt_enabled ? "on" : "off",
+            sys->presenter_affinity_enabled ? "on" : "off",
+            sys->presenter_affinity_cpu);
 }
 
 static void Open3DApplyEyeCrop(const video_format_t *source,
@@ -3237,13 +3851,998 @@ static subpicture_t *Open3DCloneSubpicture(const subpicture_t *base_subpicture)
     return copy;
 }
 
+static subpicture_t *Open3DCloneSubpictureShallow(const subpicture_t *base_subpicture)
+{
+    if (base_subpicture == NULL)
+        return NULL;
+
+    subpicture_t *copy = subpicture_New(NULL);
+    if (copy == NULL)
+        return NULL;
+
+    copy->i_channel = base_subpicture->i_channel;
+    copy->i_order = base_subpicture->i_order;
+    copy->i_start = base_subpicture->i_start;
+    copy->i_stop = base_subpicture->i_stop;
+    copy->b_ephemer = base_subpicture->b_ephemer;
+    copy->b_fade = base_subpicture->b_fade;
+    copy->b_subtitle = base_subpicture->b_subtitle;
+    copy->b_absolute = base_subpicture->b_absolute;
+    copy->i_original_picture_width = base_subpicture->i_original_picture_width;
+    copy->i_original_picture_height = base_subpicture->i_original_picture_height;
+    copy->i_alpha = base_subpicture->i_alpha;
+
+    if (Open3DCloneRegionChainShallow(&copy->p_region, base_subpicture->p_region) != VLC_SUCCESS)
+    {
+        subpicture_Delete(copy);
+        return NULL;
+    }
+    return copy;
+}
+
+static vout_thread_t *Open3DGetParentVout(vout_display_t *vd)
+{
+    if (vd == NULL || vd->obj.parent == NULL)
+        return NULL;
+    return (vout_thread_t *)vd->obj.parent;
+}
+
+static void Open3DSetDirectBluraySubtitleBridge(vout_display_t *vd, bool enabled)
+{
+    vout_thread_t *p_vout = Open3DGetParentVout(vd);
+    Open3DSubtitleBridgeSetEnabledOnObject(VLC_OBJECT(p_vout), enabled);
+}
+
+static bool Open3DGetBluraySubtitleOffsetState(vout_display_t *vd,
+                                               bool *valid_out,
+                                               int *signed_out,
+                                               int *seq_out,
+                                               int *frame_out)
+{
+    vout_thread_t *p_vout = Open3DGetParentVout(vd);
+    if (valid_out != NULL)
+        *valid_out = false;
+    if (signed_out != NULL)
+        *signed_out = 0;
+    if (seq_out != NULL)
+        *seq_out = -1;
+    if (frame_out != NULL)
+        *frame_out = -1;
+
+    if (p_vout == NULL)
+        return false;
+
+    open3d_subtitle_depth_state_t depth_state;
+    if (!Open3DSubtitleDepthReadFromObjectTree(VLC_OBJECT(p_vout), &depth_state))
+    {
+        static vlc_tick_t last_missing_log = VLC_TICK_INVALID;
+        const vlc_tick_t now = mdate();
+        if (last_missing_log == VLC_TICK_INVALID || now - last_missing_log >= CLOCK_FREQ * 2)
+        {
+            const int valid_type = var_Type(p_vout, OPEN3D_SUBTITLE_OFFSET_VALID_VAR);
+            const int signed_type = var_Type(p_vout, OPEN3D_SUBTITLE_OFFSET_SIGNED_VAR);
+            const int seq_type = var_Type(p_vout, OPEN3D_SUBTITLE_OFFSET_SEQ_VAR);
+            msg_Dbg(vd,
+                    "open3d subtitle offset vars missing on vout tree valid=%d signed=%d seq=%d",
+                    valid_type, signed_type, seq_type);
+            last_missing_log = now;
+        }
+        return false;
+    }
+    if (valid_out != NULL)
+        *valid_out = depth_state.valid;
+    if (signed_out != NULL)
+        *signed_out = depth_state.signed_offset;
+    if (seq_out != NULL)
+        *seq_out = depth_state.valid ? depth_state.sequence : -1;
+    if (frame_out != NULL)
+        *frame_out = depth_state.frame_index;
+
+    static vlc_tick_t last_state_log = VLC_TICK_INVALID;
+    const vlc_tick_t now = mdate();
+    if (last_state_log == VLC_TICK_INVALID || now - last_state_log >= CLOCK_FREQ * 2)
+    {
+        msg_Dbg(vd,
+                "open3d subtitle offset state valid=%d signed=%d seq=%d frame=%d",
+                valid_out != NULL ? *valid_out : depth_state.valid,
+                signed_out != NULL ? *signed_out : depth_state.signed_offset,
+                seq_out != NULL ? *seq_out : (depth_state.valid ? depth_state.sequence : -1),
+                frame_out != NULL ? *frame_out : depth_state.frame_index);
+        last_state_log = now;
+    }
+    return true;
+}
+
+static void Open3DRecordBluraySubtitleOffsetSample(vout_display_sys_t *sys,
+                                                   bool valid,
+                                                   int seq,
+                                                   int signed_offset,
+                                                   int frame_index)
+{
+    if (sys == NULL)
+        return;
+
+    if (!valid || seq < 0)
+    {
+        sys->bluray_subtitle_offset_last_valid = false;
+        return;
+    }
+
+    if (sys->bluray_subtitle_offset_last_valid &&
+        sys->bluray_subtitle_offset_last_seq == seq &&
+        sys->bluray_subtitle_offset_last_signed == signed_offset &&
+        sys->bluray_subtitle_offset_last_frame == frame_index)
+        return;
+
+    open3d_bluray_subtitle_offset_sample_t *sample =
+        &sys->bluray_subtitle_offset_history[sys->bluray_subtitle_offset_history_head];
+    sample->valid = true;
+    sample->wallclock = mdate();
+    sample->seq = seq;
+    sample->signed_offset = signed_offset;
+    sample->frame_index = frame_index;
+
+    sys->bluray_subtitle_offset_history_head =
+        (sys->bluray_subtitle_offset_history_head + 1) %
+        OPEN3D_BLURAY_SUBTITLE_OFFSET_HISTORY_CAP;
+    sys->bluray_subtitle_offset_last_valid = true;
+    sys->bluray_subtitle_offset_last_seq = seq;
+    sys->bluray_subtitle_offset_last_signed = signed_offset;
+    sys->bluray_subtitle_offset_last_frame = frame_index;
+}
+
+static bool Open3DFindRecentBluraySubtitleOffset(vout_display_sys_t *sys,
+                                                 int seq,
+                                                 vlc_tick_t now,
+                                                 int *signed_out,
+                                                 int *frame_out,
+                                                 vlc_tick_t *age_out)
+{
+    if (sys == NULL || seq < 0)
+        return false;
+
+    for (unsigned i = 0; i < OPEN3D_BLURAY_SUBTITLE_OFFSET_HISTORY_CAP; ++i)
+    {
+        unsigned idx = (sys->bluray_subtitle_offset_history_head +
+                        OPEN3D_BLURAY_SUBTITLE_OFFSET_HISTORY_CAP - 1 - i) %
+                       OPEN3D_BLURAY_SUBTITLE_OFFSET_HISTORY_CAP;
+        const open3d_bluray_subtitle_offset_sample_t *sample =
+            &sys->bluray_subtitle_offset_history[idx];
+        if (!sample->valid || sample->seq != seq)
+            continue;
+
+        const vlc_tick_t age = now >= sample->wallclock ? now - sample->wallclock : 0;
+        if (age > VLC_TICK_FROM_MS(250))
+            continue;
+
+        if (signed_out != NULL)
+            *signed_out = sample->signed_offset;
+        if (frame_out != NULL)
+            *frame_out = sample->frame_index;
+        if (age_out != NULL)
+            *age_out = age;
+        return true;
+    }
+
+    return false;
+}
+
+static bool Open3DResolveBluraySubtitleOffset(vout_display_t *vd,
+                                              vout_display_sys_t *sys,
+                                              uint64_t content_signature,
+                                              bool live_valid,
+                                              int live_seq,
+                                              int live_signed,
+                                              int live_frame,
+                                              int *resolved_seq_out,
+                                              int *resolved_signed_out)
+{
+    if (vd == NULL || sys == NULL || !live_valid || live_seq < 0)
+    {
+        if (sys != NULL)
+            sys->bluray_subtitle_offset_latch.valid = false;
+        return false;
+    }
+
+    Open3DRecordBluraySubtitleOffsetSample(sys, live_valid, live_seq, live_signed, live_frame);
+
+    if (sys->bluray_subtitle_offset_latch.valid &&
+        sys->bluray_subtitle_offset_latch.content_signature == content_signature &&
+        sys->bluray_subtitle_offset_latch.seq == live_seq)
+    {
+        if (resolved_seq_out != NULL)
+            *resolved_seq_out = sys->bluray_subtitle_offset_latch.seq;
+        if (resolved_signed_out != NULL)
+            *resolved_signed_out = sys->bluray_subtitle_offset_latch.signed_offset;
+        return true;
+    }
+
+    const vlc_tick_t now = mdate();
+    int chosen_signed = live_signed;
+    int chosen_frame = live_frame;
+    vlc_tick_t history_age = VLC_TICK_INVALID;
+    const bool from_history =
+        Open3DFindRecentBluraySubtitleOffset(sys, live_seq, now,
+                                            &chosen_signed, &chosen_frame,
+                                            &history_age);
+
+    sys->bluray_subtitle_offset_latch.valid = true;
+    sys->bluray_subtitle_offset_latch.content_signature = content_signature;
+    sys->bluray_subtitle_offset_latch.seq = live_seq;
+    sys->bluray_subtitle_offset_latch.signed_offset = chosen_signed;
+    sys->bluray_subtitle_offset_latch.frame_index = chosen_frame;
+    sys->bluray_subtitle_offset_latch.latched_at = now;
+
+    if (sys->debug_status)
+    {
+        msg_Dbg(vd,
+                "open3d subtitle offset latch sig=%" PRIx64
+                " seq=%d live=%d frame=%d chosen=%d source=%s age_ms=%" PRId64,
+                content_signature,
+                live_seq, live_signed, live_frame, chosen_signed,
+                from_history ? "history" : "live",
+                history_age != VLC_TICK_INVALID ? MS_FROM_VLC_TICK(history_age) : INT64_C(-1));
+    }
+
+    if (resolved_seq_out != NULL)
+        *resolved_seq_out = live_seq;
+    if (resolved_signed_out != NULL)
+        *resolved_signed_out = chosen_signed;
+    return true;
+}
+
+static subpicture_t *Open3DCloneDirectBluraySubtitleSubpicture(vout_display_t *vd)
+{
+    vout_thread_t *p_vout = Open3DGetParentVout(vd);
+    if (p_vout == NULL)
+        return NULL;
+
+    open3d_subtitle_bridge_t *bridge =
+        Open3DSubtitleBridgeGetFromObject(VLC_OBJECT(p_vout));
+    if (bridge == NULL)
+        return NULL;
+
+    return Open3DSubtitleBridgeCloneSubpicture(bridge);
+}
+
+static subpicture_t *Open3DMergeSubpictures(const subpicture_t *base_subpicture,
+                                            const subpicture_t *extra_subpicture)
+{
+    if (base_subpicture == NULL && extra_subpicture == NULL)
+        return NULL;
+
+    subpicture_t *merged = subpicture_New(NULL);
+    if (merged == NULL)
+        return NULL;
+
+    const subpicture_t *seed = base_subpicture != NULL ? base_subpicture
+                                                       : extra_subpicture;
+    merged->i_channel = seed->i_channel;
+    merged->i_order = seed->i_order;
+    merged->i_start = seed->i_start;
+    merged->i_stop = seed->i_stop;
+    merged->b_ephemer = seed->b_ephemer;
+    merged->b_fade = seed->b_fade;
+    merged->b_subtitle = (base_subpicture != NULL && base_subpicture->b_subtitle) ||
+                         (extra_subpicture != NULL && extra_subpicture->b_subtitle);
+    merged->b_absolute = seed->b_absolute;
+    merged->i_original_picture_width = seed->i_original_picture_width;
+    merged->i_original_picture_height = seed->i_original_picture_height;
+    merged->i_alpha = seed->i_alpha;
+
+    if (base_subpicture != NULL &&
+        Open3DCopyRegionChain(&merged->p_region, base_subpicture->p_region) != VLC_SUCCESS)
+    {
+        subpicture_Delete(merged);
+        return NULL;
+    }
+
+    if (extra_subpicture != NULL)
+    {
+        subpicture_region_t *extra_chain = NULL;
+        if (Open3DCopyRegionChain(&extra_chain, extra_subpicture->p_region) != VLC_SUCCESS)
+        {
+            subpicture_Delete(merged);
+            return NULL;
+        }
+        Open3DRegionChainAppend(&merged->p_region, extra_chain);
+
+        if (merged->i_original_picture_width <= 0)
+            merged->i_original_picture_width = extra_subpicture->i_original_picture_width;
+        if (merged->i_original_picture_height <= 0)
+            merged->i_original_picture_height = extra_subpicture->i_original_picture_height;
+        if (merged->i_start == VLC_TICK_INVALID || merged->i_start == 0)
+            merged->i_start = extra_subpicture->i_start;
+        if (merged->i_stop == VLC_TICK_INVALID || merged->i_stop == 0)
+            merged->i_stop = extra_subpicture->i_stop;
+        if (extra_subpicture->b_subtitle)
+            merged->b_subtitle = true;
+    }
+
+    return merged;
+}
+
+static uint64_t Open3DSubtitleCacheHashMix(uint64_t hash, uint64_t value)
+{
+    hash ^= value;
+    hash *= UINT64_C(1099511628211);
+    return hash;
+}
+
+static uint64_t Open3DSubtitleCacheHashPlaneSamples(uint64_t hash, const plane_t *plane)
+{
+    if (plane == NULL || plane->p_pixels == NULL || plane->i_pitch <= 0 || plane->i_lines <= 0)
+        return Open3DSubtitleCacheHashMix(hash, 0);
+
+    const size_t span = (size_t)plane->i_pitch * (size_t)plane->i_lines;
+    hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)plane->i_pitch);
+    hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)plane->i_lines);
+
+    const unsigned sample_count = span < 16 ? (unsigned)span : 16u;
+    for (unsigned i = 0; i < sample_count; ++i)
+    {
+        const size_t pos = sample_count == 1
+                         ? 0
+                         : ((span - 1) * (size_t)i) / (size_t)(sample_count - 1);
+        hash = Open3DSubtitleCacheHashMix(hash, plane->p_pixels[pos]);
+    }
+
+    return hash;
+}
+
+static uint64_t Open3DSubtitleCacheSignature(const subpicture_t *subpicture)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+
+    if (subpicture == NULL)
+        return 0;
+
+    hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)subpicture->i_channel);
+    hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)subpicture->i_order);
+    hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)subpicture->i_original_picture_width);
+    hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)subpicture->i_original_picture_height);
+    hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)subpicture->i_alpha);
+    hash = Open3DSubtitleCacheHashMix(hash, subpicture->b_absolute ? 1u : 0u);
+    hash = Open3DSubtitleCacheHashMix(hash, subpicture->b_subtitle ? 1u : 0u);
+
+    for (const subpicture_region_t *region = subpicture->p_region; region != NULL; region = region->p_next)
+    {
+        hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)region->i_x);
+        hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)region->i_y);
+        hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)region->i_align);
+        hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)region->i_alpha);
+        hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)region->fmt.i_visible_width);
+        hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)region->fmt.i_visible_height);
+        hash = Open3DSubtitleCacheHashMix(hash, region->p_picture != NULL ? 1u : 0u);
+        hash = Open3DSubtitleCacheHashMix(hash, region->p_text != NULL ? 1u : 0u);
+
+        if (region->p_picture != NULL)
+        {
+            hash = Open3DSubtitleCacheHashMix(hash, (uint64_t)(uint32_t)region->p_picture->i_planes);
+            for (int i = 0; i < region->p_picture->i_planes; ++i)
+                hash = Open3DSubtitleCacheHashPlaneSamples(hash, &region->p_picture->p[i]);
+        }
+    }
+
+    return hash;
+}
+
+static subpicture_t *Open3DCloneBluraySubtitleFallback(vout_display_t *vd,
+                                                       const subpicture_t *base_subpicture)
+{
+    if (vd == NULL || base_subpicture == NULL)
+        return NULL;
+    vout_display_sys_t *sys = vd->sys;
+    if (sys == NULL)
+        return NULL;
+    sys->debug_bluray_subtitle_active = false;
+    sys->debug_bluray_subtitle_cache_hit = false;
+    if (base_subpicture->b_subtitle)
+    {
+        static vlc_tick_t last_bsubtitle_log = VLC_TICK_INVALID;
+        const vlc_tick_t now = mdate();
+        if (last_bsubtitle_log == VLC_TICK_INVALID || now - last_bsubtitle_log >= CLOCK_FREQ * 2)
+        {
+            msg_Dbg(vd, "open3d fallback skipped because incoming subpicture already has b_subtitle=1");
+            last_bsubtitle_log = now;
+        }
+        return NULL;
+    }
+    if (base_subpicture->p_region == NULL)
+    {
+        static vlc_tick_t last_regionless_log = VLC_TICK_INVALID;
+        const vlc_tick_t now = mdate();
+        if (last_regionless_log == VLC_TICK_INVALID || now - last_regionless_log >= CLOCK_FREQ * 2)
+        {
+            msg_Dbg(vd, "open3d fallback skipped because incoming subpicture has no regions");
+            last_regionless_log = now;
+        }
+        return NULL;
+    }
+    unsigned packed_width = vd->source.i_visible_width > 0
+                          ? vd->source.i_visible_width
+                          : vd->source.i_width;
+    unsigned packed_height = vd->source.i_visible_height > 0
+                           ? vd->source.i_visible_height
+                           : vd->source.i_height;
+    open3d_pack_t pack_mode = Open3DDetectPackMode(vd, sys);
+    const uint64_t content_signature = Open3DSubtitleCacheSignature(base_subpicture);
+    bool offset_valid = false;
+    int live_offset_units = 0;
+    int offset_units = 0;
+    int live_offset_seq = -1;
+    int offset_seq = -1;
+    int live_offset_frame = -1;
+    if (!Open3DGetBluraySubtitleOffsetState(vd, &offset_valid,
+                                            &live_offset_units,
+                                            &live_offset_seq,
+                                            &live_offset_frame) ||
+        !Open3DResolveBluraySubtitleOffset(vd, sys, content_signature,
+                                           offset_valid,
+                                           live_offset_seq,
+                                           live_offset_units,
+                                           live_offset_frame,
+                                           &offset_seq,
+                                           &offset_units))
+    {
+        static vlc_tick_t last_no_offset_log = VLC_TICK_INVALID;
+        const vlc_tick_t now = mdate();
+        if (last_no_offset_log == VLC_TICK_INVALID || now - last_no_offset_log >= CLOCK_FREQ * 2)
+        {
+            msg_Dbg(vd,
+                    "open3d fallback skipped because subtitle offset state unavailable seq=%d",
+                    live_offset_seq);
+            last_no_offset_log = now;
+        }
+        return NULL;
+    }
+    uint64_t signature = content_signature;
+    signature = Open3DSubtitleCacheHashMix(signature, (uint64_t)(uint32_t)offset_seq);
+    signature = Open3DSubtitleCacheHashMix(signature, (uint64_t)(uint32_t)(uint8_t)offset_units);
+    signature = Open3DSubtitleCacheHashMix(signature, (uint64_t)(uint32_t)pack_mode);
+    signature = Open3DSubtitleCacheHashMix(signature, (uint64_t)packed_width);
+    signature = Open3DSubtitleCacheHashMix(signature, (uint64_t)packed_height);
+    signature = Open3DSubtitleCacheHashMix(signature, sys->subtitle_depth_enable ? 1u : 0u);
+    signature = Open3DSubtitleCacheHashMix(signature, (uint64_t)(uint32_t)sys->subtitle_depth_unit_px);
+
+    open3d_bluray_subtitle_cache_t *cache = &sys->bluray_subtitle_cache;
+    const bool cache_hit = cache->valid &&
+                           cache->signature == signature &&
+                           cache->pack_mode == pack_mode &&
+                           cache->packed_width == packed_width &&
+                           cache->packed_height == packed_height &&
+                           cache->subtitle_depth_enable == sys->subtitle_depth_enable &&
+                           cache->subtitle_depth_unit_px == sys->subtitle_depth_unit_px &&
+                           cache->offset_signed == offset_units &&
+                           cache->offset_seq == offset_seq;
+    const vlc_tick_t now = mdate();
+
+    if (!cache_hit)
+    {
+        const bool depth_refresh = cache->valid &&
+                                   sys->debug_bluray_subtitle_signature == content_signature;
+        const int old_offset = cache->offset_signed;
+        const int old_seq = cache->offset_seq;
+        Open3DBluraySubtitleCacheClear(cache);
+        cache->signature = signature;
+        cache->pack_mode = pack_mode;
+        cache->packed_width = packed_width;
+        cache->packed_height = packed_height;
+        cache->subtitle_depth_enable = sys->subtitle_depth_enable;
+        cache->subtitle_depth_unit_px = sys->subtitle_depth_unit_px;
+        cache->offset_signed = offset_units;
+        cache->offset_seq = offset_seq;
+
+        subpicture_t *left = Open3DCloneSubpictureShallow(base_subpicture);
+        subpicture_t *right = Open3DCloneSubpictureShallow(base_subpicture);
+        if (left != NULL)
+            left->b_subtitle = true;
+        if (right != NULL)
+            right->b_subtitle = true;
+
+        if (left == NULL || right == NULL)
+        {
+            if (left != NULL)
+                subpicture_Delete(left);
+            if (right != NULL)
+                subpicture_Delete(right);
+            Open3DBluraySubtitleCacheClear(cache);
+            return NULL;
+        }
+
+        if (pack_mode != OPEN3D_PACK_NONE)
+        {
+            unsigned eye_width = packed_width;
+            switch (pack_mode)
+            {
+                case OPEN3D_PACK_SBS_FULL:
+                case OPEN3D_PACK_SBS_HALF:
+                    eye_width = packed_width / 2;
+                    break;
+                default:
+                    eye_width = packed_width;
+                    break;
+            }
+            Open3DApplySubtitleStereoShift(vd, sys, left, eye_width, false);
+            Open3DApplySubtitleStereoShift(vd, sys, right, eye_width, true);
+
+            subpicture_t *packed_source = Open3DCloneSubpictureShallow(base_subpicture);
+            if (packed_source != NULL)
+            {
+                packed_source->b_subtitle = true;
+                cache->packed = Open3DBuildPackedStereoSubtitleSubpicture(vd, sys,
+                                                                          packed_source,
+                                                                          pack_mode);
+                subpicture_Delete(packed_source);
+            }
+        }
+
+        cache->pf_left = left;
+        cache->pf_right = right;
+        cache->valid = true;
+        sys->bluray_subtitle_cache_misses++;
+        sys->debug_bluray_subtitle_last_change = now;
+        if (sys->debug_status)
+        {
+            const int64_t pts = base_subpicture->i_start;
+            if (depth_refresh)
+            {
+                msg_Dbg(vd,
+                        "open3d subtitle depth refresh sig=%" PRIx64
+                        " seq=%d->%d signed=%d->%d pts=%" PRId64 " age_ms=%" PRId64,
+                        content_signature, old_seq, offset_seq, old_offset, offset_units,
+                        pts,
+                        pts != VLC_TICK_INVALID ? MS_FROM_VLC_TICK(now - pts) : INT64_C(-1));
+            }
+            else
+            {
+                msg_Dbg(vd,
+                        "open3d subtitle cache rebuild sig=%" PRIx64
+                        " seq=%d signed=%d pts=%" PRId64 " pack=%d",
+                        content_signature, offset_seq, offset_units,
+                        pts, (int)pack_mode);
+            }
+        }
+    }
+    else
+    {
+        sys->bluray_subtitle_cache_hits++;
+    }
+
+    static vlc_tick_t last_log = VLC_TICK_INVALID;
+    if (last_log == VLC_TICK_INVALID || now - last_log >= CLOCK_FREQ * 2)
+    {
+        int region_count = 0;
+        for (const subpicture_region_t *region = base_subpicture->p_region; region != NULL; region = region->p_next)
+            region_count++;
+        msg_Dbg(vd,
+                "open3d forcing Blu-ray subtitle treatment on composed subpicture "
+                "regions=%d orig=%dx%d seq=%d",
+                region_count,
+                base_subpicture->i_original_picture_width,
+                base_subpicture->i_original_picture_height,
+                offset_seq);
+        last_log = now;
+    }
+
+    sys->debug_bluray_subtitle_active = true;
+    sys->debug_bluray_subtitle_cache_hit = cache_hit;
+    sys->debug_bluray_subtitle_offset_seq = offset_seq;
+    sys->debug_bluray_subtitle_offset_signed = offset_units;
+    sys->debug_bluray_subtitle_signature = content_signature;
+    sys->debug_bluray_subtitle_pts = base_subpicture->i_start;
+
+    subpicture_t *result = NULL;
+    if (!sys->enabled && pack_mode != OPEN3D_PACK_NONE && cache->packed != NULL)
+        result = Open3DCloneSubpictureShallow(cache->packed);
+    else if (sys->enabled && cache->pf_right != NULL && cache->pf_left != NULL)
+        result = Open3DCloneSubpictureShallow(sys->show_right_eye ? cache->pf_right
+                                                                  : cache->pf_left);
+    else if (cache->pf_left != NULL)
+        result = Open3DCloneSubpictureShallow(cache->pf_left);
+
+    return result;
+}
+
+static bool Open3DSubpictureHasBitmapRegions(const subpicture_t *subpicture)
+{
+    if (subpicture == NULL)
+        return false;
+
+    for (const subpicture_region_t *region = subpicture->p_region;
+         region != NULL; region = region->p_next)
+    {
+        if (region->p_picture != NULL)
+            return true;
+    }
+    return false;
+}
+
+static bool Open3DResolvePreferredSubtitleOffset(vout_display_t *vd,
+                                                 vout_display_sys_t *sys,
+                                                 bool *offset_valid_out,
+                                                 int *offset_units_out,
+                                                 int *offset_seq_out);
+
+static void Open3DRefreshMkvSubtitleSettings(vout_display_t *vd,
+                                             vout_display_sys_t *sys)
+{
+    if (vd == NULL || sys == NULL)
+        return;
+
+    bool bridge_present = false;
+    bool mkv_subtitle_force = false;
+    int mkv_subtitle_static_offset_units = 0;
+    int mkv_subtitle_plane = -1;
+    int mkv_subtitle_source_id = -1;
+    vlc_object_t *bridge_owner =
+        vd->obj.libvlc != NULL ? VLC_OBJECT(vd->obj.libvlc) : NULL;
+    if (Open3DMkvSubtitleBridgeReadFromObject(bridge_owner, &bridge_present,
+                                              &mkv_subtitle_force,
+                                              &mkv_subtitle_static_offset_units,
+                                              &mkv_subtitle_plane,
+                                              &mkv_subtitle_source_id) &&
+        bridge_present)
+    {
+        if (!mkv_subtitle_force)
+        {
+            mkv_subtitle_static_offset_units = 0;
+            mkv_subtitle_plane = -1;
+            mkv_subtitle_source_id = -1;
+        }
+    }
+    else
+    {
+        mkv_subtitle_force = var_InheritBool(vd, "open3d-mkv-subtitle-force");
+        mkv_subtitle_static_offset_units =
+            var_InheritInteger(vd, "open3d-mkv-subtitle-static-offset-units");
+        mkv_subtitle_plane =
+            var_InheritInteger(vd, "open3d-mkv-subtitle-plane");
+        mkv_subtitle_source_id =
+            var_InheritInteger(vd, "open3d-mkv-subtitle-source-id");
+    }
+
+    if (mkv_subtitle_force == sys->mkv_subtitle_force &&
+        mkv_subtitle_static_offset_units == sys->mkv_subtitle_static_offset_units &&
+        mkv_subtitle_plane == sys->mkv_subtitle_plane &&
+        mkv_subtitle_source_id == sys->mkv_subtitle_source_id)
+        return;
+
+    sys->mkv_subtitle_force = mkv_subtitle_force;
+    sys->mkv_subtitle_static_offset_units = mkv_subtitle_static_offset_units;
+    sys->mkv_subtitle_plane = mkv_subtitle_plane;
+    sys->mkv_subtitle_source_id = mkv_subtitle_source_id;
+
+    msg_Dbg(vd,
+            "open3d refreshed MKV subtitle settings force=%d static_units=%d plane=%d source_id=%d via=%s",
+            sys->mkv_subtitle_force ? 1 : 0,
+            sys->mkv_subtitle_static_offset_units,
+            sys->mkv_subtitle_plane,
+            sys->mkv_subtitle_source_id,
+            bridge_present ? "bridge" : "inherited");
+}
+
+static subpicture_t *Open3DCloneMkvSubtitleFallback(vout_display_t *vd,
+                                                    const subpicture_t *base_subpicture)
+{
+    if (vd == NULL || base_subpicture == NULL)
+        return NULL;
+
+    vout_display_sys_t *sys = vd->sys;
+    Open3DRefreshMkvSubtitleSettings(vd, sys);
+    if (sys == NULL || !sys->mkv_subtitle_force)
+        return NULL;
+
+    if (base_subpicture->b_subtitle || base_subpicture->p_region == NULL)
+        return NULL;
+
+    if (!Open3DSubpictureHasBitmapRegions(base_subpicture))
+        return NULL;
+
+    subpicture_t *copy = Open3DCloneSubpictureShallow(base_subpicture);
+    if (copy == NULL)
+        return NULL;
+
+    copy->b_subtitle = true;
+    sys->debug_bluray_subtitle_active = true;
+    sys->debug_bluray_subtitle_cache_hit = false;
+    bool preferred_offset_valid = false;
+    int preferred_offset_units = sys->mkv_subtitle_static_offset_units;
+    int preferred_offset_seq = -1;
+    Open3DResolvePreferredSubtitleOffset(vd, sys,
+                                         &preferred_offset_valid,
+                                         &preferred_offset_units,
+                                         &preferred_offset_seq);
+    sys->debug_bluray_subtitle_offset_seq = preferred_offset_valid ? preferred_offset_seq : -1;
+    sys->debug_bluray_subtitle_offset_signed = preferred_offset_units;
+    sys->debug_bluray_subtitle_signature = Open3DSubtitleCacheSignature(base_subpicture);
+    sys->debug_bluray_subtitle_pts = base_subpicture->i_start;
+
+    static vlc_tick_t last_log = VLC_TICK_INVALID;
+    const vlc_tick_t now = mdate();
+    if (last_log == VLC_TICK_INVALID || now - last_log >= CLOCK_FREQ * 2)
+    {
+        int region_count = 0;
+        for (const subpicture_region_t *region = base_subpicture->p_region; region != NULL; region = region->p_next)
+            region_count++;
+        msg_Dbg(vd,
+                "open3d forcing MKV subtitle treatment on composed subpicture "
+                "regions=%d orig=%dx%d static_units=%d preferred_units=%d seq=%d plane=%d source_id=%d",
+                region_count,
+                base_subpicture->i_original_picture_width,
+                base_subpicture->i_original_picture_height,
+                sys->mkv_subtitle_static_offset_units,
+                preferred_offset_units,
+                preferred_offset_valid ? preferred_offset_seq : -1,
+                sys->mkv_subtitle_plane,
+                sys->mkv_subtitle_source_id);
+        last_log = now;
+    }
+
+    return copy;
+}
+
+static void Open3DShiftRegionChain(subpicture_region_t *chain, int dx, int dy)
+{
+    for (subpicture_region_t *region = chain; region != NULL; region = region->p_next)
+    {
+        region->i_x += dx;
+        region->i_y += dy;
+    }
+}
+
+static bool Open3DResolvePreferredSubtitleOffset(vout_display_t *vd,
+                                                 vout_display_sys_t *sys,
+                                                 bool *offset_valid_out,
+                                                 int *offset_units_out,
+                                                 int *offset_seq_out)
+{
+    if (offset_valid_out != NULL)
+        *offset_valid_out = false;
+    if (offset_units_out != NULL)
+        *offset_units_out = 0;
+    if (offset_seq_out != NULL)
+        *offset_seq_out = -1;
+
+    if (vd == NULL || sys == NULL)
+        return false;
+
+    Open3DRefreshMkvSubtitleSettings(vd, sys);
+
+    if (sys->bluray_subtitle_offset_latch.valid)
+    {
+        if (offset_valid_out != NULL)
+            *offset_valid_out = true;
+        if (offset_units_out != NULL)
+            *offset_units_out = sys->bluray_subtitle_offset_latch.signed_offset;
+        if (offset_seq_out != NULL)
+            *offset_seq_out = sys->bluray_subtitle_offset_latch.seq;
+        return true;
+    }
+
+    bool bridge_valid = false;
+    int bridge_units = 0;
+    int bridge_seq = -1;
+    if (Open3DGetBluraySubtitleOffsetState(vd, &bridge_valid, &bridge_units,
+                                           &bridge_seq, NULL) &&
+        bridge_valid)
+    {
+        if (offset_valid_out != NULL)
+            *offset_valid_out = true;
+        if (offset_units_out != NULL)
+            *offset_units_out = bridge_units;
+        if (offset_seq_out != NULL)
+            *offset_seq_out = bridge_seq;
+        return true;
+    }
+
+    if (sys->mkv_subtitle_static_offset_units != 0)
+    {
+        if (offset_valid_out != NULL)
+            *offset_valid_out = true;
+        if (offset_units_out != NULL)
+            *offset_units_out = sys->mkv_subtitle_static_offset_units;
+        return true;
+    }
+
+    return false;
+}
+
+static bool Open3DComputeSubtitleStereoDelta(vout_display_t *vd,
+                                             vout_display_sys_t *sys,
+                                             unsigned eye_width,
+                                             int *delta_px_out)
+{
+    if (delta_px_out == NULL)
+        return false;
+
+    *delta_px_out = 0;
+
+    if (vd == NULL || sys == NULL || !sys->subtitle_depth_enable || eye_width == 0)
+        return false;
+
+    bool offset_valid = false;
+    int offset_units = 0;
+    int offset_seq = -1;
+    if (!Open3DResolvePreferredSubtitleOffset(vd, sys,
+                                              &offset_valid,
+                                              &offset_units,
+                                              &offset_seq) ||
+        !offset_valid)
+        return false;
+
+    sys->debug_bluray_subtitle_offset_seq = offset_seq;
+    sys->debug_bluray_subtitle_offset_signed = offset_units;
+
+    if (offset_units == 0 || sys->subtitle_depth_unit_px == 0)
+        return false;
+
+    const double width_scale = (double)eye_width / 1920.0;
+    const int delta_px = (int)lround((double)offset_units *
+                                     (double)sys->subtitle_depth_unit_px *
+                                     width_scale);
+    if (delta_px == 0)
+        return false;
+
+    *delta_px_out = delta_px;
+    return true;
+}
+
+static void Open3DApplySubtitleStereoShiftToChain(vout_display_t *vd,
+                                                  vout_display_sys_t *sys,
+                                                  subpicture_region_t *chain,
+                                                  unsigned eye_width,
+                                                  bool show_right_eye)
+{
+    int delta_px = 0;
+    if (!Open3DComputeSubtitleStereoDelta(vd, sys, eye_width, &delta_px))
+        return;
+
+    int eye_shift = show_right_eye ? delta_px / 2 : -delta_px / 2;
+    if ((delta_px & 1) && show_right_eye)
+        eye_shift += (delta_px > 0) ? 1 : -1;
+
+    Open3DShiftRegionChain(chain, eye_shift, 0);
+}
+
+static bool Open3DSubtitleUsesPackedCoordinates(const subpicture_t *subpicture,
+                                                open3d_pack_t pack_mode,
+                                                unsigned packed_width,
+                                                unsigned packed_height)
+{
+    if (subpicture == NULL || packed_width == 0 || packed_height == 0)
+        return false;
+
+    switch (pack_mode)
+    {
+        case OPEN3D_PACK_SBS_FULL:
+        case OPEN3D_PACK_SBS_HALF:
+            return subpicture->i_original_picture_width > 0 &&
+                   (unsigned)subpicture->i_original_picture_width == packed_width;
+        case OPEN3D_PACK_TB_FULL:
+        case OPEN3D_PACK_TB_HALF:
+            return subpicture->i_original_picture_height > 0 &&
+                   (unsigned)subpicture->i_original_picture_height == packed_height;
+        default:
+            return false;
+    }
+}
+
+static subpicture_t *Open3DBuildPackedStereoSubtitleSubpicture(vout_display_t *vd,
+                                                               vout_display_sys_t *sys,
+                                                               const subpicture_t *base_subpicture,
+                                                               open3d_pack_t pack_mode)
+{
+    if (vd == NULL || sys == NULL || base_subpicture == NULL ||
+        !base_subpicture->b_subtitle || pack_mode == OPEN3D_PACK_NONE)
+        return NULL;
+
+    unsigned packed_width = vd->source.i_visible_width > 0
+                          ? vd->source.i_visible_width
+                          : vd->source.i_width;
+    unsigned packed_height = vd->source.i_visible_height > 0
+                           ? vd->source.i_visible_height
+                           : vd->source.i_height;
+    unsigned eye_width = packed_width;
+    unsigned eye_height = packed_height;
+    unsigned output_orig_width = packed_width;
+    unsigned output_orig_height = packed_height;
+    int right_dx = 0;
+    int right_dy = 0;
+    const bool packed_relative =
+        Open3DSubtitleUsesPackedCoordinates(base_subpicture, pack_mode,
+                                            packed_width, packed_height);
+
+    switch (pack_mode)
+    {
+        case OPEN3D_PACK_SBS_FULL:
+        case OPEN3D_PACK_SBS_HALF:
+            eye_width = packed_width / 2;
+            right_dx = (int)eye_width;
+            if (packed_relative)
+            {
+                output_orig_width = packed_width * 2;
+                right_dx = (int)packed_width;
+            }
+            break;
+        case OPEN3D_PACK_TB_FULL:
+        case OPEN3D_PACK_TB_HALF:
+            eye_height = packed_height / 2;
+            right_dy = (int)eye_height;
+            if (packed_relative)
+            {
+                output_orig_height = packed_height * 2;
+                right_dy = (int)packed_height;
+            }
+            break;
+        default:
+            return NULL;
+    }
+
+    if (packed_width == 0 || packed_height == 0 || eye_width == 0 || eye_height == 0)
+        return NULL;
+
+    subpicture_t *packed = subpicture_New(NULL);
+    if (packed == NULL)
+        return NULL;
+
+    packed->i_channel = base_subpicture->i_channel;
+    packed->i_order = base_subpicture->i_order;
+    packed->i_start = base_subpicture->i_start;
+    packed->i_stop = base_subpicture->i_stop;
+    packed->b_ephemer = base_subpicture->b_ephemer;
+    packed->b_fade = base_subpicture->b_fade;
+    packed->b_subtitle = base_subpicture->b_subtitle;
+    packed->b_absolute = base_subpicture->b_absolute;
+    packed->i_original_picture_width = (int)output_orig_width;
+    packed->i_original_picture_height = (int)output_orig_height;
+    packed->i_alpha = base_subpicture->i_alpha;
+
+    subpicture_region_t *left_chain = NULL;
+    subpicture_region_t *right_chain = NULL;
+
+    if (Open3DCloneRegionChainShallow(&left_chain, base_subpicture->p_region) != VLC_SUCCESS ||
+        Open3DCloneRegionChainShallow(&right_chain, base_subpicture->p_region) != VLC_SUCCESS)
+    {
+        subpicture_region_ChainDelete(left_chain);
+        subpicture_region_ChainDelete(right_chain);
+        subpicture_Delete(packed);
+        return NULL;
+    }
+
+    Open3DApplySubtitleStereoShiftToChain(vd, sys, left_chain, eye_width, false);
+    Open3DShiftRegionChain(right_chain, right_dx, right_dy);
+    Open3DApplySubtitleStereoShiftToChain(vd, sys, right_chain, eye_width, true);
+
+    static vlc_tick_t last_pack_log = VLC_TICK_INVALID;
+    const vlc_tick_t now = mdate();
+    if (last_pack_log == VLC_TICK_INVALID || now - last_pack_log >= CLOCK_FREQ * 2)
+    {
+        msg_Dbg(vd,
+                "open3d packed subtitle normalize packed_relative=%d pack=%d "
+                "base_orig=%dx%d out_orig=%ux%u right=(%d,%d)",
+                packed_relative ? 1 : 0, (int)pack_mode,
+                base_subpicture->i_original_picture_width,
+                base_subpicture->i_original_picture_height,
+                output_orig_width, output_orig_height,
+                right_dx, right_dy);
+        last_pack_log = now;
+    }
+
+    packed->p_region = left_chain;
+    Open3DRegionChainAppend(&packed->p_region, right_chain);
+    return packed;
+}
+
 static void Open3DPresenterStoreFrame(vout_display_sys_t *sys, picture_t *pic,
                                       const subpicture_t *subpicture)
 {
     if (sys == NULL || pic == NULL)
         return;
 
-    subpicture_t *sub_copy = Open3DCloneSubpicture(subpicture);
+    /* Presenter ownership only needs retained region/picture references here.
+     * Avoid deep-copying subtitle bitmap planes on every stored frame. */
+    subpicture_t *sub_copy = Open3DCloneSubpictureShallow(subpicture);
     picture_t *old_pic = NULL;
     subpicture_t *old_sub = NULL;
     vlc_mutex_lock(&sys->presenter_lock);
@@ -3286,7 +4885,7 @@ static void Open3DPresenterGetFrame(vout_display_sys_t *sys,
         generation != last_generation &&
         sys->presenter_picture != NULL &&
         sys->presenter_subpicture != NULL)
-        *sub_out = Open3DCloneSubpicture(sys->presenter_subpicture);
+        *sub_out = Open3DCloneSubpictureShallow(sys->presenter_subpicture);
     vlc_mutex_unlock(&sys->presenter_lock);
 }
 
@@ -3338,6 +4937,20 @@ static void Open3DRegionChainPrependChain(subpicture_region_t **head,
         tail = tail->p_next;
     tail->p_next = *head;
     *head = chain;
+}
+
+static void Open3DApplySubtitleStereoShift(vout_display_t *vd,
+                                           vout_display_sys_t *sys,
+                                           subpicture_t *subpicture,
+                                           unsigned base_width,
+                                           bool show_right_eye)
+{
+    if (vd == NULL || sys == NULL || subpicture == NULL ||
+        !sys->subtitle_depth_enable || !subpicture->b_subtitle) {
+        return;
+    }
+    Open3DApplySubtitleStereoShiftToChain(vd, sys, subpicture->p_region,
+                                          base_width, show_right_eye);
 }
 
 static subpicture_region_t *Open3DCreateSolidRegion(unsigned width, unsigned height,
@@ -4596,6 +6209,9 @@ static bool Open3DOverlayActive(vout_display_sys_t *sys, open3d_pack_t pack_mode
 static subpicture_t *Open3DBuildOverlaySubpicture(vout_display_t *vd,
                                                   vout_display_sys_t *sys,
                                                   const subpicture_t *base_subpicture,
+                                                  bool base_subpicture_shifted,
+                                                  const subpicture_t *extra_subpicture,
+                                                  bool extra_subpicture_shifted,
                                                   const video_format_t *eye_source,
                                                   open3d_pack_t pack_mode,
                                                   bool show_right_eye,
@@ -4604,6 +6220,9 @@ static subpicture_t *Open3DBuildOverlaySubpicture(vout_display_t *vd,
     subpicture_t *merged = subpicture_New(NULL);
     if (merged == NULL)
         return NULL;
+
+    subpicture_region_t *base_chain = NULL;
+    subpicture_region_t *extra_chain = NULL;
 
     if (base_subpicture != NULL)
     {
@@ -4624,6 +6243,24 @@ static subpicture_t *Open3DBuildOverlaySubpicture(vout_display_t *vd,
             subpicture_Delete(merged);
             return NULL;
         }
+        base_chain = merged->p_region;
+    }
+
+    if (extra_subpicture != NULL)
+    {
+        if (Open3DCopyRegionChain(&extra_chain, extra_subpicture->p_region) != VLC_SUCCESS)
+        {
+            subpicture_Delete(merged);
+            return NULL;
+        }
+        Open3DRegionChainAppend(&merged->p_region, extra_chain);
+
+        if (merged->i_original_picture_width <= 0)
+            merged->i_original_picture_width = extra_subpicture->i_original_picture_width;
+        if (merged->i_original_picture_height <= 0)
+            merged->i_original_picture_height = extra_subpicture->i_original_picture_height;
+        if (extra_subpicture->b_subtitle)
+            merged->b_subtitle = true;
     }
 
     unsigned base_width = merged->i_original_picture_width > 0
@@ -4642,6 +6279,25 @@ static subpicture_t *Open3DBuildOverlaySubpicture(vout_display_t *vd,
         merged->i_original_picture_width = (int)base_width;
     if (merged->i_original_picture_height <= 0)
         merged->i_original_picture_height = (int)base_height;
+    if (sys->enabled && pack_mode != OPEN3D_PACK_NONE)
+    {
+        const unsigned shift_width = eye_source->i_visible_width > 0
+                                   ? eye_source->i_visible_width
+                                   : (eye_source->i_width > 0 ? eye_source->i_width
+                                                              : base_width);
+        if (base_chain != NULL &&
+            base_subpicture != NULL &&
+            base_subpicture->b_subtitle &&
+            !base_subpicture_shifted)
+            Open3DApplySubtitleStereoShiftToChain(vd, sys, base_chain,
+                                                  shift_width, show_right_eye);
+        if (extra_chain != NULL &&
+            extra_subpicture != NULL &&
+            extra_subpicture->b_subtitle &&
+            !extra_subpicture_shifted)
+            Open3DApplySubtitleStereoShiftToChain(vd, sys, extra_chain,
+                                                  shift_width, show_right_eye);
+    }
 
     const unsigned eye_width = eye_source->i_visible_width > 0
                              ? eye_source->i_visible_width
@@ -4832,7 +6488,8 @@ static subpicture_t *Open3DPresenterOverlayCacheGet(vout_display_t *vd,
         return entry->subpicture;
     }
 
-    subpicture_t *fresh = Open3DBuildOverlaySubpicture(vd, sys, NULL,
+    subpicture_t *fresh = Open3DBuildOverlaySubpicture(vd, sys, NULL, false,
+                                                       NULL, false,
                                                        eye_source,
                                                        pack_mode,
                                                        show_right_eye,
@@ -6987,10 +8644,15 @@ static int Open(vlc_object_t *obj)
     sys->presenter_picture = NULL;
     sys->presenter_subpicture = NULL;
     sys->presenter_generation = 0;
+    sys->presenter_schedstat_fd = -1;
     sys->place_valid = false;
     sys->place_force = true;
     memset(&sys->last_place, 0, sizeof(sys->last_place));
+    sys->presenter_rt_priority_request = -1;
+    sys->presenter_affinity_cpu_request = -1;
+    sys->presenter_prefault_kb_request = 0;
     sys->presenter_affinity_cpu = -1;
+    sys->presenter_prefault_buffer = NULL;
     sys->emitter_stop = false;
     sys->emitter_started = false;
     sys->emitter_eye_pending = false;
@@ -7020,6 +8682,13 @@ static int Open(vlc_object_t *obj)
     sys->enabled = var_InheritBool(vd, "open3d-enable");
     sys->swap_eyes = var_InheritBool(vd, "open3d-flip-eyes");
     sys->debug_status = var_InheritBool(vd, "open3d-debug-status");
+    sys->subtitle_depth_enable = var_InheritBool(vd, "open3d-subtitle-depth-enable");
+    sys->subtitle_depth_unit_px = var_InheritInteger(vd, "open3d-subtitle-depth-unit-px");
+    sys->mkv_subtitle_static_offset_units = 0;
+    sys->mkv_subtitle_force = false;
+    sys->mkv_subtitle_plane = -1;
+    sys->mkv_subtitle_source_id = -1;
+    Open3DRefreshMkvSubtitleSettings(vd, sys);
 
     sys->trigger_enable = var_InheritBool(vd, "open3d-trigger-enable");
     int trigger_size = var_InheritInteger(vd, "open3d-trigger-size");
@@ -7182,6 +8851,34 @@ static int Open(vlc_object_t *obj)
     if (sys->presenter_period <= 0)
         sys->presenter_period = CLOCK_FREQ / 120;
     sys->gpu_overlay_enable = var_InheritBool(vd, "open3d-gpu-overlay-enable");
+    sys->presenter_telemetry = var_InheritBool(vd, "open3d-presenter-telemetry");
+    sys->presenter_telemetry_interval = var_InheritInteger(vd, "open3d-presenter-telemetry-interval");
+    if (sys->presenter_telemetry_interval <= 0)
+        sys->presenter_telemetry_interval = 120;
+    sys->presenter_stage_profile = var_InheritBool(vd, "open3d-presenter-stage-profile");
+    sys->presenter_rt_request = var_InheritBool(vd, "open3d-presenter-rt-enable");
+    sys->presenter_rt_priority_request = var_InheritInteger(vd, "open3d-presenter-rt-priority");
+    sys->presenter_affinity_request = var_InheritBool(vd, "open3d-presenter-affinity-enable");
+    sys->presenter_affinity_cpu_request = var_InheritInteger(vd, "open3d-presenter-affinity-cpu");
+    sys->presenter_memory_lock_request = var_InheritBool(vd, "open3d-presenter-memory-lock");
+    sys->presenter_prefault_kb_request = var_InheritInteger(vd, "open3d-presenter-prefault-kb");
+    sys->presenter_lead_us_request = var_InheritInteger(vd, "open3d-presenter-lead-us");
+    if (sys->presenter_prefault_kb_request < 0)
+        sys->presenter_prefault_kb_request = 0;
+    if (sys->presenter_lead_us_request < 0)
+        sys->presenter_lead_us_request = 0;
+    sys->presenter_lead = sys->presenter_lead_us_request;
+    if (sys->presenter_period > 0 && sys->presenter_lead >= sys->presenter_period)
+        sys->presenter_lead = sys->presenter_period - 1;
+    msg_Dbg(vd,
+            "open3d presenter tuning config rt_enable=%d rt_priority=%d affinity_enable=%d affinity_cpu=%d memlock=%d prefault_kb=%d lead_us=%" PRId64,
+            sys->presenter_rt_request ? 1 : 0,
+            sys->presenter_rt_priority_request,
+            sys->presenter_affinity_request ? 1 : 0,
+            sys->presenter_affinity_cpu_request,
+            sys->presenter_memory_lock_request ? 1 : 0,
+            sys->presenter_prefault_kb_request,
+            sys->presenter_lead);
     Open3DPresenterStatePublish(sys);
 
     sys->last_logged_pack = OPEN3D_PACK_NONE;
@@ -7214,6 +8911,8 @@ static int Open(vlc_object_t *obj)
         Open3DTextRegionCacheClear(&sys->status_calib_serial_cache);
         Open3DTriggerRegionCacheClear(&sys->trigger_region_cache);
         Open3DCalibrationRegionCacheClear(&sys->calibration_region_cache);
+        Open3DBluraySubtitleCacheClear(&sys->bluray_subtitle_cache);
+        Open3DBluraySubtitleCacheClear(&sys->bluray_subtitle_cache);
         free(sys->emitter_tty_selected);
         free(sys->emitter_tty);
         free(sys->emitter_settings_json_path);
@@ -7249,6 +8948,7 @@ static int Open(vlc_object_t *obj)
         Open3DTextRegionCacheClear(&sys->status_calib_serial_cache);
         Open3DTriggerRegionCacheClear(&sys->trigger_region_cache);
         Open3DCalibrationRegionCacheClear(&sys->calibration_region_cache);
+        Open3DBluraySubtitleCacheClear(&sys->bluray_subtitle_cache);
         free(sys->emitter_tty_selected);
         free(sys->emitter_tty);
         free(sys->emitter_settings_json_path);
@@ -7286,6 +8986,7 @@ static int Open(vlc_object_t *obj)
         Open3DTextRegionCacheClear(&sys->status_calib_serial_cache);
         Open3DTriggerRegionCacheClear(&sys->trigger_region_cache);
         Open3DCalibrationRegionCacheClear(&sys->calibration_region_cache);
+        Open3DBluraySubtitleCacheClear(&sys->bluray_subtitle_cache);
         free(sys->emitter_tty_selected);
         free(sys->emitter_tty);
         free(sys->emitter_settings_json_path);
@@ -7358,6 +9059,7 @@ static int Open(vlc_object_t *obj)
     vd->prepare = PictureRender;
     vd->display = PictureDisplay;
     vd->control = Control;
+    Open3DSetDirectBluraySubtitleBridge(vd, true);
     var_AddCallback(vd, "open3d-layout", Open3DConfigVarCallback, sys);
     var_AddCallback(vd, "open3d-default-half-layout", Open3DConfigVarCallback, sys);
     var_AddCallback(vd, "open3d-hotkeys-profile", Open3DConfigVarCallback, sys);
@@ -7422,6 +9124,8 @@ static void Close(vlc_object_t *obj)
     vout_display_t *vd = (vout_display_t *)obj;
     vout_display_sys_t *sys = vd->sys;
 
+    Open3DSetDirectBluraySubtitleBridge(vd, false);
+
     if (sys->presenter_started)
     {
         vlc_mutex_lock(&sys->presenter_lock);
@@ -7452,6 +9156,15 @@ static void Close(vlc_object_t *obj)
         vlc_join(sys->emitter_thread, NULL);
         sys->emitter_started = false;
     }
+
+    if (sys->presenter_schedstat_fd >= 0)
+    {
+        close(sys->presenter_schedstat_fd);
+        sys->presenter_schedstat_fd = -1;
+    }
+    free(sys->presenter_prefault_buffer);
+    sys->presenter_prefault_buffer = NULL;
+    sys->presenter_prefault_bytes = 0;
 
     var_DelCallback(vd, "open3d-layout", Open3DConfigVarCallback, sys);
     var_DelCallback(vd, "open3d-default-half-layout", Open3DConfigVarCallback, sys);
@@ -7495,6 +9208,7 @@ static void Close(vlc_object_t *obj)
     Open3DTextRegionCacheClear(&sys->status_calib_serial_cache);
     Open3DTriggerRegionCacheClear(&sys->trigger_region_cache);
     Open3DCalibrationRegionCacheClear(&sys->calibration_region_cache);
+    Open3DBluraySubtitleCacheClear(&sys->bluray_subtitle_cache);
     Open3DOverlayCacheClear(sys);
     vlc_gl_t *gl = sys->gl;
     vout_window_t *surface = gl->surface;
@@ -7590,11 +9304,21 @@ static void Open3DPresenterRenderTick(vout_display_t *vd, vout_display_sys_t *sy
     open3d_presenter_state_snapshot_t state;
     video_format_t eye_source = vd->source;
     open3d_pack_t pack_mode = OPEN3D_PACK_NONE;
+    open3d_pack_t detected_pack_mode = OPEN3D_PACK_NONE;
     bool show_right_eye = false;
     unsigned flips = 0;
+    open3d_presenter_stage_stamp_t prelude_start = {0}, prelude_end = {0};
+    open3d_presenter_stage_stamp_t emitter_queue_start = {0}, emitter_queue_end = {0};
+    open3d_presenter_stage_stamp_t status_log_start = {0}, status_log_end = {0};
+    open3d_presenter_stage_stamp_t compose_start = {0}, compose_end = {0};
+    open3d_presenter_stage_stamp_t gl_lock_start = {0}, gl_lock_end = {0};
+    open3d_presenter_stage_stamp_t make_current_start = {0}, make_current_end = {0};
+    open3d_presenter_stage_stamp_t cleanup_start = {0}, cleanup_end = {0};
 
     if (frame_clock == VLC_TICK_INVALID)
         frame_clock = mdate();
+    if (sys->presenter_stage_profile)
+        Open3DPresenterStageStampNow(sys, &prelude_start);
 
     if (!sys->control_started)
     {
@@ -7604,12 +9328,13 @@ static void Open3DPresenterRenderTick(vout_display_t *vd, vout_display_sys_t *sy
     }
 
     Open3DPresenterStateRead(sys, &state);
+    detected_pack_mode = Open3DDetectPackModeWithState(vd,
+                                                       state.forced_layout,
+                                                       state.default_half_layout);
 
     if (state.enabled)
     {
-        pack_mode = Open3DDetectPackModeWithState(vd,
-                                                  state.forced_layout,
-                                                  state.default_half_layout);
+        pack_mode = detected_pack_mode;
         if (pack_mode != OPEN3D_PACK_NONE)
         {
             flips = Open3DAdvanceEye(sys, state.enabled, frame_clock);
@@ -7619,7 +9344,11 @@ static void Open3DPresenterRenderTick(vout_display_t *vd, vout_display_sys_t *sy
                 show_right_eye = !show_right_eye;
 
             Open3DApplyEyeCrop(&vd->source, pack_mode, show_right_eye, &eye_source);
+            if (sys->presenter_stage_profile)
+                Open3DPresenterStageStampNow(sys, &emitter_queue_start);
             Open3DEmitterQueueEye(sys, show_right_eye, frame_clock);
+            if (sys->presenter_stage_profile)
+                Open3DPresenterStageStampNow(sys, &emitter_queue_end);
 
             if (flips > 1)
             {
@@ -7628,8 +9357,14 @@ static void Open3DPresenterRenderTick(vout_display_t *vd, vout_display_sys_t *sy
             }
 
             sys->frame_count++;
+            if (Open3DShouldLogPresenterEvents(sys) && sys->presenter_stage_profile)
+                Open3DPresenterStageStampNow(sys, &status_log_start);
             Open3DMaybeLogStatus(vd, sys, pack_mode, show_right_eye, frame_clock, flips,
                                  &eye_source);
+            Open3DMaybeLogPresenterTelemetry(vd, sys, pack_mode, show_right_eye, frame_clock,
+                                             flips);
+            if (Open3DShouldLogPresenterEvents(sys) && sys->presenter_stage_profile)
+                Open3DPresenterStageStampNow(sys, &status_log_end);
             sys->warned_missing_pack = false;
         }
         else if (!sys->warned_missing_pack)
@@ -7646,15 +9381,84 @@ static void Open3DPresenterRenderTick(vout_display_t *vd, vout_display_sys_t *sy
     }
     else
     {
+        pack_mode = detected_pack_mode;
         sys->warned_missing_pack = false;
         Open3DEmitterRequestEyeReset(sys);
     }
 
+    if (sys->presenter_stage_profile)
+    {
+        Open3DPresenterStageStampNow(sys, &prelude_end);
+        Open3DPresenterStageStampNow(sys, &compose_start);
+    }
+
+    sys->debug_bluray_subtitle_active = false;
+    sys->debug_bluray_subtitle_cache_hit = false;
+    subpicture_t *bridge_subpicture = Open3DCloneDirectBluraySubtitleSubpicture(vd);
+    subpicture_t *forced_bluray_subpicture = NULL;
+    subpicture_t *forced_mkv_subpicture = NULL;
+    const subpicture_t *working_subpicture = base_subpicture;
+    if (base_subpicture == NULL)
+        sys->bluray_subtitle_offset_latch.valid = false;
+    if (bridge_subpicture == NULL)
+    {
+        forced_bluray_subpicture = Open3DCloneBluraySubtitleFallback(vd, base_subpicture);
+        if (forced_bluray_subpicture != NULL)
+            working_subpicture = forced_bluray_subpicture;
+        else
+        {
+            forced_mkv_subpicture = Open3DCloneMkvSubtitleFallback(vd, base_subpicture);
+            if (forced_mkv_subpicture != NULL)
+                working_subpicture = forced_mkv_subpicture;
+        }
+    }
+
+    subpicture_t *packed_subpicture = NULL;
+    const bool working_subpicture_already_packed =
+        !state.enabled && forced_bluray_subpicture != NULL &&
+        working_subpicture == forced_bluray_subpicture;
+    if (!state.enabled && pack_mode != OPEN3D_PACK_NONE && working_subpicture != NULL &&
+        working_subpicture->b_subtitle && !working_subpicture_already_packed)
+    {
+        packed_subpicture = Open3DBuildPackedStereoSubtitleSubpicture(vd, sys,
+                                                                      working_subpicture,
+                                                                      pack_mode);
+        if (packed_subpicture != NULL)
+            working_subpicture = packed_subpicture;
+    }
+
+    const bool overlay_active = Open3DOverlayActive(sys, pack_mode);
+    if (bridge_subpicture != NULL)
+    {
+        if (!state.enabled && pack_mode != OPEN3D_PACK_NONE)
+        {
+            subpicture_t *packed_bridge = Open3DBuildPackedStereoSubtitleSubpicture(vd, sys,
+                                                                                    bridge_subpicture,
+                                                                                    pack_mode);
+            if (packed_bridge != NULL)
+            {
+                subpicture_Delete(bridge_subpicture);
+                bridge_subpicture = packed_bridge;
+            }
+        }
+        else if (!overlay_active && state.enabled && pack_mode != OPEN3D_PACK_NONE)
+        {
+            unsigned bridge_width = eye_source.i_visible_width > 0
+                                  ? eye_source.i_visible_width
+                                  : (eye_source.i_width > 0 ? eye_source.i_width
+                                                            : vd->source.i_visible_width);
+            if (bridge_width == 0)
+                bridge_width = vd->source.i_width;
+            Open3DApplySubtitleStereoShift(vd, sys, bridge_subpicture,
+                                           bridge_width, show_right_eye);
+        }
+    }
+
     subpicture_t *overlay_subpicture = NULL;
     bool overlay_cached = false;
-    if (Open3DOverlayActive(sys, pack_mode))
+    if (overlay_active)
     {
-        if (base_subpicture == NULL)
+        if (working_subpicture == NULL)
         {
             overlay_subpicture = Open3DPresenterOverlayCacheGet(vd, sys,
                                                                 &eye_source,
@@ -7665,7 +9469,10 @@ static void Open3DPresenterRenderTick(vout_display_t *vd, vout_display_sys_t *sy
         }
         else
         {
-            overlay_subpicture = Open3DBuildOverlaySubpicture(vd, sys, base_subpicture,
+            overlay_subpicture = Open3DBuildOverlaySubpicture(vd, sys, working_subpicture,
+                                                              working_subpicture == forced_bluray_subpicture,
+                                                              bridge_subpicture,
+                                                              false,
                                                               &eye_source,
                                                               pack_mode,
                                                               show_right_eye,
@@ -7688,70 +9495,380 @@ static void Open3DPresenterRenderTick(vout_display_t *vd, vout_display_sys_t *sy
         sys->warned_overlay_alloc = false;
     }
 
+    subpicture_t *composed_subpicture = NULL;
+    subpicture_t *shifted_subpicture = NULL;
     sys->prepared_eye_source = eye_source;
     subpicture_t *render_subpicture = overlay_subpicture != NULL
                                     ? overlay_subpicture
-                                    : (subpicture_t *)base_subpicture;
+                                    : (subpicture_t *)working_subpicture;
+    if (!overlay_active &&
+        state.enabled &&
+        pack_mode != OPEN3D_PACK_NONE &&
+        bridge_subpicture == NULL &&
+        forced_bluray_subpicture == NULL &&
+        render_subpicture != NULL &&
+        render_subpicture->b_subtitle)
+    {
+        const unsigned shift_width = eye_source.i_visible_width > 0
+                                   ? eye_source.i_visible_width
+                                   : (eye_source.i_width > 0 ? eye_source.i_width
+                                                              : vd->source.i_visible_width);
+        shifted_subpicture = Open3DCloneSubpictureShallow(render_subpicture);
+        if (shifted_subpicture != NULL)
+        {
+            Open3DApplySubtitleStereoShift(vd, sys, shifted_subpicture,
+                                           shift_width, show_right_eye);
+            render_subpicture = shifted_subpicture;
+        }
+    }
+    if (overlay_subpicture == NULL && bridge_subpicture != NULL)
+    {
+        if (working_subpicture == NULL)
+        {
+            render_subpicture = bridge_subpicture;
+        }
+        else
+        {
+            composed_subpicture = Open3DMergeSubpictures(working_subpicture,
+                                                         bridge_subpicture);
+            if (composed_subpicture != NULL)
+                render_subpicture = composed_subpicture;
+        }
+    }
 
+    open3d_presenter_stage_profile_t stage_profile;
+    memset(&stage_profile, 0, sizeof(stage_profile));
+    if (sys->presenter_stage_profile)
+    {
+        Open3DPresenterStageStampNow(sys, &compose_end);
+        memset(&sys->presenter_stage_profile_last, 0, sizeof(sys->presenter_stage_profile_last));
+    }
+
+    if (sys->presenter_stage_profile)
+        Open3DPresenterStageStampNow(sys, &gl_lock_start);
     vlc_mutex_lock(&sys->gl_lock);
+    if (sys->presenter_stage_profile)
+        Open3DPresenterStageStampNow(sys, &gl_lock_end);
+    if (sys->presenter_stage_profile)
+        Open3DPresenterStageStampNow(sys, &make_current_start);
     if (vlc_gl_MakeCurrent(sys->gl) == VLC_SUCCESS)
     {
+        open3d_presenter_stage_stamp_t total_start, total_end;
+        open3d_presenter_stage_stamp_t prepare_start, prepare_end;
+        open3d_presenter_stage_stamp_t display_start, display_end;
+        open3d_presenter_stage_stamp_t swap_start, swap_end;
+        if (sys->presenter_stage_profile)
+        {
+            Open3DPresenterStageStampNow(sys, &make_current_end);
+            Open3DPresenterStageStampNow(sys, &total_start);
+        }
+
+        if (sys->presenter_stage_profile)
+            Open3DPresenterStageStampNow(sys, &prepare_start);
         vout_display_opengl_Prepare(sys->vgl, pic, render_subpicture);
+        if (sys->presenter_stage_profile)
+            Open3DPresenterStageStampNow(sys, &prepare_end);
 
         vout_display_place_t place;
         const bool have_place = Open3DComputePicturePlace(&eye_source, vd->cfg, &place);
         if (have_place)
             Open3DApplyPicturePlace(sys, &place);
         const bool gpu_overlay_active = sys->gpu_overlay_enable && sys->gpu_overlay_ready;
+        if (sys->presenter_stage_profile)
+            Open3DPresenterStageStampNow(sys, &display_start);
         if (gpu_overlay_active)
             vout_display_opengl_DisplayNoSwap(sys->vgl, &eye_source);
         else
             vout_display_opengl_Display(sys->vgl, &eye_source);
         if (gpu_overlay_active && have_place)
             Open3DDrawGpuOverlay(vd, sys, &eye_source, pack_mode, show_right_eye, &place);
+        if (sys->presenter_stage_profile)
+            Open3DPresenterStageStampNow(sys, &display_end);
         if (gpu_overlay_active)
+        {
+            if (sys->presenter_stage_profile)
+                Open3DPresenterStageStampNow(sys, &swap_start);
             vlc_gl_Swap(sys->gl);
+            if (sys->presenter_stage_profile)
+                Open3DPresenterStageStampNow(sys, &swap_end);
+        }
 
         vlc_gl_ReleaseCurrent(sys->gl);
+        if (sys->presenter_stage_profile)
+        {
+            Open3DPresenterStageStampNow(sys, &total_end);
+            stage_profile.valid = true;
+            stage_profile.explicit_swap = gpu_overlay_active;
+            stage_profile.compose = Open3DPresenterStageMetricDiff(&compose_start, &compose_end);
+            stage_profile.gl_lock = Open3DPresenterStageMetricDiff(&gl_lock_start, &gl_lock_end);
+            stage_profile.make_current = Open3DPresenterStageMetricDiff(&make_current_start,
+                                                                        &make_current_end);
+            stage_profile.total = Open3DPresenterStageMetricDiff(&total_start, &total_end);
+            stage_profile.prepare = Open3DPresenterStageMetricDiff(&prepare_start, &prepare_end);
+            stage_profile.display = Open3DPresenterStageMetricDiff(&display_start, &display_end);
+            if (gpu_overlay_active)
+                stage_profile.swap = Open3DPresenterStageMetricDiff(&swap_start, &swap_end);
+            sys->presenter_stage_profile_last = stage_profile;
+            sys->presenter_profiled_frame_count++;
+            sys->presenter_compose_wall_total_ns += stage_profile.compose.wall_ns;
+            sys->presenter_compose_cpu_total_ns += stage_profile.compose.cpu_ns;
+            sys->presenter_gl_lock_wall_total_ns += stage_profile.gl_lock.wall_ns;
+            sys->presenter_gl_lock_cpu_total_ns += stage_profile.gl_lock.cpu_ns;
+            sys->presenter_make_current_wall_total_ns += stage_profile.make_current.wall_ns;
+            sys->presenter_make_current_cpu_total_ns += stage_profile.make_current.cpu_ns;
+            sys->presenter_prepare_wall_total_ns += stage_profile.prepare.wall_ns;
+            sys->presenter_prepare_cpu_total_ns += stage_profile.prepare.cpu_ns;
+            sys->presenter_display_wall_total_ns += stage_profile.display.wall_ns;
+            sys->presenter_display_cpu_total_ns += stage_profile.display.cpu_ns;
+            sys->presenter_swap_wall_total_ns += stage_profile.swap.wall_ns;
+            sys->presenter_swap_cpu_total_ns += stage_profile.swap.cpu_ns;
+            if (stage_profile.compose.wall_ns > sys->presenter_compose_wall_max_ns)
+                sys->presenter_compose_wall_max_ns = stage_profile.compose.wall_ns;
+            if (stage_profile.compose.cpu_ns > sys->presenter_compose_cpu_max_ns)
+                sys->presenter_compose_cpu_max_ns = stage_profile.compose.cpu_ns;
+            if (stage_profile.gl_lock.wall_ns > sys->presenter_gl_lock_wall_max_ns)
+                sys->presenter_gl_lock_wall_max_ns = stage_profile.gl_lock.wall_ns;
+            if (stage_profile.gl_lock.cpu_ns > sys->presenter_gl_lock_cpu_max_ns)
+                sys->presenter_gl_lock_cpu_max_ns = stage_profile.gl_lock.cpu_ns;
+            if (stage_profile.make_current.wall_ns > sys->presenter_make_current_wall_max_ns)
+                sys->presenter_make_current_wall_max_ns = stage_profile.make_current.wall_ns;
+            if (stage_profile.make_current.cpu_ns > sys->presenter_make_current_cpu_max_ns)
+                sys->presenter_make_current_cpu_max_ns = stage_profile.make_current.cpu_ns;
+            if (stage_profile.prepare.wall_ns > sys->presenter_prepare_wall_max_ns)
+                sys->presenter_prepare_wall_max_ns = stage_profile.prepare.wall_ns;
+            if (stage_profile.prepare.cpu_ns > sys->presenter_prepare_cpu_max_ns)
+                sys->presenter_prepare_cpu_max_ns = stage_profile.prepare.cpu_ns;
+            if (stage_profile.display.wall_ns > sys->presenter_display_wall_max_ns)
+                sys->presenter_display_wall_max_ns = stage_profile.display.wall_ns;
+            if (stage_profile.display.cpu_ns > sys->presenter_display_cpu_max_ns)
+                sys->presenter_display_cpu_max_ns = stage_profile.display.cpu_ns;
+            if (stage_profile.swap.wall_ns > sys->presenter_swap_wall_max_ns)
+                sys->presenter_swap_wall_max_ns = stage_profile.swap.wall_ns;
+            if (stage_profile.swap.cpu_ns > sys->presenter_swap_cpu_max_ns)
+                sys->presenter_swap_cpu_max_ns = stage_profile.swap.cpu_ns;
+        }
+    }
+    else if (sys->presenter_stage_profile)
+    {
+        Open3DPresenterStageStampNow(sys, &make_current_end);
     }
     vlc_mutex_unlock(&sys->gl_lock);
 
+    if (sys->presenter_stage_profile)
+        Open3DPresenterStageStampNow(sys, &cleanup_start);
+
     if (overlay_subpicture != NULL && !overlay_cached)
         subpicture_Delete(overlay_subpicture);
+    if (composed_subpicture != NULL)
+        subpicture_Delete(composed_subpicture);
+    if (bridge_subpicture != NULL)
+        subpicture_Delete(bridge_subpicture);
+    if (packed_subpicture != NULL)
+        subpicture_Delete(packed_subpicture);
+    if (shifted_subpicture != NULL)
+        subpicture_Delete(shifted_subpicture);
+    if (forced_bluray_subpicture != NULL &&
+        forced_bluray_subpicture != packed_subpicture &&
+        forced_bluray_subpicture != overlay_subpicture &&
+        forced_bluray_subpicture != composed_subpicture)
+        subpicture_Delete(forced_bluray_subpicture);
+    if (forced_mkv_subpicture != NULL &&
+        forced_mkv_subpicture != packed_subpicture &&
+        forced_mkv_subpicture != overlay_subpicture &&
+        forced_mkv_subpicture != composed_subpicture)
+        subpicture_Delete(forced_mkv_subpicture);
+
+    if (sys->presenter_stage_profile)
+        Open3DPresenterStageStampNow(sys, &cleanup_end);
+
+    if (stage_profile.valid)
+    {
+        stage_profile.prelude = Open3DPresenterStageMetricDiff(&prelude_start, &prelude_end);
+        stage_profile.emitter_queue = Open3DPresenterStageMetricDiff(&emitter_queue_start,
+                                                                     &emitter_queue_end);
+        stage_profile.status_log = Open3DPresenterStageMetricDiff(&status_log_start,
+                                                                  &status_log_end);
+        stage_profile.cleanup = Open3DPresenterStageMetricDiff(&cleanup_start, &cleanup_end);
+        sys->presenter_stage_profile_last = stage_profile;
+        sys->presenter_prelude_wall_total_ns += stage_profile.prelude.wall_ns;
+        sys->presenter_prelude_cpu_total_ns += stage_profile.prelude.cpu_ns;
+        sys->presenter_emitter_queue_wall_total_ns += stage_profile.emitter_queue.wall_ns;
+        sys->presenter_emitter_queue_cpu_total_ns += stage_profile.emitter_queue.cpu_ns;
+        sys->presenter_status_log_wall_total_ns += stage_profile.status_log.wall_ns;
+        sys->presenter_status_log_cpu_total_ns += stage_profile.status_log.cpu_ns;
+        sys->presenter_cleanup_wall_total_ns += stage_profile.cleanup.wall_ns;
+        sys->presenter_cleanup_cpu_total_ns += stage_profile.cleanup.cpu_ns;
+        if (stage_profile.prelude.wall_ns > sys->presenter_prelude_wall_max_ns)
+            sys->presenter_prelude_wall_max_ns = stage_profile.prelude.wall_ns;
+        if (stage_profile.prelude.cpu_ns > sys->presenter_prelude_cpu_max_ns)
+            sys->presenter_prelude_cpu_max_ns = stage_profile.prelude.cpu_ns;
+        if (stage_profile.emitter_queue.wall_ns > sys->presenter_emitter_queue_wall_max_ns)
+            sys->presenter_emitter_queue_wall_max_ns = stage_profile.emitter_queue.wall_ns;
+        if (stage_profile.emitter_queue.cpu_ns > sys->presenter_emitter_queue_cpu_max_ns)
+            sys->presenter_emitter_queue_cpu_max_ns = stage_profile.emitter_queue.cpu_ns;
+        if (stage_profile.status_log.wall_ns > sys->presenter_status_log_wall_max_ns)
+            sys->presenter_status_log_wall_max_ns = stage_profile.status_log.wall_ns;
+        if (stage_profile.status_log.cpu_ns > sys->presenter_status_log_cpu_max_ns)
+            sys->presenter_status_log_cpu_max_ns = stage_profile.status_log.cpu_ns;
+        if (stage_profile.cleanup.wall_ns > sys->presenter_cleanup_wall_max_ns)
+            sys->presenter_cleanup_wall_max_ns = stage_profile.cleanup.wall_ns;
+        if (stage_profile.cleanup.cpu_ns > sys->presenter_cleanup_cpu_max_ns)
+            sys->presenter_cleanup_cpu_max_ns = stage_profile.cleanup.cpu_ns;
+    }
 }
 
 static void Open3DPresenterTuneThread(vout_display_t *vd, vout_display_sys_t *sys)
 {
 #ifdef __linux__
-    pthread_t self = pthread_self();
-
-    int fifo_priority = sched_get_priority_max(SCHED_FIFO);
-    if (fifo_priority > 1)
+    if (sys->presenter_stage_profile && sys->presenter_schedstat_fd < 0)
     {
-        struct sched_param sp = { .sched_priority = fifo_priority - 1 };
-        int rc = pthread_setschedparam(self, SCHED_FIFO, &sp);
-        if (rc == 0)
+        sys->presenter_schedstat_fd = open("/proc/thread-self/schedstat",
+                                           O_RDONLY | O_CLOEXEC);
+        if (sys->presenter_schedstat_fd >= 0)
+            msg_Dbg(vd, "open3d presenter stage profiling enabled (schedstat available)");
+        else
+            msg_Dbg(vd, "open3d presenter stage profiling enabled (schedstat unavailable: %s)",
+                    vlc_strerror_c(errno));
+    }
+
+    pthread_t self = pthread_self();
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+        page_size = 4096;
+
+    if (sys->presenter_memory_lock_request)
+    {
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0)
         {
-            sys->presenter_rt_enabled = true;
-            msg_Dbg(vd, "open3d presenter scheduler: SCHED_FIFO priority=%d",
-                    sp.sched_priority);
+            sys->presenter_mlockall_enabled = true;
+            msg_Dbg(vd, "open3d presenter memory lock enabled");
         }
         else
         {
-            msg_Dbg(vd, "open3d presenter scheduler fallback (SCHED_FIFO failed: %s)",
-                    vlc_strerror_c(rc));
+            msg_Dbg(vd, "open3d presenter memory lock fallback (mlockall failed: %s)",
+                    vlc_strerror_c(errno));
+        }
+    }
+    else
+    {
+        msg_Dbg(vd, "open3d presenter memory lock disabled by config");
+    }
+
+    if (sys->presenter_memory_lock_request && sys->presenter_prefault_kb_request > 0)
+    {
+        size_t bytes = (size_t)sys->presenter_prefault_kb_request * 1024u;
+        uint8_t *buffer = malloc(bytes);
+        if (buffer != NULL)
+        {
+            for (size_t off = 0; off < bytes; off += (size_t)page_size)
+                buffer[off] = (uint8_t)(off / (size_t)page_size);
+            if (bytes > 0)
+                buffer[bytes - 1] = 0;
+            sys->presenter_prefault_buffer = buffer;
+            sys->presenter_prefault_bytes = bytes;
+            msg_Dbg(vd, "open3d presenter prefault heap warmup bytes=%zu", bytes);
+        }
+        else
+        {
+            msg_Dbg(vd, "open3d presenter prefault heap warmup fallback (alloc failed: %s)",
+                    vlc_strerror_c(errno));
+        }
+
+        size_t stack_bytes = bytes < (size_t)(64 * 1024) ? bytes : (size_t)(64 * 1024);
+        if (stack_bytes > 0)
+        {
+            volatile uint8_t *stack_buffer = alloca(stack_bytes);
+            for (size_t off = 0; off < stack_bytes; off += (size_t)page_size)
+                stack_buffer[off] = (uint8_t)(off / (size_t)page_size);
+            stack_buffer[stack_bytes - 1] = 0;
+            msg_Dbg(vd, "open3d presenter prefault stack warmup bytes=%zu", stack_bytes);
         }
     }
 
-    cpu_set_t process_mask;
-    CPU_ZERO(&process_mask);
-    if (sched_getaffinity(0, sizeof(process_mask), &process_mask) == 0)
+    int fifo_priority_max = sched_get_priority_max(SCHED_FIFO);
+    int fifo_priority_min = sched_get_priority_min(SCHED_FIFO);
+    if (sys->presenter_rt_request && fifo_priority_max >= fifo_priority_min)
     {
+        bool can_attempt_rt = true;
+        int requested_priority = sys->presenter_rt_priority_request;
+        int max_allowed_priority = fifo_priority_max;
+        int desired_priority = requested_priority < 0 ? fifo_priority_max - 1
+                                                      : requested_priority;
+#ifdef RLIMIT_RTPRIO
+        struct rlimit rtprio_rlimit;
+        if (getrlimit(RLIMIT_RTPRIO, &rtprio_rlimit) == 0 &&
+            rtprio_rlimit.rlim_cur != RLIM_INFINITY)
+        {
+            if (rtprio_rlimit.rlim_cur < (rlim_t)max_allowed_priority)
+                max_allowed_priority = (int)rtprio_rlimit.rlim_cur;
+            if (max_allowed_priority < fifo_priority_min)
+            {
+                msg_Dbg(vd,
+                        "open3d presenter scheduler fallback (RLIMIT_RTPRIO=%ju too low for SCHED_FIFO)",
+                        (uintmax_t)rtprio_rlimit.rlim_cur);
+                can_attempt_rt = false;
+            }
+        }
+#endif
+        if (can_attempt_rt && desired_priority < fifo_priority_min)
+            desired_priority = fifo_priority_min;
+        if (can_attempt_rt && desired_priority > max_allowed_priority)
+        {
+            msg_Dbg(vd,
+                    "open3d presenter scheduler clamp priority %d -> %d due to RT limit",
+                    desired_priority, max_allowed_priority);
+            desired_priority = max_allowed_priority;
+        }
+        if (can_attempt_rt)
+        {
+            struct sched_param sp = { .sched_priority = desired_priority };
+            int rc = pthread_setschedparam(self, SCHED_FIFO, &sp);
+            if (rc == 0)
+            {
+                sys->presenter_rt_enabled = true;
+                msg_Dbg(vd, "open3d presenter scheduler: SCHED_FIFO priority=%d",
+                        sp.sched_priority);
+            }
+            else
+            {
+                msg_Dbg(vd, "open3d presenter scheduler fallback (SCHED_FIFO failed: %s)",
+                        vlc_strerror_c(rc));
+            }
+        }
+    }
+    else if (!sys->presenter_rt_request)
+    {
+        msg_Dbg(vd, "open3d presenter scheduler disabled by config");
+    }
+
+    if (!sys->presenter_affinity_request)
+    {
+        msg_Dbg(vd, "open3d presenter affinity disabled by config");
+    }
+    else
+    {
+        cpu_set_t process_mask;
+        CPU_ZERO(&process_mask);
+        if (sched_getaffinity(0, sizeof(process_mask), &process_mask) != 0)
+            return;
+
         int cpu = -1;
+        if (sys->presenter_affinity_cpu_request >= 0)
+        {
+            int requested_cpu = sys->presenter_affinity_cpu_request;
+            if (requested_cpu < CPU_SETSIZE && CPU_ISSET(requested_cpu, &process_mask))
+                cpu = requested_cpu;
+            else
+                msg_Dbg(vd, "open3d presenter affinity fallback (requested cpu=%d unavailable)",
+                        requested_cpu);
+        }
 #ifdef HAVE_SCHED_GETCPU
-        int current_cpu = sched_getcpu();
-        if (current_cpu >= 0 && CPU_ISSET(current_cpu, &process_mask))
-            cpu = current_cpu;
+        if (cpu < 0)
+        {
+            int current_cpu = sched_getcpu();
+            if (current_cpu >= 0 && CPU_ISSET(current_cpu, &process_mask))
+                cpu = current_cpu;
+        }
 #endif
         if (cpu < 0)
         {
@@ -7805,14 +9922,17 @@ static void *Open3DPresenterThread(void *data)
     {
         if (sys->presenter_period > 0)
         {
+            vlc_tick_t wake_tick = next_present_tick;
             if (next_present_tick == VLC_TICK_INVALID)
                 next_present_tick = mdate();
+            if (sys->presenter_lead > 0 && wake_tick != VLC_TICK_INVALID)
+                wake_tick -= sys->presenter_lead;
 
-            mwait(next_present_tick);
+            mwait(wake_tick);
             const vlc_tick_t wake = mdate();
-            if (wake > next_present_tick)
+            if (wake > wake_tick)
             {
-                const vlc_tick_t overshoot = wake - next_present_tick;
+                const vlc_tick_t overshoot = wake - wake_tick;
                 sys->presenter_sleep_overshoot_events++;
                 sys->presenter_sleep_overshoot_total += overshoot;
                 if (overshoot > sys->presenter_sleep_overshoot_max)
@@ -7856,6 +9976,32 @@ static void *Open3DPresenterThread(void *data)
             sys->presenter_render_total += (uint64_t)render_cost;
             if (render_cost > sys->presenter_render_max)
                 sys->presenter_render_max = render_cost;
+            if (sys->presenter_period > 0 && render_cost > sys->presenter_period)
+            {
+                const vlc_tick_t over = render_cost - sys->presenter_period;
+                sys->presenter_render_over_budget_events++;
+                if (over > sys->presenter_render_over_budget_max)
+                    sys->presenter_render_over_budget_max = over;
+                if (Open3DShouldLogPresenterEvents(sys))
+                {
+                    msg_Warn(vd,
+                             "open3d presenter render over budget cost=%" PRId64 "us period=%" PRId64
+                             "us over=%" PRId64 "us clock=%" PRId64 " subtitle_active=%d cache_hit=%d seq=%d signed=%d sig=%" PRIx64
+                             " subtitle_pts=%" PRId64 " cache_hits=%" PRIu64 " cache_misses=%" PRIu64,
+                             render_cost, sys->presenter_period, over, render_end,
+                             sys->debug_bluray_subtitle_active ? 1 : 0,
+                             sys->debug_bluray_subtitle_cache_hit ? 1 : 0,
+                             sys->debug_bluray_subtitle_offset_seq,
+                             sys->debug_bluray_subtitle_offset_signed,
+                             sys->debug_bluray_subtitle_signature,
+                             sys->debug_bluray_subtitle_pts,
+                             sys->bluray_subtitle_cache_hits,
+                             sys->bluray_subtitle_cache_misses);
+                    if (sys->presenter_stage_profile)
+                        Open3DLogPresenterStageProfile(vd, "over_budget",
+                                                       &sys->presenter_stage_profile_last);
+                }
+            }
         }
         else
         {
@@ -7886,6 +10032,25 @@ static void *Open3DPresenterThread(void *data)
             sys->presenter_deadline_miss_steps_total += steps;
             if (late > sys->presenter_deadline_miss_max)
                 sys->presenter_deadline_miss_max = late;
+            if (Open3DShouldLogPresenterEvents(sys))
+            {
+                msg_Warn(vd,
+                         "open3d presenter deadline miss late=%" PRId64 "us steps=%" PRIu64 " clock=%" PRId64
+                         " subtitle_active=%d cache_hit=%d seq=%d signed=%d sig=%" PRIx64
+                         " subtitle_pts=%" PRId64 " cache_hits=%" PRIu64 " cache_misses=%" PRIu64,
+                         late, steps, now,
+                         sys->debug_bluray_subtitle_active ? 1 : 0,
+                         sys->debug_bluray_subtitle_cache_hit ? 1 : 0,
+                         sys->debug_bluray_subtitle_offset_seq,
+                         sys->debug_bluray_subtitle_offset_signed,
+                         sys->debug_bluray_subtitle_signature,
+                         sys->debug_bluray_subtitle_pts,
+                         sys->bluray_subtitle_cache_hits,
+                         sys->bluray_subtitle_cache_misses);
+                if (sys->presenter_stage_profile)
+                    Open3DLogPresenterStageProfile(vd, "deadline_miss",
+                                                   &sys->presenter_stage_profile_last);
+            }
             next_present_tick += steps * sys->presenter_period;
         }
     }
@@ -7911,6 +10076,7 @@ static void PictureRender(vout_display_t *vd, picture_t *pic, subpicture_t *subp
 
     video_format_t eye_source = vd->source;
     open3d_pack_t pack_mode = OPEN3D_PACK_NONE;
+    const open3d_pack_t detected_pack_mode = Open3DDetectPackMode(vd, sys);
     bool show_right_eye = false;
     vlc_tick_t frame_clock = Open3DFrameClock(pic);
     unsigned flips = 0;
@@ -7924,7 +10090,7 @@ static void PictureRender(vout_display_t *vd, picture_t *pic, subpicture_t *subp
 
     if (sys->enabled)
     {
-        pack_mode = Open3DDetectPackMode(vd, sys);
+        pack_mode = detected_pack_mode;
         if (pack_mode != OPEN3D_PACK_NONE)
         {
             flips = Open3DAdvanceEye(sys, sys->enabled, frame_clock);
@@ -7955,6 +10121,8 @@ static void PictureRender(vout_display_t *vd, picture_t *pic, subpicture_t *subp
             sys->frame_count++;
             Open3DMaybeLogStatus(vd, sys, pack_mode, show_right_eye, frame_clock, flips,
                                  &eye_source);
+            Open3DMaybeLogPresenterTelemetry(vd, sys, pack_mode, show_right_eye, frame_clock,
+                                             flips);
             sys->warned_missing_pack = false;
         }
         else if (!sys->warned_missing_pack)
@@ -7971,22 +10139,112 @@ static void PictureRender(vout_display_t *vd, picture_t *pic, subpicture_t *subp
     }
     else
     {
+        pack_mode = detected_pack_mode;
         sys->warned_missing_pack = false;
         Open3DEmitterRequestEyeReset(sys);
     }
 
+    sys->debug_bluray_subtitle_active = false;
+    sys->debug_bluray_subtitle_cache_hit = false;
+    subpicture_t *bridge_subpicture = Open3DCloneDirectBluraySubtitleSubpicture(vd);
+    subpicture_t *forced_bluray_subpicture = NULL;
+    subpicture_t *forced_mkv_subpicture = NULL;
     subpicture_t *render_subpicture = subpicture;
-    if (Open3DOverlayActive(sys, pack_mode))
+    if (subpicture == NULL)
+        sys->bluray_subtitle_offset_latch.valid = false;
+    if (bridge_subpicture == NULL)
     {
-        subpicture_t *merged = Open3DBuildOverlaySubpicture(vd, sys, subpicture,
+        forced_bluray_subpicture = Open3DCloneBluraySubtitleFallback(vd, subpicture);
+        if (forced_bluray_subpicture != NULL)
+            render_subpicture = forced_bluray_subpicture;
+        else
+        {
+            forced_mkv_subpicture = Open3DCloneMkvSubtitleFallback(vd, subpicture);
+            if (forced_mkv_subpicture != NULL)
+                render_subpicture = forced_mkv_subpicture;
+        }
+    }
+    subpicture_t *packed_subpicture = NULL;
+    const bool render_subpicture_already_packed =
+        !sys->enabled && forced_bluray_subpicture != NULL &&
+        render_subpicture == forced_bluray_subpicture;
+    if (!sys->enabled && pack_mode != OPEN3D_PACK_NONE &&
+        render_subpicture != NULL && render_subpicture->b_subtitle &&
+        !render_subpicture_already_packed)
+    {
+        packed_subpicture = Open3DBuildPackedStereoSubtitleSubpicture(vd, sys,
+                                                                      render_subpicture,
+                                                                      pack_mode);
+        if (packed_subpicture != NULL)
+            render_subpicture = packed_subpicture;
+    }
+    const bool overlay_active = Open3DOverlayActive(sys, pack_mode);
+    if (bridge_subpicture != NULL)
+    {
+        if (!sys->enabled && pack_mode != OPEN3D_PACK_NONE)
+        {
+            subpicture_t *packed_bridge = Open3DBuildPackedStereoSubtitleSubpicture(vd, sys,
+                                                                                    bridge_subpicture,
+                                                                                    pack_mode);
+            if (packed_bridge != NULL)
+            {
+                subpicture_Delete(bridge_subpicture);
+                bridge_subpicture = packed_bridge;
+            }
+        }
+        else if (!overlay_active && sys->enabled && pack_mode != OPEN3D_PACK_NONE)
+        {
+            unsigned bridge_width = eye_source.i_visible_width > 0
+                                  ? eye_source.i_visible_width
+                                  : (eye_source.i_width > 0 ? eye_source.i_width
+                                                            : vd->source.i_visible_width);
+            if (bridge_width == 0)
+                bridge_width = vd->source.i_width;
+            Open3DApplySubtitleStereoShift(vd, sys, bridge_subpicture,
+                                           bridge_width, show_right_eye);
+        }
+    }
+    subpicture_t *owned_render_subpicture = NULL;
+    if (!overlay_active &&
+        sys->enabled &&
+        pack_mode != OPEN3D_PACK_NONE &&
+        bridge_subpicture == NULL &&
+        forced_bluray_subpicture == NULL &&
+        render_subpicture != NULL &&
+        render_subpicture->b_subtitle)
+    {
+        const unsigned shift_width = eye_source.i_visible_width > 0
+                                   ? eye_source.i_visible_width
+                                   : (eye_source.i_width > 0 ? eye_source.i_width
+                                                              : vd->source.i_visible_width);
+        subpicture_t *shifted = Open3DCloneSubpictureShallow(render_subpicture);
+        if (shifted != NULL)
+        {
+            Open3DApplySubtitleStereoShift(vd, sys, shifted, shift_width, show_right_eye);
+            render_subpicture = shifted;
+            owned_render_subpicture = shifted;
+        }
+    }
+
+    if (overlay_active)
+    {
+        subpicture_t *merged = Open3DBuildOverlaySubpicture(vd, sys, render_subpicture,
+                                                            render_subpicture == forced_bluray_subpicture,
+                                                            bridge_subpicture,
+                                                            false,
                                                             &eye_source,
                                                             pack_mode,
                                                             show_right_eye,
                                                             mdate());
         if (merged != NULL)
         {
+            if (packed_subpicture != NULL)
+            {
+                subpicture_Delete(packed_subpicture);
+                packed_subpicture = NULL;
+            }
             render_subpicture = merged;
-            sys->prepared_owned_subpicture = merged;
+            owned_render_subpicture = merged;
             sys->warned_overlay_alloc = false;
         }
         else if (!sys->warned_overlay_alloc)
@@ -7996,11 +10254,41 @@ static void PictureRender(vout_display_t *vd, picture_t *pic, subpicture_t *subp
             sys->warned_overlay_alloc = true;
         }
     }
+    else if (bridge_subpicture != NULL)
+    {
+        if (render_subpicture == NULL)
+        {
+            render_subpicture = bridge_subpicture;
+            owned_render_subpicture = bridge_subpicture;
+        }
+        else
+        {
+            subpicture_t *merged = Open3DMergeSubpictures(render_subpicture,
+                                                          bridge_subpicture);
+            if (merged != NULL)
+            {
+                render_subpicture = merged;
+                owned_render_subpicture = merged;
+            }
+        }
+        sys->warned_overlay_alloc = false;
+    }
+    else if (packed_subpicture != NULL)
+    {
+        owned_render_subpicture = packed_subpicture;
+        sys->warned_overlay_alloc = false;
+    }
+    else if (forced_bluray_subpicture != NULL)
+    {
+        owned_render_subpicture = forced_bluray_subpicture;
+        sys->warned_overlay_alloc = false;
+    }
     else
     {
         sys->warned_overlay_alloc = false;
     }
 
+    sys->prepared_owned_subpicture = owned_render_subpicture;
     sys->prepared_eye_source = eye_source;
 
     vlc_mutex_lock(&sys->gl_lock);
@@ -8010,6 +10298,21 @@ static void PictureRender(vout_display_t *vd, picture_t *pic, subpicture_t *subp
         vlc_gl_ReleaseCurrent(sys->gl);
     }
     vlc_mutex_unlock(&sys->gl_lock);
+
+    if (packed_subpicture != NULL &&
+        packed_subpicture != owned_render_subpicture)
+        subpicture_Delete(packed_subpicture);
+    if (bridge_subpicture != NULL &&
+        bridge_subpicture != owned_render_subpicture)
+        subpicture_Delete(bridge_subpicture);
+    if (forced_bluray_subpicture != NULL &&
+        forced_bluray_subpicture != owned_render_subpicture &&
+        forced_bluray_subpicture != packed_subpicture)
+        subpicture_Delete(forced_bluray_subpicture);
+    if (forced_mkv_subpicture != NULL &&
+        forced_mkv_subpicture != owned_render_subpicture &&
+        forced_mkv_subpicture != packed_subpicture)
+        subpicture_Delete(forced_mkv_subpicture);
 }
 
 static void PictureDisplay(vout_display_t *vd, picture_t *pic, subpicture_t *subpicture)

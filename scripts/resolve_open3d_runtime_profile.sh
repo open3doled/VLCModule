@@ -11,6 +11,7 @@ Output keys:
   runtime_profile
   plugins_path
   edge264_lib
+  helper_lib_dir
 EOF
 }
 
@@ -43,16 +44,19 @@ if [[ -z "${OPEN3D_MVC_STABLE_RUNTIME_ROOT:-}" && ! -d "${stable_runtime_root}" 
   stable_runtime_root="${legacy_stable_runtime_root}"
 fi
 stable_plugins="${stable_runtime_root}/plugins"
-stable_edge264_lib="${stable_runtime_root}/lib/libedge264.so.1"
+stable_helper_lib="${stable_runtime_root}/runtime-lib"
+stable_edge264_lib="${stable_helper_lib}/libedge264.so.1"
 live_plugins="${REPO_DIR}/local/out/runtime_plugins_live"
 vendor_edge264_ndebug="${REPO_DIR}/vendor/edge264/libedge264_ndebug.so.1"
 
 plugins_path=""
 edge264_lib=""
+helper_lib_dir=""
 
 if [[ "${profile}" == "stable" ]]; then
   plugins_path="${stable_plugins}"
   edge264_lib="${stable_edge264_lib}"
+  helper_lib_dir="${stable_helper_lib}"
 else
   plugins_path="${live_plugins}"
   if [[ -f "${stable_edge264_lib}" ]]; then
@@ -65,3 +69,4 @@ fi
 printf 'runtime_profile=%s\n' "${profile}"
 printf 'plugins_path=%s\n' "${plugins_path}"
 printf 'edge264_lib=%s\n' "${edge264_lib}"
+printf 'helper_lib_dir=%s\n' "${helper_lib_dir}"

@@ -8,8 +8,8 @@ Usage: build.sh [--check] [/path/to/vlc-3.0.23-source]
 Build the maintained Open3D VLC runtime:
 - vendored libbluray
 - edge264
-- VLC plugins (open3d, edge264mvc, open3dmkv, open3dbluraymvc, playlist, ts)
-- staged stable runtime
+- VLC plugins (open3d, edge264mvc, open3dannexb, mkv, open3dbluraymvc, playlist, ts)
+- staged stable plugin/runtime-lib set
 
 Options:
   --check   Exit 0 if the staged runtime artifacts already exist, else 1.
@@ -22,8 +22,28 @@ EOF
 }
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VLC_SRC="${OPEN3D_VLC_SRC:-/tmp/vlc-3.0.23-src-20260310}"
 CHECK_ONLY=0
+
+default_vlc_src() {
+  local latest=""
+
+  if [[ -n "${OPEN3D_VLC_SRC:-}" ]]; then
+    printf '%s\n' "${OPEN3D_VLC_SRC}"
+    return 0
+  fi
+
+  while IFS= read -r latest; do
+    [[ -n "${latest}" ]] && break
+  done < <(find /tmp -maxdepth 1 -mindepth 1 -type d -name 'vlc-3.0.23-src-*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1 {print $2}')
+
+  if [[ -n "${latest}" ]]; then
+    printf '%s\n' "${latest}"
+  else
+    printf '%s\n' "/tmp/vlc-3.0.23-src-20260310"
+  fi
+}
+
+VLC_SRC="$(default_vlc_src)"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,9 +78,10 @@ STABLE_ROOT="${REPO_DIR}/local/out/stable_runtime/latest"
 REQUIRED_FILES=(
   "${STABLE_ROOT}/plugins/access/libopen3dbluraymvc_plugin.so"
   "${STABLE_ROOT}/plugins/codec/libedge264mvc_plugin.so"
-  "${STABLE_ROOT}/plugins/demux/libopen3dmkv_plugin.so"
+  "${STABLE_ROOT}/plugins/demux/libopen3dannexb_plugin.so"
+  "${STABLE_ROOT}/plugins/demux/libmkv_plugin.so"
   "${STABLE_ROOT}/plugins/video_output/libopen3d_plugin.so"
-  "${STABLE_ROOT}/lib/libedge264.so.1"
+  "${STABLE_ROOT}/runtime-lib/libedge264.so.1"
 )
 
 runtime_ready() {
@@ -74,8 +95,8 @@ runtime_ready() {
     fi
   done
 
-  if ! compgen -G "${STABLE_ROOT}/lib/libbluray.so*" > /dev/null; then
-    echo "missing ${STABLE_ROOT}/lib/libbluray.so*" >&2
+  if ! compgen -G "${STABLE_ROOT}/runtime-lib/libbluray.so*" > /dev/null; then
+    echo "missing ${STABLE_ROOT}/runtime-lib/libbluray.so*" >&2
     missing=1
   fi
 
@@ -114,6 +135,13 @@ fi
 
 "${REPO_DIR}/scripts/build_vendor_libbluray_open3d.sh"
 OPEN3D_VENDOR_LIBBLURAY_STAGE="${REPO_DIR}/local/out/vendor_stage/libbluray" \
+  OPEN3D_VLC_BUILD_PHASE=prepare \
+  "${REPO_DIR}/scripts/build_open3d_module_vlc3.sh" "${VLC_SRC}"
+make -C "${VLC_SRC}/src" libvlccore.la
+make -C "${VLC_SRC}/lib" libvlc.la
+make -C "${VLC_SRC}/bin" vlc
+OPEN3D_VENDOR_LIBBLURAY_STAGE="${REPO_DIR}/local/out/vendor_stage/libbluray" \
+  OPEN3D_VLC_BUILD_PHASE=plugins \
   "${REPO_DIR}/scripts/build_open3d_module_vlc3.sh" "${VLC_SRC}"
 OPEN3D_VENDOR_LIBBLURAY_STAGE="${REPO_DIR}/local/out/vendor_stage/libbluray" \
   "${REPO_DIR}/scripts/update_open3d_mvc_stable_runtime.sh" "${VLC_SRC}" "${EDGE264_SOURCE_LIB}"

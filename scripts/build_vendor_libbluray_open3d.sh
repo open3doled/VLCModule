@@ -7,6 +7,7 @@ SRC_DIR="${REPO_DIR}/vendor/libbluray"
 BUILD_DIR="${OPEN3D_LIBBLURAY_BUILD_DIR:-${REPO_DIR}/local/out/vendor_build/libbluray}"
 STAGE_DIR="${OPEN3D_LIBBLURAY_STAGE_DIR:-${REPO_DIR}/local/out/vendor_stage/libbluray}"
 BUILD_TYPE="${OPEN3D_LIBBLURAY_BUILD_TYPE:-debugoptimized}"
+BDJ_JAR_MODE="${OPEN3D_LIBBLURAY_BDJ_JAR_MODE:-auto}"
 LOCAL_DEVROOT="${REPO_DIR}/local/out/devpkgs/root"
 
 if [[ ! -f "${SRC_DIR}/meson.build" ]]; then
@@ -67,7 +68,7 @@ MESON_ARGS=(
   "-Denable_tools=false"
   "-Denable_devtools=false"
   "-Denable_examples=false"
-  "-Dbdj_jar=disabled"
+  "-Dbdj_jar=${BDJ_JAR_MODE}"
   "-Dlibxml2=disabled"
 )
 
@@ -84,7 +85,7 @@ if [[ ! -d "${BUILD_DIR}/meson-private" ]]; then
     "-Denable_tools=false"
     "-Denable_devtools=false"
     "-Denable_examples=false"
-    "-Dbdj_jar=disabled"
+    "-Dbdj_jar=${BDJ_JAR_MODE}"
     "-Dlibxml2=disabled"
   )
 fi
@@ -96,3 +97,6 @@ env PKG_CONFIG_PATH="${PKG_CONFIG_PATH_COMBINED}" meson install -C "${BUILD_DIR}
 echo "OPEN3D_LIBBLURAY_BUILD_DIR=${BUILD_DIR}"
 echo "OPEN3D_LIBBLURAY_STAGE_DIR=${STAGE_DIR}"
 echo "OPEN3D_LIBBLURAY_SO=${STAGE_DIR}/lib/x86_64-linux-gnu/libbluray.so"
+if compgen -G "${STAGE_DIR}/share/java/libbluray-*.jar" > /dev/null; then
+  echo "OPEN3D_LIBBLURAY_JAVA_DIR=${STAGE_DIR}/share/java"
+fi

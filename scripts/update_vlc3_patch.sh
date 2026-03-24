@@ -18,6 +18,10 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEFAULT_INPUT="${OPEN3D_VLC_TARBALL:-/tmp/vlc-3.0.23.tar.xz}"
 INPUT_PATH="${1:-${DEFAULT_INPUT}}"
 OUTPUT_PATCH="${2:-${REPO_DIR}/patches/vlc-3.0.23/0001-open3doled-vlc3-mvc-runtime.patch}"
+PATCH_DISC_UI_SCRIPT="${REPO_DIR}/scripts/patch_vlc3_open3d_disc_ui.py"
+PATCH_T64_HOST_PLUGINS_SCRIPT="${REPO_DIR}/scripts/patch_vlc3_t64_host_plugins.py"
+PATCH_MKV_EDGE264MVC_SCRIPT="${REPO_DIR}/scripts/patch_vlc3_mkv_edge264mvc.py"
+PATCH_INPUT_ROUTING_SCRIPT="${REPO_DIR}/scripts/patch_vlc3_open3d_input_routing.py"
 
 if [[ "${INPUT_PATH}" == "-h" || "${INPUT_PATH}" == "--help" ]]; then
   usage
@@ -79,7 +83,7 @@ copy_repo_module_sources() {
   local module_src="${REPO_DIR}/renderer/vlc-3.0.23/modules/video_output/open3d_display.c"
   local font_src="${REPO_DIR}/renderer/vlc-3.0.23/modules/video_output/open3d_font8x16_basic.h"
   local edge264_src="${REPO_DIR}/renderer/vlc-3.0.23/modules/codec/edge264mvc.c"
-  local open3dmkv_src="${REPO_DIR}/renderer/vlc-3.0.23/modules/demux/open3dmkv.c"
+  local open3dannexb_src="${REPO_DIR}/renderer/vlc-3.0.23/modules/demux/open3dannexb.c"
   local ts_psi_src="${REPO_DIR}/renderer/vlc-3.0.23/modules/demux/mpeg/ts_psi.c"
   local ts_c_src="${REPO_DIR}/renderer/vlc-3.0.23/modules/demux/mpeg/ts.c"
   local demux_makefile_src="${REPO_DIR}/renderer/vlc-3.0.23/modules/demux/Makefile.am"
@@ -89,7 +93,8 @@ copy_repo_module_sources() {
   cp "${module_src}" "${tree}/modules/video_output/open3d_display.c"
   cp "${font_src}" "${tree}/modules/video_output/open3d_font8x16_basic.h"
   cp "${edge264_src}" "${tree}/modules/codec/edge264mvc.c"
-  cp "${open3dmkv_src}" "${tree}/modules/demux/open3dmkv.c"
+  cp "${open3dannexb_src}" "${tree}/modules/demux/open3dannexb.c"
+  rm -f "${tree}/modules/demux/open3dmkv.c"
   cp "${ts_psi_src}" "${tree}/modules/demux/mpeg/ts_psi.c"
   cp "${ts_c_src}" "${tree}/modules/demux/mpeg/ts.c"
   cp "${demux_makefile_src}" "${tree}/modules/demux/Makefile.am"
@@ -100,6 +105,42 @@ copy_repo_module_sources() {
 
   rm -f "${tree}/modules/demux/mvcasm.c"
   rm -f "${tree}/modules/demux/playlist/mpls.c"
+}
+
+patch_qt_disc_ui() {
+  local tree="$1"
+  if [[ ! -x "${PATCH_DISC_UI_SCRIPT}" ]]; then
+    echo "Error: missing Qt Disc UI patch helper: ${PATCH_DISC_UI_SCRIPT}" >&2
+    exit 3
+  fi
+  python3 "${PATCH_DISC_UI_SCRIPT}" "${tree}"
+}
+
+patch_t64_host_plugins() {
+  local tree="$1"
+  if [[ ! -x "${PATCH_T64_HOST_PLUGINS_SCRIPT}" ]]; then
+    echo "Error: missing host t64 alias patch helper: ${PATCH_T64_HOST_PLUGINS_SCRIPT}" >&2
+    exit 3
+  fi
+  python3 "${PATCH_T64_HOST_PLUGINS_SCRIPT}" "${tree}"
+}
+
+patch_mkv_edge264mvc() {
+  local tree="$1"
+  if [[ ! -x "${PATCH_MKV_EDGE264MVC_SCRIPT}" ]]; then
+    echo "Error: missing MKV edge264mvc patch helper: ${PATCH_MKV_EDGE264MVC_SCRIPT}" >&2
+    exit 3
+  fi
+  python3 "${PATCH_MKV_EDGE264MVC_SCRIPT}" "${tree}"
+}
+
+patch_input_routing() {
+  local tree="$1"
+  if [[ ! -x "${PATCH_INPUT_ROUTING_SCRIPT}" ]]; then
+    echo "Error: missing input routing patch helper: ${PATCH_INPUT_ROUTING_SCRIPT}" >&2
+    exit 3
+  fi
+  python3 "${PATCH_INPUT_ROUTING_SCRIPT}" "${tree}"
 }
 
 patch_vout_helper() {
@@ -202,6 +243,8 @@ libopen3d_plugin_la_LIBADD = $(LIBM) $(OPENGL_COMMONLIBS)
 if HAVE_WIN32
 libopen3d_plugin_la_CFLAGS += -DHAVE_GL_CORE_SYMBOLS
 libopen3d_plugin_la_LIBADD += $(GL_LIBS)
+else
+libopen3d_plugin_la_LIBADD += -lpthread
 endif
 """.strip()
 
@@ -315,6 +358,10 @@ refresh_patch() {
   git commit -q -m "upstream base"
 
   copy_repo_module_sources "${tree}"
+  patch_qt_disc_ui "${tree}"
+  patch_t64_host_plugins "${tree}"
+  patch_mkv_edge264mvc "${tree}"
+  patch_input_routing "${tree}"
   patch_vout_helper "${tree}"
   patch_video_output_makefile "${tree}"
   patch_codec_makefile "${tree}"

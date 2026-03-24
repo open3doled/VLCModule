@@ -54,6 +54,7 @@
 
 #include "../demux/mpeg/timestamps.h"
 #include "../demux/timestamps_filter.h"
+#include "../video_output/open3d_subtitle_bridge.h"
 
 /* FIXME we should find a better way than including that */
 #include "../../src/text/iso-639_def.h"
@@ -112,6 +113,14 @@
 #ifndef OPEN3DBLURAY_LOG_PREFIX
 #define OPEN3DBLURAY_LOG_PREFIX "open3dbluraymvc"
 #endif
+
+#define OPEN3DBLURAY_SUBTITLE_OFFSET_VALID_VAR  "open3d-subtitle-offset-valid"
+#define OPEN3DBLURAY_SUBTITLE_OFFSET_SIGNED_VAR "open3d-subtitle-offset-signed"
+#define OPEN3DBLURAY_SUBTITLE_OFFSET_RAW_VAR    "open3d-subtitle-offset-raw"
+#define OPEN3DBLURAY_SUBTITLE_OFFSET_SEQ_VAR    "open3d-subtitle-offset-seq"
+#define OPEN3DBLURAY_SUBTITLE_OFFSET_FRAME_VAR  "open3d-subtitle-offset-frame"
+#define OPEN3DBLURAY_FORCED_SUBTITLE_ID_BASE    0x7f000000u
+#define OPEN3DBLURAY_FORCED_SUBTITLE_DESC       "Forced only"
 
 /*****************************************************************************
  * Module descriptor
@@ -236,6 +245,13 @@ typedef struct bluray_overlay_t
     OverlayStatus       status;
     subpicture_region_t *p_regions;
     int                 width, height;
+    uint8_t             plane;
+    int64_t             pts90k;
+    bool                b_subtitle_offset_valid;
+    uint8_t             i_subtitle_offset_sequence;
+    uint8_t             i_subtitle_offset_raw;
+    int8_t              i_subtitle_offset_signed;
+    int                 i_subtitle_offset_frame;
 
     /* pointer to last subpicture updater.
      * used to disconnect this overlay from vout when:
@@ -244,6 +260,22 @@ typedef struct bluray_overlay_t
      */
     struct subpicture_updater_sys_t *p_updater;
 } bluray_overlay_t;
+
+typedef struct
+{
+    int  i_real_pid;
+    bool b_forced_only;
+    bool b_auto_forced_only;
+} open3dbluray_subtitle_selection_t;
+
+typedef struct
+{
+    open3dbluray_subtitle_selection_t current;
+    bool                              b_auto_forced_default_enabled;
+    int                               i_pending_forced_startup_real_pid;
+    bool                              b_pending_apply_valid;
+    open3dbluray_subtitle_selection_t pending_apply;
+} open3dbluray_subtitle_selection_state_t;
 
 struct  demux_sys_t
 {
@@ -292,6 +324,7 @@ struct  demux_sys_t
 
     /* */
     vout_thread_t       *p_vout;
+    open3d_subtitle_bridge_t subtitle_bridge;
 
     es_out_id_t         *p_dummy_video;
 
@@ -303,6 +336,13 @@ struct  demux_sys_t
     vlc_demux_chained_t *p_parser;
     bool                b_flushed;
     bool                b_pl_playing;       /* true when playing playlist */
+    bool                b_selected_pg_offset_sequence_valid;
+    uint8_t             i_selected_pg_offset_sequence_id;
+    open3dbluray_subtitle_selection_state_t subtitle_selection;
+    int                 i_forced_filter_pid;
+    bool                b_forced_filter_output_active;
+    block_t             *p_forced_filter_head;
+    block_t             **pp_forced_filter_last;
 
     /* stream input */
     vlc_mutex_t         read_block_lock;
@@ -495,6 +535,96 @@ static es_pair_t *getEsPairByES(vlc_array_t *p_array, const es_out_id_t *p_es)
     return getEsPair(p_array, es_pair_compare_ES, p_es);
 }
 
+static int open3dblurayMakeForcedSubtitleEsId(int i_pid)
+{
+    return (int)(OPEN3DBLURAY_FORCED_SUBTITLE_ID_BASE |
+                 ((uint32_t)i_pid & 0xffffu));
+}
+
+static bool open3dblurayDecodeForcedSubtitleEsId(int i_id, int *pi_pid)
+{
+    const uint32_t u_id = (uint32_t)i_id;
+
+    if ((u_id & 0xffff0000u) != OPEN3DBLURAY_FORCED_SUBTITLE_ID_BASE)
+        return false;
+
+    const int i_pid = (int)(u_id & 0xffffu);
+    if (i_pid <= 0)
+        return false;
+
+    if (pi_pid != NULL)
+        *pi_pid = i_pid;
+    return true;
+}
+
+static bool open3dblurayForcedSubtitleTrackExposureEnabled(void)
+{
+    const char *env = getenv("OPEN3D_BLURAY_EXPOSE_FORCED_ONLY_TRACKS");
+    if (env == NULL || *env == '\0')
+        return true;
+
+    return strcmp(env, "0") != 0 &&
+           strcasecmp(env, "false") != 0 &&
+           strcasecmp(env, "no") != 0;
+}
+
+static bool open3dblurayTracePgsBlocksEnabled(void)
+{
+    const char *env = getenv("OPEN3DBLURAY_TRACE_PGS_BLOCKS");
+    if (env == NULL || *env == '\0')
+        return false;
+
+    return strcmp(env, "0") != 0 &&
+           strcasecmp(env, "false") != 0 &&
+           strcasecmp(env, "no") != 0;
+}
+
+static bool open3dblurayTraceForcedFilterEnabled(void)
+{
+    const char *env = getenv("OPEN3DBLURAY_TRACE_FORCED_FILTER");
+    if (env == NULL || *env == '\0')
+        return false;
+
+    return strcmp(env, "0") != 0 &&
+           strcasecmp(env, "false") != 0 &&
+           strcasecmp(env, "no") != 0;
+}
+
+static void open3dblurayTracePgsBlock(demux_t *p_demux,
+                                      int i_pid,
+                                      const block_t *p_block)
+{
+    static unsigned s_trace_count = 0;
+    char hexbuf[3 * 32 + 1];
+    size_t i_hex = 0;
+    size_t i_dump = 0;
+
+    if (!open3dblurayTracePgsBlocksEnabled() || p_block == NULL || p_block->p_buffer == NULL)
+        return;
+
+    if (s_trace_count >= 16)
+        return;
+    s_trace_count++;
+
+    i_dump = p_block->i_buffer < 32 ? p_block->i_buffer : 32;
+    for (size_t i = 0; i < i_dump && i_hex + 3 < sizeof(hexbuf); ++i) {
+        snprintf(&hexbuf[i_hex], sizeof(hexbuf) - i_hex, "%02x%s",
+                 p_block->p_buffer[i], (i + 1 < i_dump) ? " " : "");
+        i_hex += (i + 1 < i_dump) ? 3 : 2;
+    }
+    hexbuf[i_hex] = '\0';
+
+    msg_Info(p_demux,
+             "%s trace_pgs_block pid=0x%04x size=%zu pts=%" PRId64 " dts=%" PRId64 " flags=0x%x head=%s",
+             OPEN3DBLURAY_LOG_PREFIX,
+             i_pid,
+             p_block->i_buffer,
+             p_block->i_pts,
+             p_block->i_dts,
+             p_block->i_flags,
+             hexbuf);
+}
+
 static es_pair_t *getUnusedEsPair(vlc_array_t *p_array)
 {
     return getEsPair(p_array, es_pair_compare_Unused, 0);
@@ -528,10 +658,16 @@ static void unref_subpicture_updater(subpicture_updater_sys_t *p_sys)
     }
 }
 
-/* Get a 3 char code
- * FIXME: partiallyy duplicated from src/input/es_out.c
+/*
+ * Normalize one VLC preferred-language variable to a single ISO639-2/T code.
+ *
+ * This intentionally mirrors only the subset of src/input/es_out.c behavior
+ * that we need here. libbluray player settings accept one language code, so we
+ * use only the first list entry when VLC is configured with a comma-separated
+ * preference list.
  */
-static const char *DemuxGetLanguageCode( demux_t *p_demux, const char *psz_var )
+static const char *open3dblurayGetPreferredLanguageCode(demux_t *p_demux,
+                                                        const char *psz_var)
 {
     const iso639_lang_t *pl;
     char *psz_lang;
@@ -565,9 +701,69 @@ static const char *DemuxGetLanguageCode( demux_t *p_demux, const char *psz_var )
     return LANGUAGE_DEFAULT;
 }
 
+static int open3dblurayFindPgStreamIndexByPid(const BLURAY_CLIP_INFO *p_clip_info,
+                                              int i_pid,
+                                              const BLURAY_STREAM_INFO **pp_stream)
+{
+    if (pp_stream != NULL)
+        *pp_stream = NULL;
+
+    if (p_clip_info == NULL || i_pid <= 0)
+        return -1;
+
+    for (int i = 0; i < p_clip_info->pg_stream_count; ++i) {
+        const BLURAY_STREAM_INFO *p_stream = &p_clip_info->pg_streams[i];
+        if (p_stream->pid != i_pid)
+            continue;
+
+        if (pp_stream != NULL)
+            *pp_stream = p_stream;
+        return i;
+    }
+
+    return -1;
+}
+
+static int open3dblurayFindPgStreamIndexByLanguage(const BLURAY_CLIP_INFO *p_clip_info,
+                                                   const char *psz_lang,
+                                                   const BLURAY_STREAM_INFO **pp_stream)
+{
+    if (pp_stream != NULL)
+        *pp_stream = NULL;
+
+    if (p_clip_info == NULL || psz_lang == NULL || psz_lang[0] == '\0')
+        return -1;
+
+    for (int i = 0; i < p_clip_info->pg_stream_count; ++i) {
+        const BLURAY_STREAM_INFO *p_stream = &p_clip_info->pg_streams[i];
+        if (strncasecmp((const char *)p_stream->lang, psz_lang, 3) != 0)
+            continue;
+
+        if (pp_stream != NULL)
+            *pp_stream = p_stream;
+        return i;
+    }
+
+    return -1;
+}
+
+static void open3dblurayApplyMenulessPgLanguageSetting(demux_t *p_demux,
+                                                       const BLURAY_STREAM_INFO *p_stream)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    if (p_sys->b_menu || p_stream == NULL)
+        return;
+
+    bd_set_player_setting_str(p_sys->bluray, BLURAY_PLAYER_SETTING_PG_LANG,
+                              (const char *)p_stream->lang);
+}
+
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
+typedef struct bluray_esout_sys_t bluray_esout_sys_t;
+
 static es_out_t *esOutNew(vlc_object_t*, es_out_t *, void *);
 static es_out_t *escape_esOutNew(vlc_object_t *, es_out_t *);
 
@@ -586,6 +782,52 @@ static int   onIntfEvent(vlc_object_t *, char const *,
                          vlc_value_t, vlc_value_t, void *);
 
 static void  blurayRestartParser(demux_t *p_demux, bool, bool);
+static void  blurayOnUserStreamSelection(demux_t *p_demux, int i_pid);
+static void  blurayOnUserStreamSelectionEx(demux_t *p_demux,
+                                           int i_pid,
+                                           bool b_auto_forced_only);
+static void  open3dblurayRememberSubtitleSelectionEx(demux_t *p_demux,
+                                                     int i_pid,
+                                                     bool b_forced_only,
+                                                     bool b_auto_forced_only);
+static bool  open3dblurayHasRememberedBaseSubtitleSelection(demux_t *p_demux,
+                                                            int i_pid);
+static bool  open3dblurayTakePendingForcedStartupSubtitle(demux_t *p_demux,
+                                                          int i_pid);
+static void  open3dbluraySchedulePendingForcedSubtitleSelection(demux_t *p_demux,
+                                                                int i_pid,
+                                                                bool b_auto_forced_only);
+static bool  open3dblurayTakePendingForcedSubtitleSelection(demux_t *p_demux,
+                                                            int *pi_pid,
+                                                            bool *pb_auto_forced_only);
+static bool  open3dblurayHasRememberedForcedSubtitleSelection(demux_t *p_demux,
+                                                              int i_pid);
+static bool  open3dblurayHasRememberedAutoForcedSubtitleSelection(demux_t *p_demux,
+                                                                  int i_pid);
+static bool  open3dblurayShouldAutoPromotePreferredSubtitle(demux_t *p_demux,
+                                                            int i_pid,
+                                                            int i_selected_pid);
+static bool  open3dblurayHasForcedSubtitleTrack(demux_t *p_demux,
+                                                int i_real_spu_pid);
+static void  open3dblurayMaybeAutoSelectPreferredForcedSubtitle(demux_t *p_demux,
+                                                                int i_real_spu_pid,
+                                                                int i_selected_pid);
+static bool  open3dblurayGetPreferredSubtitleStream(demux_t *p_demux,
+                                                    int *pi_pid,
+                                                    uint8_t *pi_offset_seq,
+                                                    char psz_lang[4]);
+static int   open3dblurayGetRememberedSubtitleUiId(demux_t *p_demux);
+static void  open3dblurayForcedFilterClearQueued(demux_sys_t *p_sys);
+static void  open3dblurayForcedFilterInvalidate(demux_t *p_demux);
+static void  open3dblurayForcedFilterReset(demux_t *p_demux);
+static void  open3dblurayForcedFilterSelectPid(demux_t *p_demux, int i_pid);
+static int   open3dbluraySendForcedPgsBlock(demux_t *p_demux, es_out_t *p_dst_out,
+                                            es_out_id_t *p_forced_es, int i_pid,
+                                            block_t *p_block);
+static void  open3dblurayMaybeAddForcedSubtitleTrackLocked(demux_t *p_demux,
+                                                           bluray_esout_sys_t *esout_sys,
+                                                           const es_pair_t *p_real_pair);
+static void  open3dblurayRemoveAllForcedSubtitleTracks(demux_t *p_demux);
 static void  notifyDiscontinuityToParser( demux_sys_t *p_sys );
 
 
@@ -655,6 +897,7 @@ static void blurayReleaseVout(demux_t *p_demux)
     demux_sys_t *p_sys = p_demux->p_sys;
 
     if (p_sys->p_vout != NULL) {
+        Open3DSubtitleBridgeDetachFromObject(VLC_OBJECT(p_sys->p_vout));
         var_DelCallback(p_sys->p_vout, "mouse-moved", onMouseEvent, p_demux);
         var_DelCallback(p_sys->p_vout, "mouse-clicked", onMouseEvent, p_demux);
 
@@ -680,6 +923,143 @@ static void blurayReleaseVout(demux_t *p_demux)
         vlc_object_release(p_sys->p_vout);
         p_sys->p_vout = NULL;
     }
+}
+
+static void open3dblurayEnsureVout(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    if (p_sys->p_vout != NULL)
+        return;
+
+    p_sys->p_vout = input_GetVout(p_demux->p_input);
+    if (p_sys->p_vout != NULL) {
+        var_AddCallback(p_sys->p_vout, "mouse-moved", onMouseEvent, p_demux);
+        var_AddCallback(p_sys->p_vout, "mouse-clicked", onMouseEvent, p_demux);
+    }
+}
+
+static void open3dblurayAttachSubtitleBridgeToVout(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    open3dblurayEnsureVout(p_demux);
+    if (p_sys->p_vout == NULL)
+        return;
+
+    Open3DSubtitleBridgeAttachToObject(VLC_OBJECT(p_sys->p_vout),
+                                       &p_sys->subtitle_bridge);
+}
+
+static bool open3dblurayUseDirectSubtitleBridge(demux_t *p_demux,
+                                                const bluray_overlay_t *p_ov)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    if (p_sys->p_vout == NULL || p_ov == NULL || p_ov->plane != BD_OVERLAY_PG)
+        return false;
+
+    return Open3DSubtitleBridgeGetEnabledFromObject(VLC_OBJECT(p_sys->p_vout));
+}
+
+static void open3dblurayDetachOverlaySubpictureFromVout(demux_t *p_demux,
+                                                        bluray_overlay_t *p_ov)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    if (p_ov == NULL)
+        return;
+
+    vlc_mutex_lock(&p_ov->lock);
+    if (p_sys->p_vout != NULL && p_ov->i_channel != -1)
+        vout_FlushSubpictureChannel(p_sys->p_vout, p_ov->i_channel);
+    p_ov->i_channel = -1;
+    vlc_mutex_unlock(&p_ov->lock);
+
+    if (p_ov->p_updater != NULL)
+    {
+        unref_subpicture_updater(p_ov->p_updater);
+        p_ov->p_updater = NULL;
+    }
+}
+
+static void open3dbluraySyncSubtitleBridgeFromOverlayLocked(demux_t *p_demux,
+                                                            const bluray_overlay_t *p_ov)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    if (p_ov == NULL || p_ov->plane != BD_OVERLAY_PG)
+    {
+        Open3DSubtitleBridgeClear(&p_sys->subtitle_bridge);
+        return;
+    }
+
+    const vlc_tick_t pts = p_ov->pts90k > 0 ? FROM_SCALE(p_ov->pts90k)
+                                            : VLC_TICK_INVALID;
+    open3d_subtitle_depth_state_t depth_state;
+    Open3DSubtitleDepthStateSet(&depth_state,
+                                p_ov->b_subtitle_offset_valid,
+                                p_ov->i_subtitle_offset_sequence,
+                                p_ov->i_subtitle_offset_raw,
+                                p_ov->i_subtitle_offset_signed,
+                                p_ov->i_subtitle_offset_frame);
+    if (Open3DSubtitleBridgeUpdate(&p_sys->subtitle_bridge,
+                                   p_ov->width, p_ov->height,
+                                   p_ov->p_regions, pts,
+                                   &depth_state) != VLC_SUCCESS)
+        msg_Err(p_demux, "failed to update direct Blu-ray subtitle bridge");
+}
+
+static void open3dblurayPublishSubtitleOffsetToVout(demux_t *p_demux,
+                                                    const bluray_overlay_t *p_ov)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    open3dblurayEnsureVout(p_demux);
+    vout_thread_t *p_vout = p_sys->p_vout;
+    open3d_subtitle_depth_state_t depth_state;
+
+    if (!p_vout)
+        return;
+
+    Open3DSubtitleDepthStateClear(&depth_state);
+
+    if (p_ov && p_ov->b_subtitle_offset_valid) {
+        Open3DSubtitleDepthStateSet(&depth_state,
+                                    true,
+                                    p_ov->i_subtitle_offset_sequence,
+                                    p_ov->i_subtitle_offset_raw,
+                                    p_ov->i_subtitle_offset_signed,
+                                    p_ov->i_subtitle_offset_frame);
+    } else {
+        bool b_valid = false;
+        int i_signed = 0;
+        int i_raw = 0;
+        int i_frame = -1;
+        int i_seq = p_sys->b_selected_pg_offset_sequence_valid
+                  ? p_sys->i_selected_pg_offset_sequence_id : -1;
+
+        if (p_sys->bluray != NULL && p_sys->b_selected_pg_offset_sequence_valid) {
+            const int64_t i_pts = (int64_t)bd_tell_time(p_sys->bluray);
+            BD_OPEN3D_PG_OFFSET offset;
+            if (bd_open3d_mvc_get_pg_offset(p_sys->bluray,
+                                           p_sys->i_selected_pg_offset_sequence_id,
+                                           i_pts, &offset)) {
+                b_valid = true;
+                i_signed = offset.signed_offset;
+                i_raw = offset.raw_offset;
+                i_frame = offset.frame_index;
+                i_seq = offset.offset_sequence_id;
+            }
+        }
+        Open3DSubtitleDepthStateSet(&depth_state,
+                                    b_valid,
+                                    b_valid ? (uint8_t)i_seq : 0xff,
+                                    (uint8_t)i_raw,
+                                    (int8_t)i_signed,
+                                    i_frame);
+    }
+
+    Open3DSubtitleDepthPublishToObject(VLC_OBJECT(p_vout), &depth_state);
 }
 
 /*****************************************************************************
@@ -1349,6 +1729,13 @@ static int blurayOpen(vlc_object_t *object)
         return VLC_ENOMEM;
 
     p_sys->i_still_end_time = STILL_IMAGE_NOT_SET;
+    p_sys->subtitle_selection.current.i_real_pid = -1;
+    p_sys->subtitle_selection.pending_apply.i_real_pid = -1;
+    p_sys->subtitle_selection.i_pending_forced_startup_real_pid = -1;
+    p_sys->subtitle_selection.b_auto_forced_default_enabled = false;
+    p_sys->subtitle_selection.b_pending_apply_valid = false;
+    p_sys->i_forced_filter_pid = -1;
+    p_sys->pp_forced_filter_last = &p_sys->p_forced_filter_head;
 #if OPEN3DBLURAY_ENABLE_MVC
     p_sys->i_mvc_group = 1;
     p_sys->i_seek_timing_last_group_pcr = VLC_TICK_INVALID;
@@ -1366,6 +1753,7 @@ static int blurayOpen(vlc_object_t *object)
     vlc_mutex_init(&p_sys->pl_info_lock);
     vlc_mutex_init(&p_sys->bdj_overlay_lock);
     vlc_mutex_init(&p_sys->read_block_lock); /* used during bd_open_stream() */
+    Open3DSubtitleBridgeInit(&p_sys->subtitle_bridge);
 
     /* request sub demuxers to skip continuity check as some split
        file concatenation are just resetting counters... */
@@ -1481,11 +1869,11 @@ static int blurayOpen(vlc_object_t *object)
     bd_set_player_setting(p_sys->bluray, BLURAY_PLAYER_SETTING_REGION_CODE, 1<<region);
 
     /* set preferred languages */
-    const char *psz_code = DemuxGetLanguageCode( p_demux, "audio-language" );
+    const char *psz_code = open3dblurayGetPreferredLanguageCode(p_demux, "audio-language");
     bd_set_player_setting_str(p_sys->bluray, BLURAY_PLAYER_SETTING_AUDIO_LANG, psz_code);
-    psz_code = DemuxGetLanguageCode( p_demux, "sub-language" );
+    psz_code = open3dblurayGetPreferredLanguageCode(p_demux, "sub-language");
     bd_set_player_setting_str(p_sys->bluray, BLURAY_PLAYER_SETTING_PG_LANG,    psz_code);
-    psz_code = DemuxGetLanguageCode( p_demux, "menu-language" );
+    psz_code = open3dblurayGetPreferredLanguageCode(p_demux, "menu-language");
     bd_set_player_setting_str(p_sys->bluray, BLURAY_PLAYER_SETTING_MENU_LANG,  psz_code);
 
     /* Get disc metadata */
@@ -1641,7 +2029,9 @@ static void blurayClose(vlc_object_t *object)
     vlc_mutex_destroy(&p_sys->pl_info_lock);
     vlc_mutex_destroy(&p_sys->bdj_overlay_lock);
     vlc_mutex_destroy(&p_sys->read_block_lock);
+    Open3DSubtitleBridgeDestroy(&p_sys->subtitle_bridge);
 
+    open3dblurayForcedFilterClearQueued(p_sys);
     free(p_sys->psz_bd_path);
 }
 
@@ -1696,6 +2086,37 @@ static BLURAY_STREAM_INFO * blurayGetStreamInfoByPIDUnlocked(demux_sys_t *p_sys,
     return NULL;
 }
 
+static void open3dblurayUpdateSelectedSubtitleOffsetUnlocked(demux_t *p_demux, int i_pid)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    BLURAY_STREAM_INFO *p_stream = NULL;
+
+    p_sys->b_selected_pg_offset_sequence_valid = false;
+    p_sys->i_selected_pg_offset_sequence_id = 0xff;
+    open3dblurayPublishSubtitleOffsetToVout(p_demux, NULL);
+
+    if (i_pid > 0)
+        p_stream = blurayGetStreamInfoByPIDUnlocked(p_sys, i_pid);
+
+    if (!p_stream || p_stream->coding_type != BLURAY_STREAM_TYPE_SUB_PG ||
+        p_stream->pg_offset_sequence_id == 0xff)
+        return;
+
+    p_sys->b_selected_pg_offset_sequence_valid = true;
+    p_sys->i_selected_pg_offset_sequence_id = p_stream->pg_offset_sequence_id;
+
+    msg_Info(p_demux,
+             "%s subtitle_stream pid=0x%04x lang=%s offset_seq=%u ss=%u ss_offset_seq=%u",
+             OPEN3DBLURAY_LOG_PREFIX,
+             i_pid,
+             p_stream->lang,
+             p_stream->pg_offset_sequence_id,
+             p_stream->pg_is_ss,
+             p_stream->pg_ss_offset_sequence_id);
+
+    open3dblurayPublishSubtitleOffsetToVout(p_demux, NULL);
+}
+
 static void setStreamLang(demux_sys_t *p_sys, es_format_t *p_fmt)
 {
     vlc_mutex_lock(&p_sys->pl_info_lock);
@@ -1727,7 +2148,7 @@ static int blurayGetStreamPID(demux_sys_t *p_sys, int i_stream_type, uint8_t i_s
 /*****************************************************************************
  * bluray fake es_out
  *****************************************************************************/
-typedef struct
+struct bluray_esout_sys_t
 {
     es_out_t *p_dst_out;
     vlc_object_t *p_obj;
@@ -1744,7 +2165,13 @@ typedef struct
         int i_audio_pid; /* Selected audio stream. -1 if default */
         int i_spu_pid;   /* Selected spu stream. -1 if default */
     } selected;
-} bluray_esout_sys_t;
+};
+
+typedef struct
+{
+    int  i_pid;
+    char psz_lang[4];
+} open3dbluray_forced_pg_track_t;
 
 enum
 {
@@ -1765,6 +2192,9 @@ static es_out_id_t *bluray_esOutAdd(es_out_t *p_out, const es_format_t *p_fmt)
     demux_sys_t *p_sys = p_demux->p_sys;
     es_format_t fmt;
     bool b_select = false;
+    bool b_real_spu_ready = false;
+    int i_real_spu_pid = -1;
+    int i_selected_spu_pid = -1;
 
     es_format_Copy(&fmt, p_fmt);
 
@@ -1809,10 +2239,20 @@ static es_out_id_t *bluray_esOutAdd(es_out_t *p_out, const es_format_t *p_fmt)
         setStreamLang(p_sys, &fmt);
         break ;
     case SPU_ES:
-        b_select = (esout_sys->selected.i_spu_pid == p_fmt->i_id && p_sys->b_spu_enable);
+    {
+        int i_forced_real_pid = -1;
+        if (open3dblurayDecodeForcedSubtitleEsId(p_fmt->i_id, &i_forced_real_pid)) {
+            b_select = open3dblurayHasRememberedForcedSubtitleSelection(p_demux,
+                                                                        i_forced_real_pid);
+        } else {
+            b_select = open3dblurayHasRememberedBaseSubtitleSelection(p_demux,
+                                                                      p_fmt->i_id) &&
+                       p_sys->b_spu_enable;
+        }
         fmt.i_priority = ES_PRIORITY_NOT_SELECTABLE;
         setStreamLang(p_sys, &fmt);
         break ;
+    }
     default:
         break ;
     }
@@ -1856,10 +2296,47 @@ static es_out_id_t *bluray_esOutAdd(es_out_t *p_out, const es_format_t *p_fmt)
             es_out_Control(esout_sys->p_dst_out, ES_OUT_SET_ES, p_es);
         else
             es_out_Control(esout_sys->p_dst_out, ES_OUT_SET_ES_STATE, p_es, false);
+
+        if (fmt.i_cat == SPU_ES && !open3dblurayDecodeForcedSubtitleEsId(fmt.i_id, NULL)) {
+            es_pair_t *p_real_pair = getEsPairByPID(&esout_sys->es, fmt.i_id);
+            open3dblurayMaybeAddForcedSubtitleTrackLocked(p_demux, esout_sys, p_real_pair);
+            b_real_spu_ready = true;
+            i_real_spu_pid = fmt.i_id;
+            i_selected_spu_pid = esout_sys->selected.i_spu_pid;
+        }
     }
     es_format_Clean(&fmt);
 
     vlc_mutex_unlock(&esout_sys->lock);
+
+    if (b_real_spu_ready) {
+        const bool b_pending_forced = open3dblurayTakePendingForcedStartupSubtitle(p_demux,
+                                                                                    i_real_spu_pid);
+        const bool b_remembered_forced = open3dblurayHasRememberedForcedSubtitleSelection(p_demux,
+                                                                                           i_real_spu_pid);
+        if (b_pending_forced || b_remembered_forced) {
+            const bool b_auto_forced = open3dblurayHasRememberedAutoForcedSubtitleSelection(p_demux,
+                                                                                             i_real_spu_pid);
+            msg_Dbg(p_demux,
+                    "%s deferring forced-only subtitle selection pid=0x%04x auto=%d until demux loop",
+                    OPEN3DBLURAY_LOG_PREFIX,
+                    i_real_spu_pid,
+                    b_auto_forced ? 1 : 0);
+            open3dbluraySchedulePendingForcedSubtitleSelection(p_demux,
+                                                               i_real_spu_pid,
+                                                               b_auto_forced);
+        } else if (open3dblurayShouldAutoPromotePreferredSubtitle(p_demux,
+                                                                  i_real_spu_pid,
+                                                                  i_selected_spu_pid)) {
+            msg_Dbg(p_demux,
+                    "%s deferring preferred forced-only subtitle promotion pid=0x%04x until demux loop",
+                    OPEN3DBLURAY_LOG_PREFIX,
+                    i_real_spu_pid);
+            open3dbluraySchedulePendingForcedSubtitleSelection(p_demux,
+                                                               i_real_spu_pid,
+                                                               true);
+        }
+    }
 
     return p_es;
 }
@@ -1905,10 +2382,29 @@ static int bluray_esOutSend(es_out_t *p_out, es_out_id_t *p_es, block_t *p_block
     if (p_block && p_pair)
         open3dblurayTraceSeekTimingAudio(p_demux, p_pair, p_block);
 #endif
+    if (p_block && p_pair && p_pair->fmt.i_cat == SPU_ES &&
+        !open3dblurayDecodeForcedSubtitleEsId(p_pair->fmt.i_id, NULL))
+        open3dblurayTracePgsBlock(p_demux, p_pair->fmt.i_id, p_block);
     if(esout_sys->b_disable_output)
     {
         block_Release(p_block);
         p_block = NULL;
+    }
+    else if (p_block && p_pair && p_pair->fmt.i_cat == SPU_ES &&
+             !open3dblurayDecodeForcedSubtitleEsId(p_pair->fmt.i_id, NULL) &&
+             open3dblurayHasRememberedForcedSubtitleSelection(p_demux, p_pair->fmt.i_id))
+    {
+        es_pair_t *p_forced_pair = getEsPairByPID(&esout_sys->es,
+                                                  open3dblurayMakeForcedSubtitleEsId(p_pair->fmt.i_id));
+        if (p_forced_pair != NULL) {
+            int i_send_ret = open3dbluraySendForcedPgsBlock(p_demux,
+                                                            esout_sys->p_dst_out,
+                                                            p_forced_pair->p_es,
+                                                            p_pair->fmt.i_id,
+                                                            p_block);
+            vlc_mutex_unlock(&esout_sys->lock);
+            return i_send_ret;
+        }
     }
 #if OPEN3DBLURAY_ENABLE_MVC
     else if (p_block && p_pair &&
@@ -1970,6 +2466,7 @@ static int bluray_esOutControl(es_out_t *p_out, int i_query, va_list args)
             bool b_select = (i_query == BLURAY_ES_OUT_CONTROL_SET_ES_BY_PID);
             const int i_bluray_stream_type = va_arg(args, int);
             const int i_pid = va_arg(args, int);
+            int i_effective_pid = i_pid;
             switch(i_bluray_stream_type)
             {
                 case BD_EVENT_AUDIO_STREAM:
@@ -1977,16 +2474,32 @@ static int bluray_esOutControl(es_out_t *p_out, int i_query, va_list args)
                     break;
                 case BD_EVENT_PG_TEXTST_STREAM:
                     esout_sys->selected.i_spu_pid = i_pid;
+                    if (open3dblurayHasRememberedForcedSubtitleSelection(p_demux, i_pid))
+                        i_effective_pid = open3dblurayMakeForcedSubtitleEsId(i_pid);
                     break;
                 default:
                     break;
             }
 
-            es_pair_t *p_pair = getEsPairByPID(&esout_sys->es, i_pid);
+            es_pair_t *p_pair = getEsPairByPID(&esout_sys->es, i_effective_pid);
             if(unlikely(!p_pair))
             {
                 vlc_mutex_unlock(&esout_sys->lock);
                 return VLC_EGENERIC;
+            }
+
+            if (i_bluray_stream_type == BD_EVENT_PG_TEXTST_STREAM &&
+                i_effective_pid != i_pid) {
+                es_pair_t *p_real_pair = getEsPairByPID(&esout_sys->es, i_pid);
+                if (p_real_pair != NULL)
+                    es_out_Control(esout_sys->p_dst_out, ES_OUT_SET_ES_STATE,
+                                   p_real_pair->p_es, false);
+            } else if (i_bluray_stream_type == BD_EVENT_PG_TEXTST_STREAM) {
+                es_pair_t *p_forced_pair = getEsPairByPID(&esout_sys->es,
+                                                          open3dblurayMakeForcedSubtitleEsId(i_pid));
+                if (p_forced_pair != NULL)
+                    es_out_Control(esout_sys->p_dst_out, ES_OUT_SET_ES_STATE,
+                                   p_forced_pair->p_es, false);
             }
 
             if(b_select)
@@ -2111,6 +2624,654 @@ static es_out_t *esOutNew(vlc_object_t *p_obj, es_out_t *p_dst_out, void *priv)
     esout_sys->selected.i_spu_pid = -1;
     vlc_mutex_init(&esout_sys->lock);
     return p_out;
+}
+
+static open3dbluray_subtitle_selection_t
+open3dblurayMakeSubtitleSelection(int i_pid,
+                                  bool b_forced_only,
+                                  bool b_auto_forced_only)
+{
+    open3dbluray_subtitle_selection_t selection = {
+        .i_real_pid = i_pid,
+        .b_forced_only = (i_pid > 0) ? b_forced_only : false,
+        .b_auto_forced_only = (i_pid > 0 && b_forced_only) ? b_auto_forced_only : false,
+    };
+    return selection;
+}
+
+static void open3dblurayRememberSubtitleSelectionEx(demux_t *p_demux,
+                                                    int i_pid,
+                                                    bool b_forced_only,
+                                                    bool b_auto_forced_only)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    p_sys->subtitle_selection.current =
+        open3dblurayMakeSubtitleSelection(i_pid,
+                                          b_forced_only,
+                                          b_auto_forced_only);
+}
+
+static void open3dblurayRememberSubtitleSelection(demux_t *p_demux,
+                                                  int i_pid,
+                                                  bool b_forced_only)
+{
+    open3dblurayRememberSubtitleSelectionEx(p_demux, i_pid, b_forced_only, false);
+}
+
+static bool open3dblurayHasRememberedBaseSubtitleSelection(demux_t *p_demux,
+                                                           int i_pid)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const open3dbluray_subtitle_selection_t *p_selection =
+        &p_sys->subtitle_selection.current;
+
+    return p_selection->i_real_pid == i_pid &&
+           !p_selection->b_forced_only;
+}
+
+static void open3dblurayForcedFilterClearQueued(demux_sys_t *p_sys)
+{
+    if (p_sys->p_forced_filter_head != NULL)
+        block_ChainRelease(p_sys->p_forced_filter_head);
+    p_sys->p_forced_filter_head = NULL;
+    p_sys->pp_forced_filter_last = &p_sys->p_forced_filter_head;
+}
+
+static void open3dblurayForcedFilterInvalidate(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    open3dblurayForcedFilterClearQueued(p_sys);
+    p_sys->b_forced_filter_output_active = false;
+}
+
+static void open3dblurayForcedFilterReset(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    open3dblurayForcedFilterInvalidate(p_demux);
+    p_sys->i_forced_filter_pid = -1;
+}
+
+static void open3dblurayForcedFilterSelectPid(demux_t *p_demux, int i_pid)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    if (p_sys->i_forced_filter_pid != i_pid)
+        open3dblurayForcedFilterInvalidate(p_demux);
+
+    p_sys->i_forced_filter_pid = i_pid;
+}
+
+typedef struct
+{
+    bool b_valid;
+    uint16_t i_width;
+    uint16_t i_height;
+    uint8_t i_frame_rate;
+    uint16_t i_composition_number;
+    uint8_t i_composition_state;
+    uint8_t i_palette_update_flag;
+    uint8_t i_palette_id;
+    uint8_t i_object_count;
+    uint8_t i_forced_object_count;
+    const uint8_t *p_payload;
+} open3dbluray_pgs_pcs_t;
+
+static bool open3dblurayParsePgsPcs(const block_t *p_block,
+                                    open3dbluray_pgs_pcs_t *p_pcs)
+{
+    if (p_pcs != NULL)
+        memset(p_pcs, 0, sizeof(*p_pcs));
+
+    if (p_block == NULL || p_pcs == NULL || p_block->p_buffer == NULL ||
+        p_block->i_buffer < 14 || p_block->p_buffer[0] != 0x16)
+        return false;
+
+    const size_t i_payload_len = ((size_t)p_block->p_buffer[1] << 8) |
+                                 (size_t)p_block->p_buffer[2];
+    if (p_block->i_buffer < 3 + i_payload_len || i_payload_len < 11)
+        return false;
+
+    const uint8_t *p_payload = p_block->p_buffer + 3;
+    const uint8_t i_object_count = p_payload[10];
+    const size_t i_needed = 11u + 8u * i_object_count;
+    if (i_payload_len < i_needed)
+        return false;
+
+    p_pcs->b_valid = true;
+    p_pcs->i_width = GetWBE(&p_payload[0]);
+    p_pcs->i_height = GetWBE(&p_payload[2]);
+    p_pcs->i_frame_rate = p_payload[4];
+    p_pcs->i_composition_number = GetWBE(&p_payload[5]);
+    p_pcs->i_composition_state = p_payload[7];
+    p_pcs->i_palette_update_flag = p_payload[8];
+    p_pcs->i_palette_id = p_payload[9];
+    p_pcs->i_object_count = i_object_count;
+    p_pcs->p_payload = p_payload;
+
+    for (uint8_t i = 0; i < i_object_count; ++i) {
+        const uint8_t *p_object = &p_payload[11 + 8u * i];
+        if ((p_object[3] & 0x40u) != 0)
+            p_pcs->i_forced_object_count++;
+    }
+
+    return true;
+}
+
+static block_t *open3dblurayBuildPgsPcsBlock(const block_t *p_src,
+                                             const open3dbluray_pgs_pcs_t *p_pcs,
+                                             bool b_clear_only)
+{
+    if (p_src == NULL || p_pcs == NULL || !p_pcs->b_valid)
+        return NULL;
+
+    const uint8_t i_output_objects = b_clear_only ? 0 : p_pcs->i_forced_object_count;
+    const size_t i_payload_len = 11u + 8u * i_output_objects;
+    block_t *p_out = block_Alloc(3 + i_payload_len);
+    if (p_out == NULL)
+        return NULL;
+
+    block_CopyProperties(p_out, (block_t *)p_src);
+    p_out->p_buffer[0] = 0x16;
+    p_out->p_buffer[1] = (uint8_t)(i_payload_len >> 8);
+    p_out->p_buffer[2] = (uint8_t)(i_payload_len & 0xff);
+    memcpy(p_out->p_buffer + 3, p_pcs->p_payload, 11);
+    p_out->p_buffer[3 + 10] = i_output_objects;
+    p_out->i_buffer = 3 + i_payload_len;
+
+    if (!b_clear_only && p_pcs->i_forced_object_count > 0) {
+        size_t i_dst = 3 + 11;
+        for (uint8_t i = 0; i < p_pcs->i_object_count; ++i) {
+            const uint8_t *p_object = &p_pcs->p_payload[11 + 8u * i];
+            if ((p_object[3] & 0x40u) == 0)
+                continue;
+            memcpy(&p_out->p_buffer[i_dst], p_object, 8);
+            i_dst += 8;
+        }
+    }
+
+    return p_out;
+}
+
+static int open3dblurayFlushForcedPgsDisplaySet(demux_t *p_demux,
+                                                es_out_t *p_dst_out,
+                                                es_out_id_t *p_forced_es)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    block_t *p_list = p_sys->p_forced_filter_head;
+    block_t *p_block;
+    block_t *p_next;
+    block_t *p_pcs_block = NULL;
+    open3dbluray_pgs_pcs_t pcs = { 0 };
+    bool b_emit = false;
+    bool b_clear_only = false;
+    int i_ret = VLC_SUCCESS;
+
+    p_sys->p_forced_filter_head = NULL;
+    p_sys->pp_forced_filter_last = &p_sys->p_forced_filter_head;
+
+    for (p_block = p_list; p_block != NULL; p_block = p_block->p_next) {
+        if (p_block->p_buffer != NULL && p_block->i_buffer >= 1 &&
+            p_block->p_buffer[0] == 0x16) {
+            p_pcs_block = p_block;
+            break;
+        }
+    }
+
+    if (p_pcs_block != NULL && open3dblurayParsePgsPcs(p_pcs_block, &pcs)) {
+        b_emit = true;
+        if (pcs.i_forced_object_count > 0) {
+            p_sys->b_forced_filter_output_active = true;
+        } else {
+            b_clear_only = true;
+            p_sys->b_forced_filter_output_active = false;
+        }
+        if (open3dblurayTraceForcedFilterEnabled()) {
+            msg_Info(p_demux,
+                     "%s forced_filter comp=%u objects=%u forced=%u mode=%s",
+                     OPEN3DBLURAY_LOG_PREFIX,
+                     pcs.i_composition_number,
+                     pcs.i_object_count,
+                     pcs.i_forced_object_count,
+                     b_clear_only ? "clear" : "forced");
+        }
+    } else if (open3dblurayTraceForcedFilterEnabled()) {
+        msg_Warn(p_demux,
+                 "%s forced_filter dropped display_set pcs_present=%d pcs_parse_ok=%d",
+                 OPEN3DBLURAY_LOG_PREFIX,
+                 p_pcs_block != NULL,
+                 (p_pcs_block != NULL) ? open3dblurayParsePgsPcs(p_pcs_block, &pcs) : 0);
+    }
+
+    for (p_block = p_list; p_block != NULL; p_block = p_next) {
+        block_t *p_out = NULL;
+        p_next = p_block->p_next;
+        p_block->p_next = NULL;
+
+        if (!b_emit) {
+            block_Release(p_block);
+            continue;
+        }
+
+        if (p_block == p_pcs_block) {
+            p_out = open3dblurayBuildPgsPcsBlock(p_block, &pcs, b_clear_only);
+            block_Release(p_block);
+        } else {
+            p_out = p_block;
+        }
+
+        if (p_out == NULL) {
+            i_ret = VLC_ENOMEM;
+            continue;
+        }
+
+        if (es_out_Send(p_dst_out, p_forced_es, p_out) != VLC_SUCCESS)
+            i_ret = VLC_EGENERIC;
+    }
+
+    return i_ret;
+}
+
+static int open3dbluraySendForcedPgsBlock(demux_t *p_demux,
+                                          es_out_t *p_dst_out,
+                                          es_out_id_t *p_forced_es,
+                                          int i_pid,
+                                          block_t *p_block)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    if (p_forced_es == NULL || p_block == NULL)
+        return VLC_EGENERIC;
+
+    if (p_sys->i_forced_filter_pid != i_pid)
+        open3dblurayForcedFilterSelectPid(p_demux, i_pid);
+
+    block_ChainLastAppend(&p_sys->pp_forced_filter_last, p_block);
+
+    if (p_block->p_buffer == NULL || p_block->i_buffer < 1 || p_block->p_buffer[0] != 0x80)
+        return VLC_SUCCESS;
+
+    return open3dblurayFlushForcedPgsDisplaySet(p_demux, p_dst_out, p_forced_es);
+}
+
+static void open3dblurayRememberPendingForcedStartupSubtitle(demux_t *p_demux,
+                                                             int i_pid)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    p_sys->subtitle_selection.i_pending_forced_startup_real_pid = i_pid;
+}
+
+static bool open3dblurayTakePendingForcedStartupSubtitle(demux_t *p_demux,
+                                                         int i_pid)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    if (p_sys->subtitle_selection.i_pending_forced_startup_real_pid != i_pid)
+        return false;
+
+    p_sys->subtitle_selection.i_pending_forced_startup_real_pid = -1;
+    return true;
+}
+
+static void open3dbluraySchedulePendingForcedSubtitleSelection(demux_t *p_demux,
+                                                               int i_pid,
+                                                               bool b_auto_forced_only)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    p_sys->subtitle_selection.pending_apply =
+        open3dblurayMakeSubtitleSelection(i_pid, true, b_auto_forced_only);
+    p_sys->subtitle_selection.b_pending_apply_valid = (i_pid > 0);
+}
+
+static bool open3dblurayTakePendingForcedSubtitleSelection(demux_t *p_demux,
+                                                           int *pi_pid,
+                                                           bool *pb_auto_forced_only)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const open3dbluray_subtitle_selection_t pending =
+        p_sys->subtitle_selection.pending_apply;
+
+    if (!p_sys->subtitle_selection.b_pending_apply_valid ||
+        pending.i_real_pid <= 0 || !pending.b_forced_only)
+        return false;
+
+    if (pi_pid != NULL)
+        *pi_pid = pending.i_real_pid;
+    if (pb_auto_forced_only != NULL)
+        *pb_auto_forced_only = pending.b_auto_forced_only;
+
+    p_sys->subtitle_selection.pending_apply =
+        open3dblurayMakeSubtitleSelection(-1, false, false);
+    p_sys->subtitle_selection.b_pending_apply_valid = false;
+    return true;
+}
+
+static bool open3dblurayHasRememberedForcedSubtitleSelection(demux_t *p_demux,
+                                                             int i_pid)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const open3dbluray_subtitle_selection_t *p_selection =
+        &p_sys->subtitle_selection.current;
+
+    return p_selection->i_real_pid == i_pid &&
+           p_selection->b_forced_only;
+}
+
+static bool open3dblurayHasRememberedAutoForcedSubtitleSelection(demux_t *p_demux,
+                                                                 int i_pid)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const open3dbluray_subtitle_selection_t *p_selection =
+        &p_sys->subtitle_selection.current;
+
+    return p_selection->i_real_pid == i_pid &&
+           p_selection->b_forced_only &&
+           p_selection->b_auto_forced_only;
+}
+
+static bool open3dblurayShouldAutoPromotePreferredSubtitle(demux_t *p_demux,
+                                                           int i_pid,
+                                                           int i_selected_pid)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const open3dbluray_subtitle_selection_t *p_selection =
+        &p_sys->subtitle_selection.current;
+
+    if (!p_sys->subtitle_selection.b_auto_forced_default_enabled ||
+        i_pid <= 0 || i_selected_pid != i_pid)
+        return false;
+
+    if (p_selection->i_real_pid < 0)
+        return true;
+
+    return p_selection->b_auto_forced_only &&
+           p_selection->i_real_pid != i_pid;
+}
+
+static bool open3dblurayHasForcedSubtitleTrack(demux_t *p_demux,
+                                               int i_real_spu_pid)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    if (p_sys->p_out == NULL || i_real_spu_pid <= 0)
+        return false;
+
+    bluray_esout_sys_t *esout_sys = (bluray_esout_sys_t *)p_sys->p_out->p_sys;
+    const int i_forced_id = open3dblurayMakeForcedSubtitleEsId(i_real_spu_pid);
+    bool b_present = false;
+
+    vlc_mutex_lock(&esout_sys->lock);
+    b_present = getEsPairByPID(&esout_sys->es, i_forced_id) != NULL;
+    vlc_mutex_unlock(&esout_sys->lock);
+    return b_present;
+}
+
+static void open3dblurayMaybeAutoSelectPreferredForcedSubtitle(demux_t *p_demux,
+                                                               int i_real_spu_pid,
+                                                               int i_selected_pid)
+{
+    if (!open3dblurayShouldAutoPromotePreferredSubtitle(p_demux,
+                                                        i_real_spu_pid,
+                                                        i_selected_pid) ||
+        !open3dblurayHasForcedSubtitleTrack(p_demux, i_real_spu_pid))
+        return;
+
+    msg_Info(p_demux,
+             "%s auto-selecting forced-only subtitle pid=0x%04x via preferred PG stream",
+             OPEN3DBLURAY_LOG_PREFIX,
+             i_real_spu_pid);
+    blurayOnUserStreamSelectionEx(p_demux,
+                                  open3dblurayMakeForcedSubtitleEsId(i_real_spu_pid),
+                                  true);
+}
+
+static bool open3dblurayGetPreferredSubtitleStream(demux_t *p_demux,
+                                                   int *pi_pid,
+                                                   uint8_t *pi_offset_seq,
+                                                   char psz_lang[4])
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const BLURAY_STREAM_INFO *p_stream = NULL;
+    const char *psz_pref_lang;
+
+    if (pi_pid != NULL)
+        *pi_pid = -1;
+    if (pi_offset_seq != NULL)
+        *pi_offset_seq = 0xff;
+    if (psz_lang != NULL)
+        psz_lang[0] = '\0';
+
+    if (p_sys->p_clip_info == NULL || p_sys->p_clip_info->pg_stream_count <= 0)
+        return false;
+
+    psz_pref_lang = open3dblurayGetPreferredLanguageCode(p_demux, "sub-language");
+    if (open3dblurayFindPgStreamIndexByLanguage(p_sys->p_clip_info,
+                                                psz_pref_lang,
+                                                &p_stream) < 0 ||
+        p_stream == NULL)
+        return false;
+
+    if (pi_pid != NULL)
+        *pi_pid = p_stream->pid;
+    if (pi_offset_seq != NULL)
+        *pi_offset_seq = p_stream->pg_offset_sequence_id;
+    if (psz_lang != NULL) {
+        memcpy(psz_lang, p_stream->lang, 3);
+        psz_lang[3] = '\0';
+    }
+    return true;
+}
+
+static int open3dblurayGetRememberedSubtitleUiId(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const open3dbluray_subtitle_selection_t *p_selection =
+        &p_sys->subtitle_selection.current;
+
+    if (p_selection->i_real_pid <= 0)
+        return p_selection->i_real_pid;
+
+    return p_selection->b_forced_only
+         ? open3dblurayMakeForcedSubtitleEsId(p_selection->i_real_pid)
+         : p_selection->i_real_pid;
+}
+
+static void open3dbluraySelectSubtitleUiId(demux_t *p_demux, int i_id)
+{
+    if (p_demux->p_input == NULL)
+        return;
+
+    vlc_value_t val = { .i_int = i_id };
+    var_Change(p_demux->p_input, "spu-es", VLC_VAR_SETVALUE, &val, NULL);
+}
+
+static void open3dblurayInitForcedSubtitleFmt(es_format_t *p_fmt,
+                                              const es_pair_t *p_real_pair,
+                                              const open3dbluray_forced_pg_track_t *p_track)
+{
+    assert(p_real_pair != NULL);
+    es_format_Copy(p_fmt, &p_real_pair->fmt);
+
+    p_fmt->i_id = open3dblurayMakeForcedSubtitleEsId(p_track->i_pid);
+    p_fmt->i_priority = ES_PRIORITY_NOT_SELECTABLE;
+
+    free(p_fmt->psz_description);
+    p_fmt->psz_description = strdup(OPEN3DBLURAY_FORCED_SUBTITLE_DESC);
+
+    free(p_fmt->psz_language);
+    p_fmt->psz_language = p_track->psz_lang[0] != '\0'
+                        ? strndup(p_track->psz_lang, 3)
+                        : NULL;
+}
+
+static bool open3dblurayLookupForcedSubtitleTrackInfo(demux_t *p_demux,
+                                                      int i_real_pid,
+                                                      open3dbluray_forced_pg_track_t *p_track)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    bool b_found = false;
+
+    if (p_track == NULL || i_real_pid <= 0)
+        return false;
+
+    memset(p_track, 0, sizeof(*p_track));
+    p_track->i_pid = i_real_pid;
+
+    vlc_mutex_lock(&p_sys->pl_info_lock);
+    for (int i = 0; p_sys->p_clip_info != NULL && i < p_sys->p_clip_info->pg_stream_count; ++i) {
+        if (p_sys->p_clip_info->pg_streams[i].pid != i_real_pid)
+            continue;
+
+        memcpy(p_track->psz_lang,
+               p_sys->p_clip_info->pg_streams[i].lang,
+               sizeof(p_track->psz_lang) - 1);
+        p_track->psz_lang[3] = '\0';
+        b_found = true;
+        break;
+    }
+    vlc_mutex_unlock(&p_sys->pl_info_lock);
+
+    return b_found;
+}
+
+static bool open3dblurayEnsureForcedSubtitleTrackLocked(demux_t *p_demux,
+                                                        bluray_esout_sys_t *esout_sys,
+                                                        const es_pair_t *p_real_pair,
+                                                        const open3dbluray_forced_pg_track_t *p_track,
+                                                        int *pi_ui_select_id)
+{
+    int i_forced_id;
+    es_format_t fmt;
+    es_out_id_t *p_es = NULL;
+    open3dbluray_forced_pg_track_t track;
+
+    if (!open3dblurayForcedSubtitleTrackExposureEnabled())
+        return false;
+    if (p_real_pair == NULL || p_real_pair->fmt.i_cat != SPU_ES)
+        return false;
+
+    track = (p_track != NULL) ? *p_track : (open3dbluray_forced_pg_track_t){ 0 };
+    if (track.i_pid <= 0)
+        track.i_pid = p_real_pair->fmt.i_id;
+
+    if (track.i_pid <= 0 || open3dblurayDecodeForcedSubtitleEsId(track.i_pid, NULL))
+        return false;
+
+    i_forced_id = open3dblurayMakeForcedSubtitleEsId(track.i_pid);
+    if (getEsPairByPID(&esout_sys->es, i_forced_id) != NULL)
+        return false;
+
+    if (p_track == NULL && !open3dblurayLookupForcedSubtitleTrackInfo(p_demux, track.i_pid, &track))
+        return false;
+
+    es_format_Init(&fmt, UNKNOWN_ES, 0);
+    open3dblurayInitForcedSubtitleFmt(&fmt, p_real_pair, &track);
+    p_es = es_out_Add(esout_sys->p_dst_out, &fmt);
+    if (p_es != NULL) {
+        es_pair_Add(&esout_sys->es, &fmt, p_es);
+        es_out_Control(esout_sys->p_dst_out, ES_OUT_SET_ES_STATE, p_es, false);
+        if (pi_ui_select_id != NULL &&
+            open3dblurayHasRememberedForcedSubtitleSelection(p_demux, track.i_pid)) {
+            *pi_ui_select_id = open3dblurayGetRememberedSubtitleUiId(p_demux);
+        }
+        msg_Info(p_demux,
+                 "%s added forced-only subtitle ES id=0x%08x pid=0x%04x lang=%s",
+                 OPEN3DBLURAY_LOG_PREFIX,
+                 i_forced_id,
+                 track.i_pid,
+                 track.psz_lang[0] ? track.psz_lang : "und");
+    }
+    es_format_Clean(&fmt);
+    return p_es != NULL;
+}
+
+static void open3dblurayRemoveAllForcedSubtitleTracks(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    if (p_sys->p_out == NULL)
+        return;
+
+    bluray_esout_sys_t *esout_sys = (bluray_esout_sys_t *)p_sys->p_out->p_sys;
+
+    vlc_mutex_lock(&esout_sys->lock);
+
+    for (ssize_t i = (ssize_t)vlc_array_count(&esout_sys->es) - 1; i >= 0; --i) {
+        es_pair_t *p_pair = vlc_array_item_at_index(&esout_sys->es, i);
+        int i_real_pid = -1;
+
+        if (!open3dblurayDecodeForcedSubtitleEsId(p_pair->fmt.i_id, &i_real_pid))
+            continue;
+
+        msg_Info(p_demux,
+                 "%s removing forced-only subtitle ES id=0x%08x pid=0x%04x",
+                 OPEN3DBLURAY_LOG_PREFIX,
+                 p_pair->fmt.i_id,
+                 i_real_pid);
+        es_out_Del(esout_sys->p_dst_out, p_pair->p_es);
+        es_pair_Remove(&esout_sys->es, p_pair);
+    }
+
+    vlc_mutex_unlock(&esout_sys->lock);
+}
+
+static void open3dbluraySyncForcedSubtitleTracks(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    if (!open3dblurayForcedSubtitleTrackExposureEnabled())
+        return;
+    if (p_sys->p_out == NULL)
+        return;
+
+    bluray_esout_sys_t *esout_sys = (bluray_esout_sys_t *)p_sys->p_out->p_sys;
+    open3dbluray_forced_pg_track_t *p_tracks = NULL;
+    size_t i_track_count = 0;
+    int i_ui_select_id = -1;
+
+    vlc_mutex_lock(&p_sys->pl_info_lock);
+    if (p_sys->p_clip_info != NULL && p_sys->p_clip_info->pg_stream_count > 0) {
+        i_track_count = p_sys->p_clip_info->pg_stream_count;
+        p_tracks = calloc(i_track_count, sizeof(*p_tracks));
+        if (p_tracks != NULL) {
+            for (size_t i = 0; i < i_track_count; ++i) {
+                p_tracks[i].i_pid = p_sys->p_clip_info->pg_streams[i].pid;
+                memcpy(p_tracks[i].psz_lang,
+                       p_sys->p_clip_info->pg_streams[i].lang,
+                       sizeof(p_tracks[i].psz_lang));
+                p_tracks[i].psz_lang[3] = '\0';
+            }
+        } else {
+            i_track_count = 0;
+        }
+    }
+    vlc_mutex_unlock(&p_sys->pl_info_lock);
+
+    vlc_mutex_lock(&esout_sys->lock);
+
+    for (size_t i = 0; i < i_track_count; ++i) {
+        es_pair_t *p_real_pair = getEsPairByPID(&esout_sys->es, p_tracks[i].i_pid);
+        if (p_real_pair == NULL)
+            continue;
+
+        open3dblurayEnsureForcedSubtitleTrackLocked(p_demux,
+                                                   esout_sys,
+                                                   p_real_pair,
+                                                   &p_tracks[i],
+                                                   &i_ui_select_id);
+    }
+
+    vlc_mutex_unlock(&esout_sys->lock);
+    free(p_tracks);
+
+    if (i_ui_select_id >= 0)
+        open3dbluraySelectSubtitleUiId(p_demux, i_ui_select_id);
+}
+
+static void open3dblurayMaybeAddForcedSubtitleTrackLocked(demux_t *p_demux,
+                                                          bluray_esout_sys_t *esout_sys,
+                                                          const es_pair_t *p_real_pair)
+{
+    open3dblurayEnsureForcedSubtitleTrackLocked(p_demux,
+                                               esout_sys,
+                                               p_real_pair,
+                                               NULL,
+                                               NULL);
 }
 
 /*****************************************************************************
@@ -2248,6 +3409,7 @@ static subpicture_t *bluraySubpictureCreate(bluray_overlay_t *p_ov)
     p_pic->i_original_picture_height = p_ov->height;
     p_pic->b_ephemer = true;
     p_pic->b_absolute = true;
+    p_pic->b_subtitle = (p_ov->plane == BD_OVERLAY_PG);
 
     vlc_mutex_init(&p_upd_sys->lock);
     p_upd_sys->ref_cnt = 2;
@@ -2313,6 +3475,9 @@ static void blurayCloseOverlay(demux_t *p_demux, int plane)
 
         p_sys->p_overlays[plane] = NULL;
     }
+
+    if (plane == BD_OVERLAY_PG)
+        Open3DSubtitleBridgeClear(&p_sys->subtitle_bridge);
 
     for (int i = 0; i < MAX_OVERLAY; i++)
         if (p_sys->p_overlays[i])
@@ -2380,6 +3545,9 @@ static void blurayClearOverlay(demux_t *p_demux, int plane)
     ov->status = Outdated;
 
     vlc_mutex_unlock(&ov->lock);
+
+    if (plane == BD_OVERLAY_PG)
+        Open3DSubtitleBridgeClear(&p_sys->subtitle_bridge);
 }
 
 static void blurayInitOverlay(demux_t *p_demux, int plane, int width, int height)
@@ -2401,10 +3569,15 @@ static void blurayInitOverlay(demux_t *p_demux, int plane, int width, int height
     ov->width = width;
     ov->height = height;
     ov->i_channel = -1;
+    ov->plane = plane;
+    ov->pts90k = -1;
 
     vlc_mutex_init(&ov->lock);
 
     p_sys->p_overlays[plane] = ov;
+
+    if (plane == BD_OVERLAY_PG)
+        Open3DSubtitleBridgeClear(&p_sys->subtitle_bridge);
 }
 
 /*
@@ -2533,6 +3706,33 @@ static void blurayOverlayProc(void *ptr, const BD_OVERLAY *const overlay)
         blurayClearOverlay(p_demux, overlay->plane);
         break;
     case BD_OVERLAY_FLUSH:
+        if (p_sys->p_overlays[overlay->plane]) {
+            bluray_overlay_t *ov = p_sys->p_overlays[overlay->plane];
+
+            vlc_mutex_lock(&ov->lock);
+            ov->pts90k = overlay->pts;
+            ov->b_subtitle_offset_valid = false;
+
+            if (ov->plane == BD_OVERLAY_PG &&
+                p_sys->b_selected_pg_offset_sequence_valid) {
+                BD_OPEN3D_PG_OFFSET offset;
+                if (bd_open3d_mvc_get_pg_offset(p_sys->bluray,
+                                               p_sys->i_selected_pg_offset_sequence_id,
+                                               overlay->pts, &offset)) {
+                    ov->b_subtitle_offset_valid = true;
+                    ov->i_subtitle_offset_sequence = offset.offset_sequence_id;
+                    ov->i_subtitle_offset_raw = offset.raw_offset;
+                    ov->i_subtitle_offset_signed = offset.signed_offset;
+                    ov->i_subtitle_offset_frame = offset.frame_index;
+                }
+            }
+
+            open3dbluraySyncSubtitleBridgeFromOverlayLocked(p_demux, ov);
+            open3dblurayPublishSubtitleOffsetToVout(p_demux, ov);
+            vlc_mutex_unlock(&ov->lock);
+            if (open3dblurayUseDirectSubtitleBridge(p_demux, ov))
+                open3dblurayDetachOverlaySubpictureFromVout(p_demux, ov);
+        }
         blurayActivateOverlay(p_demux, overlay->plane);
         break;
     case BD_OVERLAY_DRAW:
@@ -2665,7 +3865,10 @@ static void bluraySendOverlayToVout(demux_t *p_demux, bluray_overlay_t *p_ov)
         return;
     }
 
-    p_pic->i_start = p_pic->i_stop = mdate();
+    if (p_ov->pts90k > 0)
+        p_pic->i_start = p_pic->i_stop = FROM_SCALE(p_ov->pts90k);
+    else
+        p_pic->i_start = p_pic->i_stop = mdate();
     p_pic->i_channel = vout_RegisterSubpictureChannel(p_sys->p_vout);
     p_ov->i_channel = p_pic->i_channel;
 
@@ -2803,6 +4006,7 @@ static void blurayRestartParser(demux_t *p_demux, bool b_flush, bool b_random_ac
      * we are changing title.
      */
     demux_sys_t *p_sys = p_demux->p_sys;
+    open3dblurayForcedFilterInvalidate(p_demux);
 
     if(b_flush)
         es_out_Control(p_sys->p_out, BLURAY_ES_OUT_CONTROL_DISABLE_OUTPUT);
@@ -2870,16 +4074,58 @@ static int bluraySetTitle(demux_t *p_demux, int i_title)
 #  define BLURAY_AUDIO_STREAM 0
 #endif
 
-static void blurayOnUserStreamSelection(demux_t *p_demux, int i_pid)
+static void blurayOnUserStreamSelectionEx(demux_t *p_demux,
+                                          int i_pid,
+                                          bool b_auto_forced_only)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
+    int i_forced_pid = -1;
+    const bool b_forced_only = open3dblurayDecodeForcedSubtitleEsId(i_pid, &i_forced_pid);
+    const bool b_explicit_spu_selection = (i_pid == -SPU_ES) ||
+                                          b_forced_only ||
+                                          ((i_pid & 0xff00) == 0x1200) ||
+                                          i_pid == 0x1800;
+
+    if (!b_auto_forced_only && b_explicit_spu_selection)
+        p_sys->subtitle_selection.b_auto_forced_default_enabled = false;
+
     vlc_mutex_lock(&p_sys->pl_info_lock);
 
     if(i_pid == -AUDIO_ES)
         bd_select_stream(p_sys->bluray, BLURAY_AUDIO_STREAM, 0, 0);
-    else if(i_pid == -SPU_ES)
+    else if(i_pid == -SPU_ES) {
+        open3dblurayRememberSubtitleSelection(p_demux, -1, false);
+        open3dblurayForcedFilterReset(p_demux);
+        open3dblurayUpdateSelectedSubtitleOffsetUnlocked(p_demux, -1);
         bd_select_stream(p_sys->bluray, BLURAY_PG_TEXTST_STREAM, 0, 0);
-    else if (p_sys->p_clip_info)
+    } else if (b_forced_only && p_sys->p_clip_info) {
+        const BLURAY_STREAM_INFO *p_stream = NULL;
+        const int i_id = open3dblurayFindPgStreamIndexByPid(p_sys->p_clip_info,
+                                                            i_forced_pid,
+                                                            &p_stream);
+        if (i_id >= 0 && p_stream != NULL) {
+            open3dblurayRememberSubtitleSelectionEx(p_demux,
+                                                    i_forced_pid,
+                                                    true,
+                                                    b_auto_forced_only);
+            open3dblurayForcedFilterSelectPid(p_demux, i_forced_pid);
+            open3dblurayUpdateSelectedSubtitleOffsetUnlocked(p_demux, i_forced_pid);
+            bd_select_stream(p_sys->bluray, BLURAY_PG_TEXTST_STREAM, i_id + 1, 1);
+            open3dblurayApplyMenulessPgLanguageSetting(p_demux, p_stream);
+            msg_Info(p_demux,
+                     "%s selected forced-only subtitle pid=0x%04x lang=%s playlist_index=%d synthetic_es=0x%08x mode=filtered_pgs",
+                     OPEN3DBLURAY_LOG_PREFIX,
+                     i_forced_pid,
+                     (const char *)p_stream->lang,
+                     i_id,
+                     open3dblurayMakeForcedSubtitleEsId(i_forced_pid));
+            open3dbluraySelectSubtitleUiId(p_demux,
+                                          open3dblurayMakeForcedSubtitleEsId(i_forced_pid));
+        } else {
+            msg_Warn(p_demux, "%s forced-only subtitle selection pid=0x%04x not found in current playlist",
+                     OPEN3DBLURAY_LOG_PREFIX, i_forced_pid);
+        }
+    } else if (p_sys->p_clip_info)
     {
         if ((i_pid & 0xff00) == 0x1100) {
             bool b_in_playlist = false;
@@ -2904,19 +4150,20 @@ static void blurayOnUserStreamSelection(demux_t *p_demux, int i_pid)
                                BD_EVENT_AUDIO_STREAM, i_pid);
             }
         } else if ((i_pid & 0xff00) == 0x1200 || i_pid == 0x1800) {
-            bool b_in_playlist = false;
-            // subtitle
-            for (int i_id = 0; i_id < p_sys->p_clip_info->pg_stream_count; i_id++) {
-                if (i_pid == p_sys->p_clip_info->pg_streams[i_id].pid) {
-                    bd_select_stream(p_sys->bluray, BLURAY_PG_TEXTST_STREAM, i_id + 1, 1);
-                    if(!p_sys->b_menu)
-                        bd_set_player_setting_str(p_sys->bluray, BLURAY_PLAYER_SETTING_PG_LANG,
-                                   (const char *) p_sys->p_clip_info->pg_streams[i_id].lang);
-                    b_in_playlist = true;
-                    break;
-                }
-            }
-            if(!b_in_playlist && !p_sys->b_menu)
+            const BLURAY_STREAM_INFO *p_stream = NULL;
+            const int i_id = open3dblurayFindPgStreamIndexByPid(p_sys->p_clip_info,
+                                                                i_pid,
+                                                                &p_stream);
+            if (i_id >= 0 && p_stream != NULL) {
+                open3dblurayRememberSubtitleSelectionEx(p_demux,
+                                                        i_pid,
+                                                        false,
+                                                        false);
+                open3dblurayForcedFilterReset(p_demux);
+                open3dblurayUpdateSelectedSubtitleOffsetUnlocked(p_demux, i_pid);
+                bd_select_stream(p_sys->bluray, BLURAY_PG_TEXTST_STREAM, i_id + 1, 1);
+                open3dblurayApplyMenulessPgLanguageSetting(p_demux, p_stream);
+            } else if (!p_sys->b_menu)
             {
                 msg_Warn(p_demux, "Incorrect playlist for menuless track, forcing");
                 es_out_Control(p_sys->p_out, BLURAY_ES_OUT_CONTROL_SET_ES_BY_PID,
@@ -2926,6 +4173,102 @@ static void blurayOnUserStreamSelection(demux_t *p_demux, int i_pid)
     }
 
     vlc_mutex_unlock(&p_sys->pl_info_lock);
+}
+
+static void blurayOnUserStreamSelection(demux_t *p_demux, int i_pid)
+{
+    blurayOnUserStreamSelectionEx(p_demux, i_pid, false);
+}
+
+static void open3dblurayApplyStartupSubtitlePreference(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    int i_selected_spu_pid = -1;
+    int i_pref_pid = -1;
+    uint8_t i_pref_offset_seq = 0xff;
+    char sz_pref_lang[4] = "";
+
+    if (!p_sys->p_clip_info || p_sys->p_clip_info->pg_stream_count <= 0) {
+        return;
+    }
+
+    const int i_track_id = var_InheritInteger(p_demux, "sub-track-id");
+    if (i_track_id >= 0) {
+        p_sys->subtitle_selection.b_auto_forced_default_enabled = false;
+        msg_Dbg(p_demux,
+                "open3dbluraymvc startup subtitle preference: sub-track-id=%d",
+                i_track_id);
+        int i_forced_pid = -1;
+        if (open3dblurayDecodeForcedSubtitleEsId(i_track_id, &i_forced_pid)) {
+            open3dblurayRememberPendingForcedStartupSubtitle(p_demux, i_forced_pid);
+            return;
+        }
+        blurayOnUserStreamSelection(p_demux, i_track_id);
+        return;
+    }
+
+    const int i_track = var_InheritInteger(p_demux, "sub-track");
+    if (i_track >= 0 && i_track < p_sys->p_clip_info->pg_stream_count) {
+        p_sys->subtitle_selection.b_auto_forced_default_enabled = false;
+        msg_Dbg(p_demux,
+                "open3dbluraymvc startup subtitle preference: sub-track=%d pid=0x%04x lang=%s offset_seq=%u",
+                i_track,
+                p_sys->p_clip_info->pg_streams[i_track].pid,
+                (const char *)p_sys->p_clip_info->pg_streams[i_track].lang,
+                p_sys->p_clip_info->pg_streams[i_track].pg_offset_sequence_id);
+        blurayOnUserStreamSelection(p_demux, p_sys->p_clip_info->pg_streams[i_track].pid);
+        return;
+    }
+
+    p_sys->subtitle_selection.b_auto_forced_default_enabled =
+        open3dblurayForcedSubtitleTrackExposureEnabled();
+    if (!p_sys->subtitle_selection.b_auto_forced_default_enabled)
+        return;
+
+    if (open3dblurayGetPreferredSubtitleStream(p_demux,
+                                               &i_pref_pid,
+                                               &i_pref_offset_seq,
+                                               sz_pref_lang)) {
+        msg_Dbg(p_demux,
+                "%s startup subtitle preference: auto forced-only preferred_lang=%s pid=0x%04x offset_seq=%u",
+                OPEN3DBLURAY_LOG_PREFIX,
+                sz_pref_lang,
+                i_pref_pid,
+                i_pref_offset_seq);
+        if (open3dblurayHasForcedSubtitleTrack(p_demux, i_pref_pid)) {
+            open3dblurayMaybeAutoSelectPreferredForcedSubtitle(p_demux,
+                                                               i_pref_pid,
+                                                               i_pref_pid);
+        } else {
+            open3dblurayRememberPendingForcedStartupSubtitle(p_demux, i_pref_pid);
+            open3dblurayRememberSubtitleSelectionEx(p_demux,
+                                                    i_pref_pid,
+                                                    true,
+                                                    true);
+        }
+        return;
+    }
+
+    if (p_sys->p_out != NULL) {
+        bluray_esout_sys_t *esout_sys = (bluray_esout_sys_t *)p_sys->p_out->p_sys;
+        vlc_mutex_lock(&esout_sys->lock);
+        i_selected_spu_pid = esout_sys->selected.i_spu_pid;
+        vlc_mutex_unlock(&esout_sys->lock);
+    }
+
+    if (i_selected_spu_pid > 0) {
+        msg_Dbg(p_demux,
+                "%s startup subtitle preference: auto forced-only candidate pid=0x%04x",
+                OPEN3DBLURAY_LOG_PREFIX,
+                i_selected_spu_pid);
+        open3dblurayMaybeAutoSelectPreferredForcedSubtitle(p_demux,
+                                                           i_selected_spu_pid,
+                                                           i_selected_spu_pid);
+    } else {
+        msg_Dbg(p_demux,
+                "%s startup subtitle preference: auto forced-only pending preferred PG stream",
+                OPEN3DBLURAY_LOG_PREFIX);
+    }
 }
 
 /*****************************************************************************
@@ -3351,8 +4694,31 @@ static void blurayOnStreamSelectedEvent(demux_t *p_demux, uint32_t i_type, uint3
 
     if (i_pid > 0)
     {
-        if (i_type == BD_EVENT_PG_TEXTST_STREAM && !p_sys->b_spu_enable)
-            es_out_Control(p_sys->p_out, BLURAY_ES_OUT_CONTROL_UNSET_ES_BY_PID, (int)i_type, i_pid);
+        if (i_type == BD_EVENT_PG_TEXTST_STREAM)
+        {
+            if (open3dblurayShouldAutoPromotePreferredSubtitle(p_demux, i_pid, i_pid)) {
+                open3dblurayMaybeAutoSelectPreferredForcedSubtitle(p_demux,
+                                                                   i_pid,
+                                                                   i_pid);
+                if (open3dblurayHasRememberedForcedSubtitleSelection(p_demux, i_pid))
+                    return;
+            }
+
+            open3dblurayRememberSubtitleSelectionEx(p_demux,
+                                                    i_pid,
+                                                    open3dblurayHasRememberedForcedSubtitleSelection(p_demux,
+                                                                                                    i_pid),
+                                                    open3dblurayHasRememberedAutoForcedSubtitleSelection(p_demux,
+                                                                                                         i_pid));
+            open3dblurayUpdateSelectedSubtitleOffsetUnlocked(p_demux, i_pid);
+            if (!p_sys->b_spu_enable)
+                es_out_Control(p_sys->p_out, BLURAY_ES_OUT_CONTROL_UNSET_ES_BY_PID, (int)i_type, i_pid);
+            else
+                es_out_Control(p_sys->p_out, BLURAY_ES_OUT_CONTROL_SET_ES_BY_PID, (int)i_type, i_pid);
+            if (p_sys->b_spu_enable)
+                open3dbluraySelectSubtitleUiId(p_demux,
+                                               open3dblurayGetRememberedSubtitleUiId(p_demux));
+        }
         else
             es_out_Control(p_sys->p_out, BLURAY_ES_OUT_CONTROL_SET_ES_BY_PID, (int)i_type, i_pid);
     }
@@ -3363,6 +4729,7 @@ static void blurayUpdatePlaylist(demux_t *p_demux, unsigned i_playlist)
     demux_sys_t *p_sys = p_demux->p_sys;
 
     blurayRestartParser(p_demux, true, false);
+    open3dblurayRemoveAllForcedSubtitleTracks(p_demux);
 
     /* read title info and init some values */
     if (!p_sys->b_menu)
@@ -3377,6 +4744,7 @@ static void blurayUpdatePlaylist(demux_t *p_demux, unsigned i_playlist)
             p_demux->info.i_update |= INPUT_UPDATE_TITLE_LIST;
     }
     setTitleInfo(p_sys, p_title_info);
+    open3dbluraySyncForcedSubtitleTracks(p_demux);
 
     blurayResetStillImage(p_demux);
 }
@@ -3414,6 +4782,9 @@ static void blurayOnClipUpdate(demux_t *p_demux, uint32_t clip)
     }
 
     vlc_mutex_unlock(&p_sys->pl_info_lock);
+
+    open3dbluraySyncForcedSubtitleTracks(p_demux);
+    open3dblurayApplyStartupSubtitlePreference(p_demux);
 
     blurayResetStillImage(p_demux);
 }
@@ -3584,13 +4955,8 @@ static void blurayHandleOverlays(demux_t *p_demux, int nread)
         bool display = ov->status == ToDisplay;
         vlc_mutex_unlock(&ov->lock);
         if (display) {
-            if (p_sys->p_vout == NULL) {
-                p_sys->p_vout = input_GetVout(p_demux->p_input);
-                if (p_sys->p_vout != NULL) {
-                    var_AddCallback(p_sys->p_vout, "mouse-moved", onMouseEvent, p_demux);
-                    var_AddCallback(p_sys->p_vout, "mouse-clicked", onMouseEvent, p_demux);
-                }
-            }
+            if (p_sys->p_vout == NULL)
+                open3dblurayEnsureVout(p_demux);
 
             /* NOTE: we might want to enable background video always when there's no video stream playing.
                Now, with some discs, there are perioids (even seconds) during which the video window
@@ -3608,7 +4974,16 @@ static void blurayHandleOverlays(demux_t *p_demux, int nread)
             }
 
             if (p_sys->p_vout != NULL) {
-                bluraySendOverlayToVout(p_demux, ov);
+                open3dblurayAttachSubtitleBridgeToVout(p_demux);
+                open3dblurayPublishSubtitleOffsetToVout(p_demux, ov);
+                if (open3dblurayUseDirectSubtitleBridge(p_demux, ov)) {
+                    open3dblurayDetachOverlaySubpictureFromVout(p_demux, ov);
+                    vlc_mutex_lock(&ov->lock);
+                    ov->status = Displayed;
+                    vlc_mutex_unlock(&ov->lock);
+                } else {
+                    bluraySendOverlayToVout(p_demux, ov);
+                }
             }
         }
     }
@@ -3641,6 +5016,8 @@ static int blurayDemux(demux_t *p_demux)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
     BD_EVENT e;
+    int i_pending_forced_pid = -1;
+    bool b_pending_forced_auto = false;
 
     if(p_sys->b_draining)
     {
@@ -3681,7 +5058,21 @@ static int blurayDemux(demux_t *p_demux)
         blurayHandleEvent(p_demux, &p_sys->events_delayed.p_elems[i], true);
     p_sys->events_delayed.i_size = 0;
 
+    if (open3dblurayTakePendingForcedSubtitleSelection(p_demux,
+                                                       &i_pending_forced_pid,
+                                                       &b_pending_forced_auto)) {
+        msg_Dbg(p_demux,
+                "%s applying deferred forced-only subtitle selection pid=0x%04x auto=%d",
+                OPEN3DBLURAY_LOG_PREFIX,
+                i_pending_forced_pid,
+                b_pending_forced_auto ? 1 : 0);
+        blurayOnUserStreamSelectionEx(p_demux,
+                                      open3dblurayMakeForcedSubtitleEsId(i_pending_forced_pid),
+                                      b_pending_forced_auto);
+    }
+
     blurayHandleOverlays(p_demux, nread);
+    open3dblurayPublishSubtitleOffsetToVout(p_demux, NULL);
 
     if (nread <= 0) {
         block_Release(p_block);

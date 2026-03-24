@@ -3,12 +3,22 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: run_open3d_playback_vlc.sh /path/to/vlc-3.0.23-source <media-path-or-url> [vlc args...]
+Usage: run_open3d_playback_vlc.sh [/path/to/vlc-3.0.23-source] <media-path-or-url> [vlc args...]
 
 Maintained playback path:
 - `.iso` -> `open3dbluraymvc://`
 - `.mkv` -> native MKV demux + `edge264mvc`
-- `.264/.h264/.mvc` -> `--demux=open3dmkv`
+- `.264/.h264/.mvc` -> `--demux=open3dannexb`
+
+Optional env tuning:
+- `OPEN3D_PROCESS_CPUSET=4-7`
+- `OPEN3D_PROCESS_CPU_BACKEND=auto|systemd|taskset`
+- `OPEN3D_PRESENTER_PREFERRED_CPU=auto|N`
+- `OPEN3D_PROCESS_SCHED_POLICY=fifo|rr`
+- `OPEN3D_PROCESS_RT_PRIORITY=10`
+- `OPEN3D_PROCESS_IO_CLASS=realtime|best-effort|idle`
+- `OPEN3D_PROCESS_IO_PRIORITY=0`
+- `OPEN3D_MKV_SUBTITLE_PLANE_MAP=/path/to/plane_map.json`
 EOF
 }
 
@@ -19,10 +29,19 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-VLC_SRC="$(cd "$1" && pwd)"
+. "${SCRIPT_DIR}/open3d_process_isolation.sh"
+. "${SCRIPT_DIR}/open3d_media_routing.sh"
+. "${SCRIPT_DIR}/open3d_launcher_media_helpers.sh"
+VLC_SRC=""
+if [[ -d "$1" ]]; then
+  VLC_SRC="$(cd "$1" && pwd)"
+fi
 INPUT_MEDIA="$2"
 shift 2
 USER_VLC_ARGS=("$@")
+isolation_prefix=()
+isolation_vlc_args=()
+mkv_plane_map_tmp=""
 
 enable_open3d_vout="${OPEN3D_MVC_ENABLE_VOUT:-0}"
 no_plugins_cache="${OPEN3D_MVC_NO_PLUGINS_CACHE:-1}"
@@ -33,6 +52,7 @@ prestaged_plugin_path="${OPEN3D_MVC_PRESTAGED_PLUGIN_PATH:-}"
 runtime_shell="$("${SCRIPT_DIR}/resolve_open3d_runtime_profile.sh" "${runtime_profile}")"
 resolved_plugins="$(printf '%s\n' "${runtime_shell}" | sed -n 's/^plugins_path=//p')"
 resolved_edge264_lib="$(printf '%s\n' "${runtime_shell}" | sed -n 's/^edge264_lib=//p')"
+resolved_helper_lib_dir="$(printf '%s\n' "${runtime_shell}" | sed -n 's/^helper_lib_dir=//p')"
 
 if [[ -z "${EDGE264MVC_LIB:-}" && -n "${resolved_edge264_lib}" && -f "${resolved_edge264_lib}" ]]; then
   export EDGE264MVC_LIB="${resolved_edge264_lib}"
@@ -65,6 +85,20 @@ append_unique_path() {
   fi
 }
 
+prepare_launcher_log() {
+  local log_tag="$1"
+  local log_root="${OPEN3D_VLC_LOG_DIR:-${REPO_DIR}/local/out/runtime_logs/launcher}"
+  local timestamp
+  timestamp="$(date +%Y%m%d_%H%M%S)"
+  mkdir -p "${log_root}"
+
+  if [[ -n "${OPEN3D_VLC_LOG_PATH:-}" ]]; then
+    printf '%s\n' "${OPEN3D_VLC_LOG_PATH}"
+  else
+    printf '%s/%s_%s_pid%s.log\n' "${log_root}" "${log_tag}" "${timestamp}" "$$"
+  fi
+}
+
 discover_system_plugin_path() {
   local candidate
 
@@ -85,7 +119,7 @@ validate_plugin_root() {
 
   nested_plugin="$(find "${plugin_root}" -mindepth 3 -type f \
     \( -path '*/codec/libedge264mvc_plugin.so' \
-       -o -path '*/demux/libopen3dmkv_plugin.so' \
+       -o -path '*/demux/libopen3dannexb_plugin.so' \
        -o -path '*/video_output/libopen3d_plugin.so' \
        -o -path '*/access/libopen3dbluraymvc_plugin.so' \) \
     -print -quit 2>/dev/null || true)"
@@ -102,12 +136,19 @@ cleanup() {
   if [[ -n "${stage_log}" && -f "${stage_log}" ]]; then
     rm -f "${stage_log}"
   fi
+  if [[ -n "${mkv_plane_map_tmp}" && -f "${mkv_plane_map_tmp}" ]]; then
+    rm -f "${mkv_plane_map_tmp}"
+  fi
 }
 trap cleanup EXIT
 
 stage_plugin_root() {
   stage_log="$(mktemp)"
   local -a stage_env=()
+  if [[ -z "${VLC_SRC}" ]]; then
+    echo "Error: VLC source tree is required to stage plugins when no prestaged runtime is available." >&2
+    exit 2
+  fi
   if [[ "${enable_open3d_vout}" != "1" ]]; then
     stage_env+=("OPEN3D_STAGE_SKIP_VOUT=1")
   fi
@@ -143,72 +184,34 @@ selected_media="${INPUT_MEDIA}"
 selected_demux=""
 needs_edge264=0
 needs_access_plugin=0
-needs_open3dmkv_plugin=0
+needs_open3dannexb_plugin=0
 
 user_vout=""
 user_intf=""
-user_extraintf_set=0
-user_codec_set=0
-user_avcodec_hw_set=0
-for ((i = 0; i < ${#USER_VLC_ARGS[@]}; ++i)); do
-  token="${USER_VLC_ARGS[i]}"
-  if [[ "${token}" == --vout=* ]]; then
-    user_vout="${token#--vout=}"
-  elif [[ "${token}" == "--vout" && $((i + 1)) -lt ${#USER_VLC_ARGS[@]} ]]; then
-    user_vout="${USER_VLC_ARGS[i + 1]}"
-  elif [[ "${token}" == --intf=* ]]; then
-    user_intf="${token#--intf=}"
-  elif [[ "${token}" == "--intf" && $((i + 1)) -lt ${#USER_VLC_ARGS[@]} ]]; then
-    user_intf="${USER_VLC_ARGS[i + 1]}"
-  elif [[ "${token}" == "-I" && $((i + 1)) -lt ${#USER_VLC_ARGS[@]} ]]; then
-    user_intf="${USER_VLC_ARGS[i + 1]}"
-  elif [[ "${token}" == --extraintf=* || "${token}" == "--extraintf" ]]; then
-    user_extraintf_set=1
-  elif [[ "${token}" == --codec=* || "${token}" == "--codec" ]]; then
-    user_codec_set=1
-  elif [[ "${token}" == --avcodec-hw=* || "${token}" == "--avcodec-hw" ]]; then
-    user_avcodec_hw_set=1
-  fi
-done
+open3d_scan_user_args host_scan "${USER_VLC_ARGS[@]}"
+user_vout="${host_scan_user_vout_value}"
+user_intf="${host_scan_user_intf_value}"
+user_extraintf_set="${host_scan_user_extraintf_set}"
+user_codec_set="${host_scan_user_codec_set}"
+user_mkv_static_offset_set="${host_scan_user_mkv_static_offset_set}"
+user_mkv_subtitle_force_set="${host_scan_user_mkv_subtitle_force_set}"
+user_mkv_plane_set="${host_scan_user_mkv_plane_set}"
+user_mkv_source_id_set="${host_scan_user_mkv_source_id_set}"
+user_edge264mvc_normalize_ts_set="${host_scan_user_edge264mvc_normalize_ts_set}"
 
-is_url=0
-if [[ "${INPUT_MEDIA}" == *"://"* ]]; then
-  is_url=1
-fi
-
-if [[ "${is_url}" -eq 0 && ! -e "${INPUT_MEDIA}" ]]; then
+if ! open3d_media_route_path "${INPUT_MEDIA}"; then
   echo "Error: media path not found: ${INPUT_MEDIA}" >&2
   exit 5
 fi
 
-if [[ "${is_url}" -eq 0 && "${INPUT_MEDIA}" == *.* ]]; then
-  input_media_abs="$(readlink -f "${INPUT_MEDIA}")"
-  ext_lc="$(printf '%s' "${INPUT_MEDIA##*.}" | tr '[:upper:]' '[:lower:]')"
-  case "${ext_lc}" in
-    iso)
-      selected_media="open3dbluraymvc://${input_media_abs}"
-      needs_edge264=1
-      needs_access_plugin=1
-      ;;
-    mkv)
-      selected_media="${input_media_abs}"
-      needs_edge264=1
-      ;;
-    264|h264|mvc)
-      selected_media="${input_media_abs}"
-      selected_demux="open3dmkv"
-      needs_edge264=1
-      needs_open3dmkv_plugin=1
-      ;;
-    *)
-      selected_media="${input_media_abs}"
-      ;;
-  esac
-fi
-
-if [[ "${selected_media}" == open3dbluraymvc://* ]]; then
-  needs_access_plugin=1
-fi
+selected_media="${OPEN3D_MEDIA_SELECTED}"
+selected_demux="${OPEN3D_MEDIA_DEMUX}"
+needs_edge264="${OPEN3D_MEDIA_NEEDS_EDGE264}"
+needs_access_plugin="${OPEN3D_MEDIA_NEEDS_ACCESS_PLUGIN}"
+needs_open3dannexb_plugin="${OPEN3D_MEDIA_NEEDS_OPEN3DANNEXB_PLUGIN}"
+is_url="${OPEN3D_MEDIA_IS_URL}"
+ext_lc="${OPEN3D_MEDIA_EXT_LC}"
+input_media_abs="${OPEN3D_MEDIA_ABS}"
 
 if [[ ! -f "${PLUGIN_PATH}/codec/libedge264mvc_plugin.so" && "${needs_edge264}" == "1" ]]; then
   stage_plugin_root
@@ -218,7 +221,7 @@ if [[ ! -f "${PLUGIN_PATH}/access/libopen3dbluraymvc_plugin.so" && "${needs_acce
   stage_plugin_root
   validate_plugin_root "${PLUGIN_PATH}"
 fi
-if [[ ! -f "${PLUGIN_PATH}/demux/libopen3dmkv_plugin.so" && "${needs_open3dmkv_plugin}" == "1" ]]; then
+if [[ ! -f "${PLUGIN_PATH}/demux/libopen3dannexb_plugin.so" && "${needs_open3dannexb_plugin}" == "1" ]]; then
   stage_plugin_root
   validate_plugin_root "${PLUGIN_PATH}"
 fi
@@ -235,8 +238,8 @@ if [[ "${needs_access_plugin}" == "1" && ! -f "${PLUGIN_PATH}/access/libopen3dbl
   echo "Error: open3dbluraymvc plugin missing under plugin path: ${PLUGIN_PATH}" >&2
   exit 7
 fi
-if [[ "${needs_open3dmkv_plugin}" == "1" && ! -f "${PLUGIN_PATH}/demux/libopen3dmkv_plugin.so" ]]; then
-  echo "Error: open3dmkv plugin missing under plugin path: ${PLUGIN_PATH}" >&2
+if [[ "${needs_open3dannexb_plugin}" == "1" && ! -f "${PLUGIN_PATH}/demux/libopen3dannexb_plugin.so" ]]; then
+  echo "Error: open3dannexb raw Annex-B plugin missing under plugin path: ${PLUGIN_PATH}" >&2
   exit 8
 fi
 if [[ "${enable_open3d_vout}" == "1" && ! -f "${PLUGIN_PATH}/video_output/libopen3d_plugin.so" ]]; then
@@ -256,15 +259,30 @@ if [[ -n "${VLC_PLUGIN_PATH:-}" ]]; then
 fi
 
 runtime_ld_library_path="${LD_LIBRARY_PATH:-}"
+if [[ -n "${resolved_helper_lib_dir}" && -d "${resolved_helper_lib_dir}" ]]; then
+  runtime_ld_library_path="${resolved_helper_lib_dir}${runtime_ld_library_path:+:${runtime_ld_library_path}}"
+fi
 if [[ -n "${EDGE264MVC_LIB:-}" ]]; then
   edge264_lib_dir="$(cd "$(dirname "${EDGE264MVC_LIB}")" && pwd)"
   runtime_ld_library_path="${edge264_lib_dir}${runtime_ld_library_path:+:${runtime_ld_library_path}}"
 fi
 
+start_x11_window_tuner() {
+  if [[ "${OPEN3D_X11_BYPASS_COMPOSITOR:-0}" != "1" ]]; then
+    return 0
+  fi
+  if [[ -z "${DISPLAY:-}" ]]; then
+    echo "open3d x11 tuner: DISPLAY is not set, skipping"
+    return 0
+  fi
+  "${SCRIPT_DIR}/open3d_x11_window_tuner.sh" "$$" bypass_compositor &
+}
+
 vlc_args=(
-  --no-qt-privacy-ask
   --no-metadata-network-access
   --no-video-title-show
+  --no-qt-privacy-ask
+  --no-qt-error-dialogs
 )
 
 if [[ "${OPEN3D_MVC_FORCE_SEPARATE_INSTANCE:-0}" == "1" ]]; then
@@ -306,21 +324,77 @@ if [[ -n "${selected_demux}" ]]; then
 fi
 if [[ "${needs_edge264}" == "1" && "${user_codec_set}" == "0" ]]; then
   vlc_args+=("--codec=edge264mvc,avcodec")
-  if [[ "${user_avcodec_hw_set}" == "0" ]]; then
-    vlc_args+=("--avcodec-hw=none")
+fi
+
+if [[ "${is_url}" -eq 0 && "${ext_lc:-}" == "mkv" &&
+      "${user_edge264mvc_normalize_ts_set}" == "0" ]]; then
+  vlc_args+=("--edge264mvc-normalize-ts-cadence")
+  echo "Playback MKV timestamp normalization: enabled"
+fi
+
+if [[ "${is_url}" -eq 0 && "${ext_lc:-}" == "mkv" &&
+      "${enable_open3d_vout}" == "1" &&
+      ( "${user_mkv_static_offset_set}" == "0" ||
+        "${user_mkv_subtitle_force_set}" == "0" ||
+        "${user_mkv_plane_set}" == "0" ||
+        "${user_mkv_source_id_set}" == "0" ) ]]; then
+  if user_sub_track="$(open3d_extract_user_sub_track USER_VLC_ARGS 2>/dev/null)" &&
+     [[ "${user_sub_track}" =~ ^-?[0-9]+$ ]] &&
+     (( user_sub_track >= 0 )); then
+    if plane_map_path="$(open3d_resolve_mkv_plane_map_path "${SCRIPT_DIR}" "${input_media_abs}")"; then
+      mkv_plane_map_tmp="${plane_map_path}"
+      mkv_offset_info="$(open3d_lookup_mkv_subtitle_static_offset "${plane_map_path}" "${user_sub_track}" || true)"
+      IFS='|' read -r mkv_static_units mkv_plane mkv_language mkv_stream_index mkv_source_id <<<"${mkv_offset_info}"
+      if [[ -n "${mkv_stream_index:-}" ]]; then
+        mkv_source_id_normalized="${mkv_source_id:-}"
+        if [[ -n "${mkv_source_id_normalized}" && "${mkv_source_id_normalized}" =~ ^[0-9]+$ ]]; then
+          mkv_source_id_normalized="$((10#${mkv_source_id_normalized}))"
+        fi
+        if [[ "${user_mkv_subtitle_force_set}" == "0" ]]; then
+          vlc_args+=("--open3d-mkv-subtitle-force")
+        fi
+        if [[ -n "${mkv_static_units:-}" && "${user_mkv_static_offset_set}" == "0" ]]; then
+          vlc_args+=("--open3d-mkv-subtitle-static-offset-units=${mkv_static_units}")
+        fi
+        if [[ -n "${mkv_plane:-}" && "${user_mkv_plane_set}" == "0" ]]; then
+          vlc_args+=("--open3d-mkv-subtitle-plane=${mkv_plane}")
+        fi
+        if [[ -n "${mkv_source_id_normalized:-}" && "${user_mkv_source_id_set}" == "0" ]]; then
+          vlc_args+=("--open3d-mkv-subtitle-source-id=${mkv_source_id_normalized}")
+        fi
+        echo "Playback MKV subtitle metadata: sub_track=${user_sub_track} stream_index=${mkv_stream_index:-} language=${mkv_language:-} plane=${mkv_plane:-} source_id=${mkv_source_id_normalized:-${mkv_source_id:-}} units=${mkv_static_units:-} map=${plane_map_path}"
+      fi
+    fi
   fi
 fi
+
+open3d_isolation_build_exec_prefix isolation_prefix
+open3d_isolation_append_presenter_args isolation_vlc_args "${vlc_args[@]}" "${USER_VLC_ARGS[@]}"
 
 echo "Playback media: ${selected_media}"
 echo "Playback plugin path: ${runtime_plugin_path}"
 if [[ -n "${selected_demux}" ]]; then
   echo "Playback demux: ${selected_demux}"
 fi
+if (( ${#isolation_prefix[@]} > 0 )); then
+  echo "Playback isolation: ${isolation_prefix[*]}"
+fi
+if (( ${#isolation_vlc_args[@]} > 0 )); then
+  echo "Playback isolation args: ${isolation_vlc_args[*]}"
+fi
 
-exec env \
+log_path="$(prepare_launcher_log playback)"
+mkdir -p "$(dirname "${log_path}")"
+echo "Playback log: ${log_path}"
+exec > >(tee -a "${log_path}") 2>&1
+
+start_x11_window_tuner
+
+exec "${isolation_prefix[@]}" env \
   VLC_PLUGIN_PATH="${runtime_plugin_path}" \
   LD_LIBRARY_PATH="${runtime_ld_library_path}" \
-  "${VLC_BIN:-vlc}" \
+  "${VLC_BIN:-/usr/bin/vlc}" \
   "${vlc_args[@]}" \
+  "${isolation_vlc_args[@]}" \
   "${USER_VLC_ARGS[@]}" \
   "${selected_media}"
