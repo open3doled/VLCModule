@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""Small control client for a running Open3D VLC output instance."""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+from typing import Iterable
+
+from open3d_control_common import (
+    DISPLAY_PRESETS,
+    command_value,
+    config_home,
+    display_settings_path,
+    import_legacy_display_settings,
+    legacy_profile_default_name,
+    list_profiles,
+    local_emitter_connection_path,
+    load_display_profile,
+    normalize_profile_name,
+    profiles_dir,
+    save_display_profile,
+)
+
+EMITTER_PREFIXES = (
+    "open3d-emitter-",
+    "open3d-trigger-drive-mode",
+)
+
+EMITTER_STATE_KEY_MAP = {
+    "open3d-trigger-drive-mode": "ir_drive_mode",
+    "open3d-emitter-ir-protocol": "ir_protocol",
+    "open3d-emitter-ir-frame-delay": "ir_frame_delay",
+    "open3d-emitter-ir-frame-duration": "ir_frame_duration",
+    "open3d-emitter-ir-signal-spacing": "ir_signal_spacing",
+    "open3d-emitter-target-frametime": "target_frametime",
+    "open3d-emitter-ir-flip-eyes": "ir_flip_eyes",
+    "open3d-emitter-ir-avg-timing": "ir_average_timing_mode",
+    "open3d-emitter-opt-block-delay": "opt_block_signal_detection_delay",
+    "open3d-emitter-opt-min-threshold": "opt_min_threshold_value_to_activate",
+    "open3d-emitter-opt-threshold-high": "opt_detection_threshold_high",
+    "open3d-emitter-opt-threshold-low": "opt_detection_threshold_low",
+    "open3d-emitter-opt-ignore-during-ir": "opt_enable_ignore_during_ir",
+    "open3d-emitter-opt-dup-realtime": "opt_enable_duplicate_realtime_reporting",
+    "open3d-emitter-opt-output-stats": "opt_output_stats",
+    "open3d-emitter-opt-ignore-duplicates": "opt_ignore_all_duplicates",
+    "open3d-emitter-opt-sensor-filter": "opt_sensor_filter_mode",
+}
+
+
+def state_dirs() -> Iterable[Path]:
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg_runtime:
+        yield Path(xdg_runtime) / "open3doled" / "vlc"
+
+    xdg_state = os.environ.get("XDG_STATE_HOME")
+    if xdg_state:
+        yield Path(xdg_state) / "open3doled" / "vlc"
+
+    home = os.environ.get("HOME")
+    if home:
+        yield Path(home) / ".local" / "state" / "open3doled" / "vlc"
+
+
+def discover_socket() -> Path:
+    candidates: list[Path] = []
+    for directory in state_dirs():
+        candidates.extend(Path(p) for p in glob.glob(str(directory / "open3d-vlc-*.sock")))
+    candidates = [p for p in candidates if p.exists()]
+    if not candidates:
+        raise RuntimeError(
+            "no Open3D control socket found; pass --socket or start VLC with open3d vout"
+        )
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def connect_and_send(
+    sock_path: Path | None,
+    payload: dict[str, object],
+    retries: int,
+    retry_delay: float,
+) -> str:
+    wire = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
+    attempts = max(1, retries)
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            path = sock_path if sock_path is not None else discover_socket()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.connect(str(path))
+                sock.sendall(wire)
+                chunks: list[bytes] = []
+                while True:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+            return b"".join(chunks).decode("utf-8", errors="replace").rstrip("\n")
+        except (OSError, RuntimeError) as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(max(0.0, retry_delay))
+    raise RuntimeError(f"{last_error} after {attempts} attempt(s)")
+
+
+def request_json(
+    sock_path: Path | None,
+    payload: dict[str, object],
+    retries: int,
+    retry_delay: float,
+) -> dict[str, object]:
+    text = connect_and_send(sock_path, payload, retries, retry_delay)
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("control response was not a JSON object")
+    return parsed
+
+
+def route_set_command(key: str, value: str) -> dict[str, object]:
+    command = "set_local_emitter" if key.startswith(EMITTER_PREFIXES) else "set_display"
+    return {"cmd": command, "key": key, "value": value}
+
+
+def expected_emitter_state_key(key: str) -> str:
+    return EMITTER_STATE_KEY_MAP.get(key, key)
+
+
+def normalize_expected_for_actual(expected: object, actual: object) -> object:
+    if isinstance(actual, bool):
+        return command_value(expected).strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(actual, int) and not isinstance(actual, bool):
+        if isinstance(expected, str) and expected.strip().lower() in ("optical", "serial"):
+            return 1 if expected.strip().lower() == "serial" else 0
+        return int(float(command_value(expected).strip()))
+    if isinstance(actual, float):
+        return float(command_value(expected).strip())
+    return command_value(expected)
+
+
+def state_value_matches(actual: object, expected: object) -> bool:
+    try:
+        normalized = normalize_expected_for_actual(expected, actual)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(actual, float) or isinstance(normalized, float):
+        try:
+            return abs(float(actual) - float(normalized)) <= 0.0005
+        except (TypeError, ValueError):
+            return False
+    return actual == normalized
+
+
+def wait_for_values(
+    sock_path: Path | None,
+    section: str,
+    values: dict[str, object],
+    retries: int,
+    retry_delay: float,
+    timeout_s: float,
+    interval_s: float,
+) -> dict[str, object]:
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    last_state: dict[str, object] | None = None
+    while True:
+        last_state = request_json(sock_path, {"cmd": "get_state"}, retries, retry_delay)
+        state_section = last_state.get(section)
+        if isinstance(state_section, dict):
+            if all(
+                key in state_section and state_value_matches(state_section[key], value)
+                for key, value in values.items()
+            ):
+                return last_state
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(max(0.01, interval_s))
+
+    missing = []
+    if isinstance(last_state, dict) and isinstance(last_state.get(section), dict):
+        state_section = last_state[section]
+        missing = [
+            f"{key} expected={value!r} actual={state_section.get(key)!r}"
+            for key, value in values.items()
+            if key not in state_section or not state_value_matches(state_section[key], value)
+        ]
+    raise RuntimeError(
+        "timed out waiting for Open3D state to apply"
+        + (f": {', '.join(missing)}" if missing else "")
+    )
+
+
+def build_payload(args: argparse.Namespace) -> dict[str, object]:
+    command = args.command
+    if command in ("state", "get-state"):
+        return {"cmd": "get_state"}
+    if command == "set":
+        return route_set_command(args.key, args.value)
+    if command == "set-display":
+        return {"cmd": "set_display", "key": args.key, "value": args.value}
+    if command == "set-emitter":
+        return {"cmd": "set_local_emitter", "key": args.key, "value": args.value}
+    if command == "read-emitter":
+        return {"cmd": "read_emitter"}
+    if command == "apply-emitter":
+        return {"cmd": "apply_emitter"}
+    if command == "save-emitter":
+        return {"cmd": "save_emitter"}
+    if command == "reconnect-emitter":
+        return {"cmd": "reconnect_emitter"}
+    raise RuntimeError(f"unsupported command: {command}")
+
+
+def queue_display_values(
+    sock_path: Path | None,
+    values: dict[str, object],
+    retries: int,
+    retry_delay: float,
+) -> int:
+    queued = 0
+    for key, value in values.items():
+        request_json(
+            sock_path,
+            {"cmd": "set_display", "key": key, "value": command_value(value)},
+            retries,
+            retry_delay,
+        )
+        queued += 1
+    return queued
+
+
+def queue_emitter_values(
+    sock_path: Path | None,
+    values: dict[str, object],
+    retries: int,
+    retry_delay: float,
+) -> int:
+    queued = 0
+    for key, value in values.items():
+        request_json(
+            sock_path,
+            {"cmd": "set_local_emitter", "key": key, "value": command_value(value)},
+            retries,
+            retry_delay,
+        )
+        queued += 1
+    return queued
+
+
+def queue_and_maybe_wait_display_values(
+    sock_path: Path | None,
+    values: dict[str, object],
+    args: argparse.Namespace,
+) -> int:
+    queued = queue_display_values(sock_path, values, args.retries, args.retry_delay)
+    if args.wait_applied:
+        wait_for_values(
+            sock_path,
+            "display",
+            values,
+            args.retries,
+            args.retry_delay,
+            args.wait_timeout,
+            args.wait_interval,
+        )
+    return queued
+
+
+def queue_and_maybe_wait_preset_values(
+    sock_path: Path | None,
+    preset_values: dict[str, object],
+    args: argparse.Namespace,
+) -> int:
+    display = preset_values.get("display")
+    emitter = preset_values.get("emitter")
+    display_values = display if isinstance(display, dict) else {}
+    emitter_values = emitter if isinstance(emitter, dict) else {}
+    queued = queue_display_values(sock_path, display_values, args.retries, args.retry_delay)
+    queued += queue_emitter_values(sock_path, emitter_values, args.retries, args.retry_delay)
+
+    if args.wait_applied:
+        if display_values:
+            wait_for_values(
+                sock_path,
+                "display",
+                display_values,
+                args.retries,
+                args.retry_delay,
+                args.wait_timeout,
+                args.wait_interval,
+            )
+        if emitter_values:
+            expected = {
+                expected_emitter_state_key(key): value
+                for key, value in emitter_values.items()
+            }
+            wait_for_values(
+                sock_path,
+                "local_emitter",
+                expected,
+                args.retries,
+                args.retry_delay,
+                args.wait_timeout,
+                args.wait_interval,
+            )
+    return queued
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Control a running Open3D VLC vout over its Unix socket."
+    )
+    parser.add_argument(
+        "--socket",
+        dest="socket_path",
+        help="Path to open3d-vlc-*.sock. Defaults to the newest discovered socket.",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=5,
+        help="Connection/discovery retry count. Defaults to 5.",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=float,
+        default=0.15,
+        help="Seconds to wait between retries. Defaults to 0.15.",
+    )
+    parser.add_argument(
+        "--wait-applied",
+        action="store_true",
+        help="After set/profile/preset commands, poll get_state until requested values are visible.",
+    )
+    parser.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=2.0,
+        help="Seconds to wait for --wait-applied. Defaults to 2.0.",
+    )
+    parser.add_argument(
+        "--wait-interval",
+        type=float,
+        default=0.05,
+        help="Polling interval for --wait-applied. Defaults to 0.05.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("state", help="Print current display/emitter state.")
+    subparsers.add_parser("get-state", help="Alias for state.")
+
+    set_parser = subparsers.add_parser(
+        "set",
+        help="Set a display option, or an emitter option for open3d-emitter-* keys.",
+    )
+    set_parser.add_argument("key")
+    set_parser.add_argument("value")
+
+    set_display = subparsers.add_parser("set-display", help="Set a display option.")
+    set_display.add_argument("key")
+    set_display.add_argument("value")
+
+    set_emitter = subparsers.add_parser("set-emitter", help="Set a local emitter option.")
+    set_emitter.add_argument("key")
+    set_emitter.add_argument("value")
+
+    subparsers.add_parser("read-emitter", help="Queue a hardware emitter read.")
+    subparsers.add_parser("apply-emitter", help="Apply local emitter settings to hardware.")
+    subparsers.add_parser("save-emitter", help="Save current hardware emitter settings.")
+    subparsers.add_parser("reconnect-emitter", help="Reconnect the emitter.")
+
+    subparsers.add_parser("paths", help="Print Open3D VLC settings, profile, and state paths.")
+    subparsers.add_parser("profile-list", help="List saved display profiles.")
+
+    profile_save = subparsers.add_parser(
+        "profile-save",
+        help="Save the active Open3D display state as a named display profile.",
+    )
+    profile_save.add_argument("name")
+
+    profile_load = subparsers.add_parser(
+        "profile-load",
+        help="Load a named display profile into the running Open3D vout.",
+    )
+    profile_load.add_argument("name")
+
+    profile_import = subparsers.add_parser(
+        "profile-import",
+        help="Import a 3DPlayer/MPCVideoRenderer display_settings JSON file as an Open3D profile.",
+    )
+    profile_import.add_argument("path", type=Path)
+    profile_import.add_argument(
+        "--name",
+        help="Saved Open3D profile name. Defaults to the imported file basename.",
+    )
+    profile_import.add_argument(
+        "--presenter-hz",
+        type=float,
+        help="Optional presenter refresh override, for example 240 for 240 Hz / 120 flip setups.",
+    )
+    profile_import.add_argument(
+        "--apply",
+        action="store_true",
+        help="Also apply the imported profile to the running Open3D vout.",
+    )
+
+    preset = subparsers.add_parser(
+        "preset",
+        help="Apply a built-in display preset.",
+    )
+    preset.add_argument("name", choices=sorted(DISPLAY_PRESETS))
+
+    args = parser.parse_args(argv)
+    sock_path = Path(args.socket_path) if args.socket_path else None
+
+    if args.command == "paths":
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "config_home": str(config_home()),
+                    "display_settings": str(display_settings_path()),
+                    "local_emitter_connection": str(local_emitter_connection_path()),
+                    "profiles_dir": str(profiles_dir()),
+                    "state_dirs": [str(path) for path in state_dirs()],
+                },
+                separators=(",", ":"),
+            )
+        )
+        return 0
+    if args.command == "profile-list":
+        print(json.dumps({"ok": True, "profiles": list_profiles()}, separators=(",", ":")))
+        return 0
+    if args.command == "profile-save":
+        state = request_json(sock_path, {"cmd": "get_state"}, args.retries, args.retry_delay)
+        display = state.get("display")
+        if not isinstance(display, dict):
+            raise RuntimeError("state response did not include display settings")
+        path = save_display_profile(args.name, display)
+        print(
+            json.dumps(
+                {"ok": True, "profile": normalize_profile_name(args.name), "path": str(path), "settings": len(display)},
+                separators=(",", ":"),
+            )
+        )
+        return 0
+    if args.command == "profile-load":
+        display = load_display_profile(args.name)
+        queued = queue_and_maybe_wait_display_values(sock_path, display, args)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "profile": normalize_profile_name(args.name),
+                    "queued": queued,
+                    "applied": bool(args.wait_applied),
+                },
+                separators=(",", ":"),
+            )
+        )
+        return 0
+    if args.command == "profile-import":
+        display = import_legacy_display_settings(args.path)
+        if args.presenter_hz is not None:
+            display["open3d-presenter-hz"] = args.presenter_hz
+        profile_name = args.name or legacy_profile_default_name(args.path)
+        path = save_display_profile(profile_name, display)
+        queued = queue_and_maybe_wait_display_values(sock_path, display, args) if args.apply else 0
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "profile": normalize_profile_name(profile_name),
+                    "path": str(path),
+                    "settings": len(display),
+                    "queued": queued,
+                    "applied": bool(args.apply and args.wait_applied),
+                },
+                separators=(",", ":"),
+            )
+        )
+        return 0
+    if args.command == "preset":
+        queued = queue_and_maybe_wait_preset_values(sock_path, DISPLAY_PRESETS[args.name], args)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "preset": args.name,
+                    "queued": queued,
+                    "applied": bool(args.wait_applied),
+                },
+                separators=(",", ":"),
+            )
+        )
+        return 0
+
+    payload = build_payload(args)
+    if args.wait_applied and args.command in ("set", "set-display", "set-emitter"):
+        response = request_json(sock_path, payload, args.retries, args.retry_delay)
+        command = payload.get("cmd")
+        key = str(payload.get("key", ""))
+        value = payload.get("value")
+        if command == "set_display":
+            wait_for_values(
+                sock_path,
+                "display",
+                {key: value},
+                args.retries,
+                args.retry_delay,
+                args.wait_timeout,
+                args.wait_interval,
+            )
+        elif command == "set_local_emitter":
+            wait_for_values(
+                sock_path,
+                "local_emitter",
+                {expected_emitter_state_key(key): value},
+                args.retries,
+                args.retry_delay,
+                args.wait_timeout,
+                args.wait_interval,
+            )
+        response["applied"] = True
+        print(json.dumps(response, separators=(",", ":")))
+    else:
+        print(connect_and_send(sock_path, payload, args.retries, args.retry_delay))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except (OSError, RuntimeError) as exc:
+        print(f"open3dctl: {exc}", file=sys.stderr)
+        raise SystemExit(1)

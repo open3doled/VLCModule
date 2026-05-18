@@ -11537,7 +11537,7 @@ libmacosx_plugin_la_RES =  \
 libmacosx_plugin_ladir = $(prefix)/share/macosx/Contents/Resources
 libqt_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) -DQT_USE_QSTRINGBUILDER \
 	-DQT_NO_CAST_FROM_BYTEARRAY -I$(srcdir)/gui/qt \
-	-I$(builddir)/gui/qt $(am__append_134) $(am__append_138) \
+	-I$(builddir)/gui/qt $(QT_PLUGIN_CFLAGS) $(am__append_134) $(am__append_138) \
 	$(am__append_139)
 libqt_plugin_la_CXXFLAGS = $(AM_CXXFLAGS) $(QT_CFLAGS) $(CXXFLAGS_qt) \
 	$(am__append_131) $(am__append_133) $(am__append_135)
@@ -12732,9 +12732,10 @@ libgl_plugin_la_LIBADD = $(LIBM) $(OPENGL_COMMONLIBS) \
 libopen3d_plugin_la_SOURCES = $(OPENGL_COMMONSOURCES) video_output/open3d_display.c
 libopen3d_plugin_la_CFLAGS = $(AM_CFLAGS) $(GL_CFLAGS) \
 	$(OPENGL_COMMONCLFAGS) $(OPEN3D_PLUGIN_CFLAGS) \
-	$(am__append_231)
+	$(am__append_231) $(WAYLAND_CLIENT_CFLAGS)
 libopen3d_plugin_la_LIBADD = $(LIBM) $(OPENGL_COMMONLIBS) \
-	$(am__append_232) $(am__append_122)
+	$(am__append_232) $(am__append_122) $(X_LIBS) $(X_PRE_LIBS) -lX11 \
+	$(WAYLAND_CLIENT_LIBS)
 libglconv_vaapi_wl_plugin_la_SOURCES = video_output/opengl/converter_vaapi.c \
 	video_output/opengl/converter.h \
 	hw/vaapi/vlc_vaapi.c hw/vaapi/vlc_vaapi.h

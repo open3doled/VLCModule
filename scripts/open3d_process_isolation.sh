@@ -1,4 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/bash
+
+open3d_isolation_host_tool() {
+  env -u LD_LIBRARY_PATH -u VLC_PLUGIN_PATH "$@"
+}
 
 open3d_isolation_log() {
   printf '%s\n' "$*"
@@ -45,9 +49,8 @@ open3d_isolation_systemd_probe_cpuset() {
   local probed=""
 
   probed="$(
-    systemd-run --user --scope --quiet -p "AllowedCPUs=${cpuset}" \
-      /bin/bash -lc \
-      'awk -F":" '"'"'/^Cpus_allowed_list:/ { gsub(/^[ \t]+/, "", $2); print $2; exit }'"'"' /proc/self/status' \
+    open3d_isolation_host_tool systemd-run --user --scope --quiet -p "AllowedCPUs=${cpuset}" \
+      awk -F':' '/^Cpus_allowed_list:/ { gsub(/^[ \t]+/, "", $2); print $2; exit }' /proc/self/status \
       2>/dev/null || true
   )"
 
@@ -162,7 +165,7 @@ open3d_isolation_build_exec_prefix() {
           out_ref=(systemd-run --user --scope --quiet -p "AllowedCPUs=${cpuset}")
           open3d_isolation_log "open3d isolation: process cpuset=${cpuset} backend=systemd"
         elif command -v systemd-run >/dev/null 2>&1 &&
-             systemd-run --user --scope --quiet -p "AllowedCPUs=${cpuset}" /bin/true >/dev/null 2>&1; then
+             open3d_isolation_host_tool systemd-run --user --scope --quiet -p "AllowedCPUs=${cpuset}" /bin/true >/dev/null 2>&1; then
           open3d_isolation_log "open3d isolation: systemd AllowedCPUs probe did not apply cpuset='${cpuset}', falling back to taskset"
         elif [[ "${cpu_backend}" == "systemd" ]]; then
           open3d_isolation_log "open3d isolation: systemd AllowedCPUs backend unavailable for cpuset='${cpuset}', falling back to taskset"
@@ -172,7 +175,7 @@ open3d_isolation_build_exec_prefix() {
         if (( ${#out_ref[@]} == 0 )); then
           if ! command -v taskset >/dev/null 2>&1; then
             open3d_isolation_log "open3d isolation: taskset not available, falling back to in-process presenter tuning only"
-          elif ! taskset --cpu-list "${cpuset}" /bin/true >/dev/null 2>&1; then
+          elif ! open3d_isolation_host_tool taskset --cpu-list "${cpuset}" /bin/true >/dev/null 2>&1; then
             open3d_isolation_log "open3d isolation: invalid or unsupported OPEN3D_PROCESS_CPUSET='${cpuset}', falling back to in-process presenter tuning only"
           else
             out_ref=(taskset --cpu-list "${cpuset}")
@@ -199,7 +202,7 @@ open3d_isolation_build_exec_prefix() {
       else
         case "${sched_policy}" in
           fifo)
-            if ! chrt --fifo "${rt_priority}" /bin/true >/dev/null 2>&1; then
+            if ! open3d_isolation_host_tool chrt --fifo "${rt_priority}" /bin/true >/dev/null 2>&1; then
               open3d_isolation_log "open3d isolation: fifo priority=${rt_priority} denied, falling back to current in-process presenter tuning"
             else
               out_ref+=(chrt --fifo "${rt_priority}")
@@ -207,7 +210,7 @@ open3d_isolation_build_exec_prefix() {
             fi
             ;;
           rr)
-            if ! chrt --rr "${rt_priority}" /bin/true >/dev/null 2>&1; then
+            if ! open3d_isolation_host_tool chrt --rr "${rt_priority}" /bin/true >/dev/null 2>&1; then
               open3d_isolation_log "open3d isolation: rr priority=${rt_priority} denied, falling back to current in-process presenter tuning"
             else
               out_ref+=(chrt --rr "${rt_priority}")
@@ -240,7 +243,7 @@ open3d_isolation_build_exec_prefix() {
         open3d_isolation_log "open3d isolation: invalid OPEN3D_PROCESS_IO_PRIORITY='${io_priority}' for realtime class, skipping I/O policy"
         return 0
       fi
-      if ! ionice -c 1 -n "${io_priority}" /bin/true >/dev/null 2>&1; then
+      if ! open3d_isolation_host_tool ionice -c 1 -n "${io_priority}" /bin/true >/dev/null 2>&1; then
         open3d_isolation_log "open3d isolation: realtime ionice priority=${io_priority} denied, falling back to current process I/O priority"
         return 0
       fi
@@ -255,7 +258,7 @@ open3d_isolation_build_exec_prefix() {
         open3d_isolation_log "open3d isolation: invalid OPEN3D_PROCESS_IO_PRIORITY='${io_priority}' for best-effort class, skipping I/O policy"
         return 0
       fi
-      if ! ionice -c 2 -n "${io_priority}" /bin/true >/dev/null 2>&1; then
+      if ! open3d_isolation_host_tool ionice -c 2 -n "${io_priority}" /bin/true >/dev/null 2>&1; then
         open3d_isolation_log "open3d isolation: best-effort ionice priority=${io_priority} denied, falling back to current process I/O priority"
         return 0
       fi

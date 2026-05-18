@@ -78,6 +78,7 @@ STABLE_ROOT="${REPO_DIR}/local/out/stable_runtime/latest"
 REQUIRED_FILES=(
   "${STABLE_ROOT}/plugins/access/libopen3dbluraymvc_plugin.so"
   "${STABLE_ROOT}/plugins/codec/libedge264mvc_plugin.so"
+  "${STABLE_ROOT}/plugins/control/liboldrc_plugin.so"
   "${STABLE_ROOT}/plugins/demux/libopen3dannexb_plugin.so"
   "${STABLE_ROOT}/plugins/demux/libmkv_plugin.so"
   "${STABLE_ROOT}/plugins/video_output/libopen3d_plugin.so"

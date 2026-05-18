@@ -1,5 +1,55 @@
 #!/usr/bin/env bash
 
+open3d_should_enable_bluray_bdj_runtime() {
+  local user_bluray_menu_set="${1:-0}"
+  local user_bluray_menu_enabled="${2:-0}"
+  local selected_media="${3:-}"
+
+  if [[ "${user_bluray_menu_set}" == "1" ]]; then
+    if [[ "${user_bluray_menu_enabled}" == "1" ]]; then
+      return 0
+    fi
+    return 1
+  fi
+  if [[ "${OPEN3D_APPIMAGE_ENABLE_BDJ:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "${selected_media}" == open3dbluraymvc://* ]]; then
+    return 0
+  fi
+  return 1
+}
+
+open3d_disable_bluray_bdj_runtime() {
+  local log_prefix="${1:-open3d launcher}"
+  export LIBBLURAY_CP="/__open3d_disable_bdj__.jar"
+  printf '%s\n' "${log_prefix}: disabling BD-J runtime via LIBBLURAY_CP=${LIBBLURAY_CP}"
+}
+
+open3d_enable_bluray_bdj_runtime() {
+  local log_prefix="${1:-open3d launcher}"
+  shift
+  local candidate
+
+  if [[ -n "${LIBBLURAY_CP:-}" ]]; then
+    printf '%s\n' "${log_prefix}: using existing LIBBLURAY_CP=${LIBBLURAY_CP}"
+    return 0
+  fi
+
+  for candidate in "$@"; do
+    [[ -n "${candidate}" ]] || continue
+    if [[ -d "${candidate}" ]] &&
+       compgen -G "${candidate%/}/libbluray-j2se-*.jar" >/dev/null; then
+      export LIBBLURAY_CP="${candidate%/}/"
+      printf '%s\n' "${log_prefix}: enabling BD-J runtime via LIBBLURAY_CP=${LIBBLURAY_CP}"
+      return 0
+    fi
+  done
+
+  printf '%s\n' "${log_prefix}: BD-J requested but no libbluray BD-J jar directory was found" >&2
+  return 1
+}
+
 open3d_extract_user_sub_track() {
   local -n args_ref=$1
   local token
@@ -110,6 +160,10 @@ open3d_scan_user_args() {
   local user_mkv_plane_set=0
   local user_mkv_source_id_set=0
   local user_edge264mvc_normalize_ts_set=0
+  local user_bluray_menu_set=0
+  local user_bluray_menu_enabled=0
+  local user_presenter_rt_set=0
+  local user_avcodec_hw_set=0
   local i
 
   for ((i = 0; i < ${#args[@]}; ++i)); do
@@ -176,6 +230,13 @@ open3d_scan_user_args() {
       --codec=*)
         user_codec_set=1
         ;;
+      --avcodec-hw)
+        user_avcodec_hw_set=1
+        skip_media_detection_for_next=1
+        ;;
+      --avcodec-hw=*)
+        user_avcodec_hw_set=1
+        ;;
       --extraintf)
         user_extraintf_set=1
         skip_media_detection_for_next=1
@@ -214,6 +275,24 @@ open3d_scan_user_args() {
       --edge264mvc-normalize-ts-cadence|--no-edge264mvc-normalize-ts-cadence)
         user_edge264mvc_normalize_ts_set=1
         ;;
+      --open3d-presenter-rt-enable|--no-open3d-presenter-rt-enable)
+        user_presenter_rt_set=1
+        ;;
+      --open3d-presenter-rt-priority)
+        user_presenter_rt_set=1
+        skip_media_detection_for_next=1
+        ;;
+      --open3d-presenter-rt-priority=*)
+        user_presenter_rt_set=1
+        ;;
+      --bluray-menu)
+        user_bluray_menu_set=1
+        user_bluray_menu_enabled=1
+        ;;
+      --no-bluray-menu)
+        user_bluray_menu_set=1
+        user_bluray_menu_enabled=0
+        ;;
     esac
   done
 
@@ -231,4 +310,8 @@ open3d_scan_user_args() {
   printf -v "${prefix}_user_mkv_plane_set" '%s' "${user_mkv_plane_set}"
   printf -v "${prefix}_user_mkv_source_id_set" '%s' "${user_mkv_source_id_set}"
   printf -v "${prefix}_user_edge264mvc_normalize_ts_set" '%s' "${user_edge264mvc_normalize_ts_set}"
+  printf -v "${prefix}_user_bluray_menu_set" '%s' "${user_bluray_menu_set}"
+  printf -v "${prefix}_user_bluray_menu_enabled" '%s' "${user_bluray_menu_enabled}"
+  printf -v "${prefix}_user_presenter_rt_set" '%s' "${user_presenter_rt_set}"
+  printf -v "${prefix}_user_avcodec_hw_set" '%s' "${user_avcodec_hw_set}"
 }

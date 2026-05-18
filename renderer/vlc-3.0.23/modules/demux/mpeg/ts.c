@@ -63,42 +63,6 @@
 
 #include <assert.h>
 
-#if defined(OPEN3D_VLC_ABI_ALIAS_T64)
-# if defined(__GNUC__) || defined(__clang__)
-#  define OPEN3D_TSMVC_VISIBILITY __attribute__((visibility("default")))
-# else
-#  define OPEN3D_TSMVC_VISIBILITY
-# endif
-
-# if defined(_WIN32)
-#  define OPEN3D_TSMVC_EXPORT __declspec(dllexport)
-# else
-#  define OPEN3D_TSMVC_EXPORT
-# endif
-
-extern int vlc_entry__3_0_0f( vlc_set_cb, void * );
-extern const char *vlc_entry_copyright__3_0_0f( void );
-extern const char *vlc_entry_license__3_0_0f( void );
-
-OPEN3D_TSMVC_EXPORT OPEN3D_TSMVC_VISIBILITY
-int vlc_entry__3_0_0ft64( vlc_set_cb vlc_set, void *opaque )
-{
-    return vlc_entry__3_0_0f( vlc_set, opaque );
-}
-
-OPEN3D_TSMVC_EXPORT OPEN3D_TSMVC_VISIBILITY
-const char *vlc_entry_copyright__3_0_0ft64( void )
-{
-    return vlc_entry_copyright__3_0_0f();
-}
-
-OPEN3D_TSMVC_EXPORT OPEN3D_TSMVC_VISIBILITY
-const char *vlc_entry_license__3_0_0ft64( void )
-{
-    return vlc_entry_license__3_0_0f();
-}
-#endif
-
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/

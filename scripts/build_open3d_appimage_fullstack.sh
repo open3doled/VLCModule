@@ -18,10 +18,12 @@ OUT_ROOT="${OPEN3D_APPIMAGE_OUT_ROOT:-/out/fullstack-builds}"
 RUN_DIR="${OUT_ROOT}/${RUN_STAMP}"
 SUMMARY_FILE="${RUN_DIR}/summary.txt"
 BUILD_JOBS="${OPEN3D_VLC_BUILD_JOBS:-$(nproc)}"
-OPEN3D_VLC_ABI_ALIAS_T64="${OPEN3D_VLC_ABI_ALIAS_T64:-0}"
 OPEN3D_APPIMAGE_EXTENDED_MODULE_SET="${OPEN3D_APPIMAGE_EXTENDED_MODULE_SET:-1}"
+OPEN3D_APPIMAGE_ENABLE_WAYLAND="${OPEN3D_APPIMAGE_ENABLE_WAYLAND:-0}"
 OPEN3D_APPIMAGE_REUSE_SOURCE_TREE="${OPEN3D_APPIMAGE_REUSE_SOURCE_TREE:-1}"
 OPEN3D_APPIMAGE_CLEAN_BUILD="${OPEN3D_APPIMAGE_CLEAN_BUILD:-0}"
+WAYLAND_PROTOCOLS_PATH=""
+WAYLAND_SCANNER_BIN=""
 
 mkdir -p "${SRC_CACHE_DIR}" "${BUILD_ROOT}" "${STAGE_ROOT}" "${RUN_DIR}"
 
@@ -36,6 +38,39 @@ run_logged() {
     set -x
     "$@"
   ) 2>&1 | tee "${RUN_DIR}/${log_name}"
+}
+
+run_ui_build_with_retry() {
+  local -a ui_targets=(
+    libdummy_plugin.la
+    libhotkeys_plugin.la
+    libxcb_hotkeys_plugin.la
+    libqt_plugin.la
+  )
+
+  if run_logged "ui.log" make -C "${VLC_SRC_DIR}/modules" -j"${BUILD_JOBS}" \
+    "${ui_targets[@]}"; then
+    return 0
+  fi
+
+  log "Parallel UI build failed; retrying serially with -B to recover stale libtool/version-script state"
+  run_logged "ui-retry.log" make -C "${VLC_SRC_DIR}/modules" -j1 -B \
+    "${ui_targets[@]}"
+}
+
+build_optional_plugin_targets() {
+  local optional_log="${RUN_DIR}/optional-playback.log"
+  local target
+
+  : >"${optional_log}"
+  for target in "$@"; do
+    log "Attempting optional plugin target: ${target}"
+    if make -C "${VLC_SRC_DIR}/modules" -j"${BUILD_JOBS}" "${target}" >>"${optional_log}" 2>&1; then
+      log "  OPTIONAL OK ${target}"
+    else
+      log "  OPTIONAL SKIP ${target}"
+    fi
+  done
 }
 
 download_tarball() {
@@ -114,8 +149,20 @@ configure_args=(
   "--enable-shared"
   "--enable-qt"
   "--enable-xcb"
-  "--enable-wayland"
 )
+
+if [[ "${OPEN3D_APPIMAGE_ENABLE_WAYLAND}" == "1" ]]; then
+  configure_args+=("--enable-wayland")
+  if command -v pkg-config >/dev/null 2>&1; then
+    WAYLAND_PROTOCOLS_PATH="$(pkg-config --variable=pkgdatadir wayland-protocols 2>/dev/null || true)"
+  fi
+  if [[ -n "${WAYLAND_PROTOCOLS_PATH}" ]]; then
+    WAYLAND_PROTOCOLS_PATH="$(realpath -m "${WAYLAND_PROTOCOLS_PATH}")"
+  fi
+  WAYLAND_SCANNER_BIN="$(command -v wayland-scanner || true)"
+else
+  configure_args+=("--disable-wayland")
+fi
 
 log "Open3DOLED AppImage fullstack build"
 log "repo=${REPO_DIR}"
@@ -125,11 +172,24 @@ log "tarball=${TARBALL_PATH}"
 log "vlc_src=${VLC_SRC_DIR}"
 log "prefix=${PREFIX_DIR}"
 log "jobs=${BUILD_JOBS}"
-log "abi_alias_t64=${OPEN3D_VLC_ABI_ALIAS_T64}"
 log "extended_module_set=${OPEN3D_APPIMAGE_EXTENDED_MODULE_SET}"
+log "enable_wayland=${OPEN3D_APPIMAGE_ENABLE_WAYLAND}"
 log "reuse_source_tree=${OPEN3D_APPIMAGE_REUSE_SOURCE_TREE}"
 log "clean_build=${OPEN3D_APPIMAGE_CLEAN_BUILD}"
 log "configure_args=${configure_args[*]}"
+
+if [[ "${OPEN3D_APPIMAGE_ENABLE_WAYLAND}" == "1" ]]; then
+  log "wayland_protocols_path=${WAYLAND_PROTOCOLS_PATH}"
+  log "wayland_scanner=${WAYLAND_SCANNER_BIN}"
+  if [[ -z "${WAYLAND_PROTOCOLS_PATH}" ]]; then
+    log "Missing wayland-protocols pkgdatadir while OPEN3D_APPIMAGE_ENABLE_WAYLAND=1"
+    exit 1
+  fi
+  if [[ -z "${WAYLAND_SCANNER_BIN}" || ! -x "${WAYLAND_SCANNER_BIN}" ]]; then
+    log "Missing wayland-scanner while OPEN3D_APPIMAGE_ENABLE_WAYLAND=1"
+    exit 1
+  fi
+fi
 
 download_tarball
 extract_source
@@ -146,9 +206,15 @@ fi
 
 export OPEN3D_VENDOR_LIBBLURAY_STAGE="${OPEN3D_LIBBLURAY_STAGE_DIR}"
 export OPEN3D_VLC_BUILD_JOBS="${BUILD_JOBS}"
-export OPEN3D_VLC_ABI_ALIAS_T64
 
-run_logged "open3d-prepare.log" env OPEN3D_VLC_BUILD_PHASE=prepare \
+configure_env=(env OPEN3D_VLC_BUILD_PHASE=prepare)
+plugin_env=(env OPEN3D_VLC_BUILD_PHASE=plugins)
+if [[ "${OPEN3D_APPIMAGE_ENABLE_WAYLAND}" == "1" ]]; then
+  configure_env+=("WAYLAND_PROTOCOLS=${WAYLAND_PROTOCOLS_PATH}" "WAYLAND_SCANNER=${WAYLAND_SCANNER_BIN}")
+  plugin_env+=("WAYLAND_PROTOCOLS=${WAYLAND_PROTOCOLS_PATH}" "WAYLAND_SCANNER=${WAYLAND_SCANNER_BIN}")
+fi
+
+run_logged "open3d-prepare.log" "${configure_env[@]}" \
   "${REPO_DIR}/scripts/build_open3d_module_vlc3.sh" \
   "${VLC_SRC_DIR}" \
   "${configure_args[@]}"
@@ -160,7 +226,7 @@ run_logged "vlc-core.log" bash -lc "
   make -C \"${VLC_SRC_DIR}/bin\" -j\"${BUILD_JOBS}\" vlc
 "
 
-run_logged "open3d-modules.log" env OPEN3D_VLC_BUILD_PHASE=plugins \
+run_logged "open3d-modules.log" "${plugin_env[@]}" \
   "${REPO_DIR}/scripts/build_open3d_module_vlc3.sh" \
   "${VLC_SRC_DIR}" \
   "${configure_args[@]}"
@@ -174,17 +240,17 @@ if [[ ${#qt_generated_targets[@]} -eq 0 ]]; then
   exit 1
 fi
 
-playback_plugin_targets=(
+required_playback_plugin_targets=(
   libfilesystem_plugin.la
   libmkv_plugin.la
   libavcodec_plugin.la
+  librawvideo_plugin.la
   libpacketizer_dts_plugin.la
   libpacketizer_copy_plugin.la
   libpulse_plugin.la
   libfloat_mixer_plugin.la
   libaudio_format_plugin.la
   libscaletempo_plugin.la
-  libsamplerate_plugin.la
   libfreetype_plugin.la
   libswscale_plugin.la
   libyuvp_plugin.la
@@ -193,6 +259,9 @@ playback_plugin_targets=(
   liblogger_plugin.la
   libconsole_logger_plugin.la
   libfile_logger_plugin.la
+)
+optional_playback_plugin_targets=(
+  libsamplerate_plugin.la
 )
 extended_plugin_targets=(
   libpacketizer_a52_plugin.la
@@ -224,34 +293,40 @@ desktop_common_plugin_targets=(
   libdvbsub_plugin.la
   libspudec_plugin.la
   libwebvtt_plugin.la
-  libegl_wl_plugin.la
-  libwl_shm_plugin.la
-  libxdg_shell_plugin.la
   libxcb_window_plugin.la
   libglx_plugin.la
 )
+wayland_plugin_targets=(
+  libegl_wl_plugin.la
+  libwl_shm_plugin.la
+  libxdg_shell_plugin.la
+)
 
 if [[ "${OPEN3D_APPIMAGE_EXTENDED_MODULE_SET}" == "1" ]]; then
-  playback_plugin_targets+=("${extended_plugin_targets[@]}")
-  playback_plugin_targets+=("${desktop_common_plugin_targets[@]}")
+  optional_playback_plugin_targets+=("${extended_plugin_targets[@]}")
+  optional_playback_plugin_targets+=("${desktop_common_plugin_targets[@]}")
+  if [[ "${OPEN3D_APPIMAGE_ENABLE_WAYLAND}" == "1" ]]; then
+    optional_playback_plugin_targets+=("${wayland_plugin_targets[@]}")
+  fi
 fi
 
 run_logged "ui-generated.log" make -C "${VLC_SRC_DIR}/modules" -j"${BUILD_JOBS}" \
   "${qt_generated_targets[@]}"
 
-if [[ "${OPEN3D_APPIMAGE_EXTENDED_MODULE_SET}" == "1" ]]; then
+if [[ "${OPEN3D_APPIMAGE_EXTENDED_MODULE_SET}" == "1" &&
+      "${OPEN3D_APPIMAGE_ENABLE_WAYLAND}" == "1" ]]; then
   run_logged "wayland-generated.log" make -C "${VLC_SRC_DIR}/modules" -j"${BUILD_JOBS}" \
     "${wayland_generated_targets[@]}"
 fi
 
-run_logged "ui.log" make -C "${VLC_SRC_DIR}/modules" -j"${BUILD_JOBS}" \
-  libdummy_plugin.la \
-  libhotkeys_plugin.la \
-  libxcb_hotkeys_plugin.la \
-  libqt_plugin.la
+run_ui_build_with_retry
 
 run_logged "playback.log" make -C "${VLC_SRC_DIR}/modules" -j"${BUILD_JOBS}" \
-  "${playback_plugin_targets[@]}"
+  "${required_playback_plugin_targets[@]}"
+
+if [[ ${#optional_playback_plugin_targets[@]} -gt 0 ]]; then
+  build_optional_plugin_targets "${optional_playback_plugin_targets[@]}"
+fi
 
 log "Artifact checks:"
 required_artifacts=(
@@ -272,12 +347,12 @@ required_artifacts=(
   "${VLC_SRC_DIR}/modules/.libs/libfilesystem_plugin.so" \
   "${VLC_SRC_DIR}/modules/.libs/libmkv_plugin.so" \
   "${VLC_SRC_DIR}/modules/.libs/libavcodec_plugin.so" \
+  "${VLC_SRC_DIR}/modules/.libs/librawvideo_plugin.so" \
   "${VLC_SRC_DIR}/modules/.libs/libvlc_pulse.so" \
   "${VLC_SRC_DIR}/modules/.libs/libpulse_plugin.so" \
   "${VLC_SRC_DIR}/modules/.libs/libfloat_mixer_plugin.so" \
   "${VLC_SRC_DIR}/modules/.libs/libaudio_format_plugin.so" \
   "${VLC_SRC_DIR}/modules/.libs/libscaletempo_plugin.so" \
-  "${VLC_SRC_DIR}/modules/.libs/libsamplerate_plugin.so" \
   "${VLC_SRC_DIR}/modules/.libs/libfreetype_plugin.so" \
   "${VLC_SRC_DIR}/modules/.libs/libswscale_plugin.so" \
   "${VLC_SRC_DIR}/modules/.libs/libyuvp_plugin.so" \
@@ -287,42 +362,6 @@ required_artifacts=(
     "${VLC_SRC_DIR}/modules/.libs/libconsole_logger_plugin.so" \
     "${VLC_SRC_DIR}/modules/.libs/libfile_logger_plugin.so"
 )
-
-if [[ "${OPEN3D_APPIMAGE_EXTENDED_MODULE_SET}" == "1" ]]; then
-  required_artifacts+=(
-    "${VLC_SRC_DIR}/modules/.libs/libdbus_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/liboldrc_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libdirectory_demux_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libequalizer_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libdeinterlace_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libsubsdelay_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/liblua_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libexport_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libxml_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libalsa_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libhttp_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libhttps_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libftp_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libtcp_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libudp_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/librtp_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libsdp_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libmp4_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libavi_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libogg_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libwav_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libsubtitle_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libsubsdec_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libdvbsub_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libspudec_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libwebvtt_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libegl_wl_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libwl_shm_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libxdg_shell_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libxcb_window_plugin.so"
-    "${VLC_SRC_DIR}/modules/.libs/libglx_plugin.so"
-  )
-fi
 
 for artifact in "${required_artifacts[@]}"; do
   if [[ -e "${artifact}" ]]; then

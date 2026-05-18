@@ -1,3 +1,24 @@
+diff --git a/include/vlc_opengl.h b/include/vlc_opengl.h
+index fdebfeb..135050f 100644
+--- a/include/vlc_opengl.h
++++ b/include/vlc_opengl.h
+@@ -44,6 +44,8 @@ struct vlc_gl_t
+     struct vout_window_t *surface;
+     module_t *module;
+     void *sys;
++    unsigned api_type;
++    vlc_gl_t *shared_context;
+ 
+     int  (*makeCurrent)(vlc_gl_t *);
+     void (*releaseCurrent)(vlc_gl_t *);
+@@ -83,6 +85,7 @@ enum {
+ };
+ 
+ VLC_API vlc_gl_t *vlc_gl_Create(struct vout_window_t *, unsigned, const char *) VLC_USED;
++VLC_API vlc_gl_t *vlc_gl_CreateShared(vlc_gl_t *) VLC_USED;
+ VLC_API void vlc_gl_Release(vlc_gl_t *);
+ VLC_API void vlc_gl_Hold(vlc_gl_t *);
+ 
 diff --git a/modules/access/Makefile.am b/modules/access/Makefile.am
 index 7d23797..6faf94b 100644
 --- a/modules/access/Makefile.am
@@ -28,185 +49,50 @@ index dd04391..5de2705 100644
  libedummy_plugin_la_SOURCES = codec/edummy.c
  if ENABLE_SOUT
  codec_LTLIBRARIES += libedummy_plugin.la
-diff --git a/modules/control/Makefile.am b/modules/control/Makefile.am
-index 2469a86..7557dac 100644
---- a/modules/control/Makefile.am
-+++ b/modules/control/Makefile.am
-@@ -1,8 +1,10 @@
- controldir = $(pluginsdir)/control
+diff --git a/modules/control/oldrc.c b/modules/control/oldrc.c
+index fd41ba4..94274e3 100644
+--- a/modules/control/oldrc.c
++++ b/modules/control/oldrc.c
+@@ -200,7 +200,7 @@ vlc_module_begin ()
+ #endif
+     add_string( "rc-host", NULL, HOST_TEXT, HOST_LONGTEXT, true )
  
- libdummy_plugin_la_SOURCES = control/dummy.c control/intromsg.h
-+libdummy_plugin_la_CFLAGS = $(AM_CFLAGS) $(DUMMY_PLUGIN_CFLAGS)
- libgestures_plugin_la_SOURCES = control/gestures.c
- libhotkeys_plugin_la_SOURCES = control/hotkeys.c
-+libhotkeys_plugin_la_CFLAGS = $(AM_CFLAGS) $(HOTKEYS_PLUGIN_CFLAGS)
- libhotkeys_plugin_la_LIBADD = $(LIBM)
- libnetsync_plugin_la_SOURCES = control/netsync.c
- libnetsync_plugin_la_LIBADD = $(SOCKET_LIBS)
-@@ -53,7 +55,7 @@ control_LTLIBRARIES += libdbus_plugin.la
- endif
+-    set_capability( "interface", 20 )
++    set_capability( "interface", 21 )
  
- libxcb_hotkeys_plugin_la_SOURCES = control/globalhotkeys/xcb.c
--libxcb_hotkeys_plugin_la_CFLAGS = $(AM_CFLAGS) \
-+libxcb_hotkeys_plugin_la_CFLAGS = $(AM_CFLAGS) $(XCB_HOTKEYS_PLUGIN_CFLAGS) \
- 	$(XCB_KEYSYMS_CFLAGS) $(XCB_CFLAGS)
- libxcb_hotkeys_plugin_la_LIBADD = $(XCB_KEYSYMS_LIBS) $(XCB_LIBS)
- if HAVE_XCB_KEYSYMS
-diff --git a/modules/control/dummy.c b/modules/control/dummy.c
-index 4e0406d..633d896 100644
---- a/modules/control/dummy.c
-+++ b/modules/control/dummy.c
-@@ -33,6 +33,44 @@
- #include <vlc_common.h>
- #include <vlc_plugin.h>
- #include <vlc_interface.h>
-+/*
-+ * Host distro VLC 3.0.x builds may look for the Debian/Ubuntu t64 module
-+ * entry symbol even when building against the upstream 3.0.23 source tree.
-+ * Export both entry names so the staged plugin can be loaded by the host
-+ * launcher without affecting the AppImage runtime.
-+ */
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
-+extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
-+extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
-+EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
-+
-+EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
-+vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
-+{
-+    return vlc_entry__3_0_0f(vlc_set, opaque);
-+}
-+
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-+vlc_entry_copyright__3_0_0ft64(void)
-+{
-+    return vlc_entry_copyright__3_0_0f();
-+}
-+
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-+vlc_entry_license__3_0_0ft64(void)
-+{
-+    return vlc_entry_license__3_0_0f();
-+}
-+#ifdef __cplusplus
-+}
-+#endif
-+
-+
- 
+     set_callbacks( Activate, Deactivate )
  #ifdef _WIN32
- #define QUIET_TEXT N_("Do not open a DOS command box interface")
-diff --git a/modules/control/globalhotkeys/xcb.c b/modules/control/globalhotkeys/xcb.c
-index 3fa8a10..74f8caa 100644
---- a/modules/control/globalhotkeys/xcb.c
-+++ b/modules/control/globalhotkeys/xcb.c
-@@ -36,6 +36,44 @@
- #include <X11/XF86keysym.h>
+@@ -442,6 +442,7 @@ static void RegisterCallbacks( intf_thread_t *p_intf )
+     ADD( "chapter", STRING, Input )
+     ADD( "chapter_n", VOID, Input )
+     ADD( "chapter_p", VOID, Input )
++    ADD( "menu-popup", VOID, Input )
  
- #include <poll.h>
-+/*
-+ * Host distro VLC 3.0.x builds may look for the Debian/Ubuntu t64 module
-+ * entry symbol even when building against the upstream 3.0.23 source tree.
-+ * Export both entry names so the staged plugin can be loaded by the host
-+ * launcher without affecting the AppImage runtime.
-+ */
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
-+extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
-+extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
-+EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
-+
-+EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
-+vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
-+{
-+    return vlc_entry__3_0_0f(vlc_set, opaque);
-+}
-+
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-+vlc_entry_copyright__3_0_0ft64(void)
-+{
-+    return vlc_entry_copyright__3_0_0f();
-+}
-+
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-+vlc_entry_license__3_0_0ft64(void)
-+{
-+    return vlc_entry_license__3_0_0f();
-+}
-+#ifdef __cplusplus
-+}
-+#endif
-+
-+
- 
- /*****************************************************************************
-  * Local prototypes
-@@ -225,7 +263,6 @@ end:
-     return 0;
- }
- 
--
- static unsigned GetX11Modifier( xcb_connection_t *p_connection,
-         xcb_key_symbols_t *p_symbols, unsigned i_vlc )
- {
-diff --git a/modules/control/hotkeys.c b/modules/control/hotkeys.c
-index a699d4f..bdadfe6 100644
---- a/modules/control/hotkeys.c
-+++ b/modules/control/hotkeys.c
-@@ -41,6 +41,44 @@
- #include <vlc_playlist.h>
- #include <vlc_actions.h>
- #include "math.h"
-+/*
-+ * Host distro VLC 3.0.x builds may look for the Debian/Ubuntu t64 module
-+ * entry symbol even when building against the upstream 3.0.23 source tree.
-+ * Export both entry names so the staged plugin can be loaded by the host
-+ * launcher without affecting the AppImage runtime.
-+ */
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
-+extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
-+extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
-+EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
-+
-+EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
-+vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
-+{
-+    return vlc_entry__3_0_0f(vlc_set, opaque);
-+}
-+
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-+vlc_entry_copyright__3_0_0ft64(void)
-+{
-+    return vlc_entry_copyright__3_0_0f();
-+}
-+
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-+vlc_entry_license__3_0_0ft64(void)
-+{
-+    return vlc_entry_license__3_0_0f();
-+}
-+#ifdef __cplusplus
-+}
-+#endif
-+
-+
- 
- #include <assert.h>
- 
+     ADD( "fastforward", VOID, Input )
+     ADD( "rewind", VOID, Input )
+@@ -835,6 +836,7 @@ static void Help( intf_thread_t *p_intf)
+     msg_rc("%s", _("| snapshot . . . . . . . . . . . . take video snapshot"));
+     msg_rc("%s", _("| strack [X] . . . . . . . . .  set/get subtitle track"));
+     msg_rc("%s", _("| key [hotkey name] . . . . . .  simulate hotkey press"));
++    msg_rc("%s", _("| menu-popup . . . . . . . . trigger Blu-ray popup navigation"));
+     msg_rc(  "| ");
+     msg_rc("%s", _("| help . . . . . . . . . . . . . . . this help message"));
+     msg_rc("%s", _("| logout . . . . . . .  exit (if in socket connection)"));
+@@ -1039,6 +1041,14 @@ static int Input( vlc_object_t *p_this, char const *psz_cmd,
+         var_TriggerCallback( p_input, "frame-next" );
+         i_error = VLC_SUCCESS;
+     }
++    else if( !strcmp( psz_cmd, "menu-popup" ) )
++    {
++        if( var_Type( p_input, "menu-popup" ) != 0 )
++        {
++            var_TriggerCallback( p_input, "menu-popup" );
++            i_error = VLC_SUCCESS;
++        }
++    }
+     else if( !strcmp( psz_cmd, "chapter" ) ||
+              !strcmp( psz_cmd, "chapter_n" ) ||
+              !strcmp( psz_cmd, "chapter_p" ) )
 diff --git a/modules/demux/Makefile.am b/modules/demux/Makefile.am
 index dbb6a10..948d8fc 100644
 --- a/modules/demux/Makefile.am
@@ -441,52 +327,13 @@ index 9e5e985..c35681e 100644
          }
          S_CASE_GLOB("V_MPEG4/ISO*") {
 diff --git a/modules/demux/mkv/mkv.cpp b/modules/demux/mkv/mkv.cpp
-index 2a252a1..bcb5070 100644
+index 2a252a1..43fa3b2 100644
 --- a/modules/demux/mkv/mkv.cpp
 +++ b/modules/demux/mkv/mkv.cpp
-@@ -43,6 +43,278 @@ extern "C" {
+@@ -42,6 +42,238 @@ extern "C" {
+ 
  #include <vlc_fs.h>
  #include <vlc_url.h>
- 
-+#if defined(OPEN3D_VLC_ABI_ALIAS_T64)
-+/*
-+ * Host distro VLC 3.0.x builds may look for the Debian/Ubuntu t64 module
-+ * entry symbol even when building against the upstream 3.0.23 source tree.
-+ * Export both entry names so the staged mkv plugin can be loaded by the host
-+ * launcher without affecting the AppImage runtime.
-+ */
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
-+extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
-+extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
-+EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
-+
-+EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
-+vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
-+{
-+    return vlc_entry__3_0_0f(vlc_set, opaque);
-+}
-+
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-+vlc_entry_copyright__3_0_0ft64(void)
-+{
-+    return vlc_entry_copyright__3_0_0f();
-+}
-+
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-+vlc_entry_license__3_0_0ft64(void)
-+{
-+    return vlc_entry_license__3_0_0f();
-+}
-+#ifdef __cplusplus
-+}
-+#endif
-+#endif
-+
 +#include <vlc_variables.h>
 +#include "../../video_output/open3d_subtitle_bridge.h"
 +
@@ -719,11 +566,10 @@ index 2a252a1..bcb5070 100644
 +    Open3DMkvSubtitleSyncSelection(static_cast<demux_sys_t *>(opaque));
 +    return VLC_SUCCESS;
 +}
-+
+ 
  /*****************************************************************************
   * Module descriptor
-  *****************************************************************************/
-@@ -52,7 +324,7 @@ static void Close( vlc_object_t * );
+@@ -52,7 +284,7 @@ static void Close( vlc_object_t * );
  vlc_module_begin ()
      set_shortname( "Matroska" )
      set_description( N_("Matroska stream demuxer" ) )
@@ -732,7 +578,7 @@ index 2a252a1..bcb5070 100644
      set_callbacks( Open, Close )
      set_category( CAT_INPUT )
      set_subcategory( SUBCAT_INPUT_DEMUX )
-@@ -115,6 +387,12 @@ static int Open( vlc_object_t * p_this )
+@@ -115,6 +347,12 @@ static int Open( vlc_object_t * p_this )
      p_demux->pf_control = Control;
      p_demux->p_sys      = p_sys = new demux_sys_t( *p_demux );
  
@@ -745,7 +591,7 @@ index 2a252a1..bcb5070 100644
      p_stream = new matroska_stream_c( p_demux->s, false );
      if ( unlikely(p_stream == NULL) )
      {
-@@ -251,6 +529,7 @@ static int Open( vlc_object_t * p_this )
+@@ -251,6 +489,7 @@ static int Open( vlc_object_t * p_this )
          goto error;
      }
  
@@ -753,7 +599,7 @@ index 2a252a1..bcb5070 100644
      p_sys->InitUi();
  
      return VLC_SUCCESS;
-@@ -267,6 +546,10 @@ static void Close( vlc_object_t *p_this )
+@@ -267,6 +506,10 @@ static void Close( vlc_object_t *p_this )
  {
      demux_t     *p_demux = reinterpret_cast<demux_t*>( p_this );
      demux_sys_t *p_sys   = p_demux->p_sys;
@@ -764,7 +610,7 @@ index 2a252a1..bcb5070 100644
      virtual_segment_c *p_vsegment = p_sys->p_current_vsegment;
      if( p_vsegment )
      {
-@@ -832,6 +1115,11 @@ mkv_track_t::mkv_track_t(enum es_format_category_e es_cat) :
+@@ -832,6 +1075,11 @@ mkv_track_t::mkv_track_t(enum es_format_category_e es_cat) :
    ,b_enabled(true)
    ,b_forced(false)
    ,i_number(0)
@@ -794,53 +640,10 @@ index 8497d08..9a9de04 100644
          unsigned int i_extra_data;
          uint8_t      *p_extra_data;
 diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
-index 4449304..f1d04bc 100644
+index 4449304..6b693dd 100644
 --- a/modules/demux/mpeg/ts.c
 +++ b/modules/demux/mpeg/ts.c
-@@ -63,6 +63,42 @@
- 
- #include <assert.h>
- 
-+#if defined(OPEN3D_VLC_ABI_ALIAS_T64)
-+# if defined(__GNUC__) || defined(__clang__)
-+#  define OPEN3D_TSMVC_VISIBILITY __attribute__((visibility("default")))
-+# else
-+#  define OPEN3D_TSMVC_VISIBILITY
-+# endif
-+
-+# if defined(_WIN32)
-+#  define OPEN3D_TSMVC_EXPORT __declspec(dllexport)
-+# else
-+#  define OPEN3D_TSMVC_EXPORT
-+# endif
-+
-+extern int vlc_entry__3_0_0f( vlc_set_cb, void * );
-+extern const char *vlc_entry_copyright__3_0_0f( void );
-+extern const char *vlc_entry_license__3_0_0f( void );
-+
-+OPEN3D_TSMVC_EXPORT OPEN3D_TSMVC_VISIBILITY
-+int vlc_entry__3_0_0ft64( vlc_set_cb vlc_set, void *opaque )
-+{
-+    return vlc_entry__3_0_0f( vlc_set, opaque );
-+}
-+
-+OPEN3D_TSMVC_EXPORT OPEN3D_TSMVC_VISIBILITY
-+const char *vlc_entry_copyright__3_0_0ft64( void )
-+{
-+    return vlc_entry_copyright__3_0_0f();
-+}
-+
-+OPEN3D_TSMVC_EXPORT OPEN3D_TSMVC_VISIBILITY
-+const char *vlc_entry_license__3_0_0ft64( void )
-+{
-+    return vlc_entry_license__3_0_0f();
-+}
-+#endif
-+
- /*****************************************************************************
-  * Module descriptor
-  *****************************************************************************/
-@@ -169,7 +205,7 @@ vlc_module_begin ()
+@@ -169,7 +169,7 @@ vlc_module_begin ()
  
      set_capability( "demux", 10 )
      set_callbacks( Open, Close )
@@ -849,7 +652,7 @@ index 4449304..f1d04bc 100644
  vlc_module_end ()
  
  /*****************************************************************************
-@@ -365,6 +401,7 @@ static int Open( vlc_object_t *p_this )
+@@ -365,6 +365,7 @@ static int Open( vlc_object_t *p_this )
  {
      demux_t     *p_demux = (demux_t*)p_this;
      demux_sys_t *p_sys;
@@ -882,59 +685,8 @@ index c8e3eee..adfe951 100644
              SetupAVCDescriptors( p_demux, p_pes->p_es, p_dvbpsies );
              break;
          case 0x21:
-diff --git a/modules/demux/playlist/playlist.c b/modules/demux/playlist/playlist.c
-index 449d5fd..9dfdecc 100644
---- a/modules/demux/playlist/playlist.c
-+++ b/modules/demux/playlist/playlist.c
-@@ -40,6 +40,33 @@
- 
- #include "playlist.h"
- 
-+#if defined(OPEN3D_VLC_ABI_ALIAS_T64)
-+extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
-+extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
-+extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
-+EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
-+
-+EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
-+vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
-+{
-+    return vlc_entry__3_0_0f(vlc_set, opaque);
-+}
-+
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-+vlc_entry_copyright__3_0_0ft64(void)
-+{
-+    return vlc_entry_copyright__3_0_0f();
-+}
-+
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-+vlc_entry_license__3_0_0ft64(void)
-+{
-+    return vlc_entry_license__3_0_0f();
-+}
-+#endif
-+
- /*****************************************************************************
-  * Module descriptor
-  *****************************************************************************/
-diff --git a/modules/gui/qt/Makefile.am b/modules/gui/qt/Makefile.am
-index 2d59ded..0953a43 100644
---- a/modules/gui/qt/Makefile.am
-+++ b/modules/gui/qt/Makefile.am
-@@ -16,7 +16,7 @@ libqt_plugin_la_CPPFLAGS = $(AM_CPPFLAGS) \
- 	-DQT_USE_QSTRINGBUILDER \
- 	-DQT_NO_CAST_FROM_BYTEARRAY \
- 	-I$(srcdir)/gui/qt -I$(builddir)/gui/qt
--libqt_plugin_la_CXXFLAGS = $(AM_CXXFLAGS) $(QT_CFLAGS) $(CXXFLAGS_qt)
-+libqt_plugin_la_CXXFLAGS = $(AM_CXXFLAGS) $(QT_CFLAGS) $(QT_PLUGIN_CFLAGS) $(CXXFLAGS_qt)
- libqt_plugin_la_LIBADD = $(QT_LIBS) $(LIBS_qt) $(LIBM)
- libqt_plugin_la_LDFLAGS = $(AM_LDFLAGS) -rpath '$(guidir)'
- if HAVE_DARWIN
 diff --git a/modules/gui/qt/components/open_panels.cpp b/modules/gui/qt/components/open_panels.cpp
-index 6a9bf6c..fa4f4a1 100644
+index 6a9bf6c..a63df73 100644
 --- a/modules/gui/qt/components/open_panels.cpp
 +++ b/modules/gui/qt/components/open_panels.cpp
 @@ -41,6 +41,7 @@
@@ -958,16 +710,21 @@ index 6a9bf6c..fa4f4a1 100644
      BUTTON_SET_ACT_I( ui.ejectButton, "", toolbar/eject, qtr( "Eject the disc" ),
              eject() );
  
-@@ -477,6 +480,8 @@ void DiscOpenPanel::clear()
+@@ -477,6 +480,13 @@ void DiscOpenPanel::clear()
  /* update the buttons according the type of device */
  void DiscOpenPanel::updateButtons()
  {
 +    const bool is_open3d_bluray = isOpen3DBluRaySelection();
 +
++    if( is_open3d_bluray )
++        ui.dvdsimple->setText( qtr("Start without menus") );
++    else
++        ui.dvdsimple->setText( qtr("No disc menus") );
++
      if ( ui.dvdRadioButton->isChecked() )
      {
          if( m_discType != Dvd )
-@@ -490,12 +495,13 @@ void DiscOpenPanel::updateButtons()
+@@ -490,12 +500,13 @@ void DiscOpenPanel::updateButtons()
          ui.diskOptionBox_2->show();
          ui.dvdsimple->setEnabled( true );
      }
@@ -984,7 +741,7 @@ index 6a9bf6c..fa4f4a1 100644
              ui.dvdsimple->setChecked( !var_InheritBool( p_intf, "bluray-menu" ) );
          }
          ui.titleLabel->setText( qtr("Title") );
-@@ -531,6 +537,8 @@ void DiscOpenPanel::updateButtons()
+@@ -531,6 +542,8 @@ void DiscOpenPanel::updateButtons()
          ui.dvdsimple->setEnabled( false );
      }
  
@@ -993,7 +750,7 @@ index 6a9bf6c..fa4f4a1 100644
      updateMRL();
  }
  
-@@ -548,6 +556,9 @@ void DiscOpenPanel::updateMRL()
+@@ -548,6 +561,9 @@ void DiscOpenPanel::updateMRL()
      if( tmp != -1 &&  ui.deviceCombo->itemData( tmp ) != QVariant::Invalid )
          discPath = ui.deviceCombo->itemData( tmp ).toString();
  
@@ -1003,7 +760,7 @@ index 6a9bf6c..fa4f4a1 100644
      /* MRL scheme */
      const char *scheme;
      /* DVD */
-@@ -558,6 +569,8 @@ void DiscOpenPanel::updateMRL()
+@@ -558,6 +574,8 @@ void DiscOpenPanel::updateMRL()
              scheme = "dvdsimple";
      } else if ( ui.bdRadioButton->isChecked() )
          scheme = "bluray";
@@ -1012,7 +769,7 @@ index 6a9bf6c..fa4f4a1 100644
      /* VCD */
      else if ( ui.vcdRadioButton->isChecked() )
          scheme = "vcd";
-@@ -572,7 +585,7 @@ void DiscOpenPanel::updateMRL()
+@@ -572,7 +590,7 @@ void DiscOpenPanel::updateMRL()
      /* Title/chapter encoded in MRL */
      QString anchor = "";
      if( ui.titleSpin->value() > 0 ) {
@@ -1021,7 +778,7 @@ index 6a9bf6c..fa4f4a1 100644
              anchor = QString("#%1").arg( ui.titleSpin->value() );
              if ( ui.chapterSpin->value() > 0 )
                  anchor += QString(":%1").arg( ui.chapterSpin->value() );
-@@ -603,7 +616,7 @@ void DiscOpenPanel::updateMRL()
+@@ -603,7 +621,7 @@ void DiscOpenPanel::updateMRL()
          if( ui.titleSpin->value() > 0 )
              opts += QString(" :cdda-track=%1").arg( ui.titleSpin->value() );
      }
@@ -1030,7 +787,7 @@ index 6a9bf6c..fa4f4a1 100644
      {
          if ( ui.dvdsimple->isChecked() )
              opts += " :no-bluray-menu";
-@@ -611,6 +624,47 @@ void DiscOpenPanel::updateMRL()
+@@ -611,6 +629,47 @@ void DiscOpenPanel::updateMRL()
      emit mrlUpdated( fileList, opts );
  }
  
@@ -1078,7 +835,7 @@ index 6a9bf6c..fa4f4a1 100644
  void DiscOpenPanel::browseDevice()
  {
      const QStringList schemes = QStringList(QStringLiteral("file"));
-@@ -626,6 +680,26 @@ void DiscOpenPanel::browseDevice()
+@@ -626,6 +685,26 @@ void DiscOpenPanel::browseDevice()
      updateMRL();
  }
  
@@ -1136,71 +893,6 @@ index 70b10b7..a5e4b6e 100644
      void updateButtons() ;
      void eject();
  };
-diff --git a/modules/gui/qt/qt.cpp b/modules/gui/qt/qt.cpp
-index 9da91e5..f7c1638 100644
---- a/modules/gui/qt/qt.cpp
-+++ b/modules/gui/qt/qt.cpp
-@@ -51,6 +51,44 @@
- 
- #include <vlc_plugin.h>
- #include <vlc_vout_window.h>
-+/*
-+ * Host distro VLC 3.0.x builds may look for the Debian/Ubuntu t64 module
-+ * entry symbol even when building against the upstream 3.0.23 source tree.
-+ * Export both entry names so the staged plugin can be loaded by the host
-+ * launcher without affecting the AppImage runtime.
-+ */
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
-+extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
-+extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
-+EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
-+
-+EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
-+vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
-+{
-+    return vlc_entry__3_0_0f(vlc_set, opaque);
-+}
-+
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-+vlc_entry_copyright__3_0_0ft64(void)
-+{
-+    return vlc_entry_copyright__3_0_0f();
-+}
-+
-+EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-+vlc_entry_license__3_0_0ft64(void)
-+{
-+    return vlc_entry_license__3_0_0f();
-+}
-+#ifdef __cplusplus
-+}
-+#endif
-+
-+
- 
- #ifdef _WIN32 /* For static builds */
-  #include <QtPlugin>
-@@ -281,7 +319,6 @@ vlc_module_begin ()
-     add_bool( "qt-embedded-open", false, QT_NATIVEOPEN_TEXT,
-                QT_NATIVEOPEN_TEXT, false )
- 
--
-     add_bool( "qt-advanced-pref", false, ADVANCED_PREFS_TEXT,
-               ADVANCED_PREFS_LONGTEXT, false )
-     add_bool( "qt-error-dialogs", true, ERROR_TEXT,
-@@ -605,7 +642,6 @@ static void *ThreadPlatform( void *obj, char *platform_name )
- 
-     p_sys->p_app = &app;
- 
--
-     /* All the settings are in the .conf/.ini style */
- #ifdef _WIN32
-     char *cConfigDir = config_GetUserDir( VLC_CONFIG_DIR );
 diff --git a/modules/gui/qt/ui/open_disk.ui b/modules/gui/qt/ui/open_disk.ui
 index 7b4c5d2..5246001 100644
 --- a/modules/gui/qt/ui/open_disk.ui
@@ -1316,10 +1008,10 @@ index 7b4c5d2..5246001 100644
 +</ui>
 \ No newline at end of file
 diff --git a/modules/video_output/Makefile.am b/modules/video_output/Makefile.am
-index 6d75a1d..015517e 100644
+index 6d75a1d..b9c921b 100644
 --- a/modules/video_output/Makefile.am
 +++ b/modules/video_output/Makefile.am
-@@ -83,6 +83,16 @@ libgl_plugin_la_CFLAGS += -DHAVE_GL_CORE_SYMBOLS
+@@ -83,6 +83,17 @@ libgl_plugin_la_CFLAGS += -DHAVE_GL_CORE_SYMBOLS
  libgl_plugin_la_LIBADD += $(GL_LIBS)
  endif
  
@@ -1331,12 +1023,13 @@ index 6d75a1d..015517e 100644
 +libopen3d_plugin_la_LIBADD += $(GL_LIBS)
 +else
 +libopen3d_plugin_la_LIBADD += -lpthread
++libopen3d_plugin_la_LIBADD += $(X_LIBS) $(X_PRE_LIBS) -lX11
 +endif
 +
  libglconv_vaapi_wl_plugin_la_SOURCES = video_output/opengl/converter_vaapi.c \
  	video_output/opengl/converter.h \
  	hw/vaapi/vlc_vaapi.c hw/vaapi/vlc_vaapi.h
-@@ -107,6 +117,7 @@ libglconv_vdpau_plugin_la_LIBADD = $(LIBDL) libvlc_vdpau.la $(X_LIBS) $(X_PRE_LI
+@@ -107,6 +118,7 @@ libglconv_vdpau_plugin_la_LIBADD = $(LIBDL) libvlc_vdpau.la $(X_LIBS) $(X_PRE_LI
  
  if HAVE_GL
  vout_LTLIBRARIES += libgl_plugin.la
@@ -1344,11 +1037,265 @@ index 6d75a1d..015517e 100644
  if HAVE_EGL
  if HAVE_VAAPI
  if HAVE_WAYLAND_EGL
+diff --git a/modules/video_output/opengl/egl.c b/modules/video_output/opengl/egl.c
+index ab20fb4..6e68948 100644
+--- a/modules/video_output/opengl/egl.c
++++ b/modules/video_output/opengl/egl.c
+@@ -48,6 +48,9 @@ typedef struct vlc_gl_sys_t
+     EGLDisplay display;
+     EGLSurface surface;
+     EGLContext context;
++    EGLConfig config;
++    bool owns_display;
++    bool owns_surface;
+ #if defined (USE_PLATFORM_X11)
+     Display *x11;
+     bool restore_forget_gravity;
+@@ -207,12 +210,13 @@ static void Close (vlc_object_t *obj)
+     {
+         if (sys->context != EGL_NO_CONTEXT)
+             eglDestroyContext(sys->display, sys->context);
+-        if (sys->surface != EGL_NO_SURFACE)
++        if (sys->surface != EGL_NO_SURFACE && sys->owns_surface)
+             eglDestroySurface(sys->display, sys->surface);
+-        eglTerminate(sys->display);
++        if (sys->owns_display)
++            eglTerminate(sys->display);
+     }
+ #ifdef USE_PLATFORM_X11
+-    if (sys->x11 != NULL) {
++    if (sys->owns_display && sys->x11 != NULL) {
+         if (sys->restore_forget_gravity) {
+             XSetWindowAttributes swa;
+             swa.bit_gravity = ForgetGravity;
+@@ -247,13 +251,31 @@ static int Open (vlc_object_t *obj, const struct gl_api *api)
+     sys->display = EGL_NO_DISPLAY;
+     sys->surface = EGL_NO_SURFACE;
+     sys->context = EGL_NO_CONTEXT;
++    sys->config = NULL;
++    sys->owns_display = true;
++    sys->owns_surface = true;
+     sys->eglCreateImageKHR = NULL;
+     sys->eglDestroyImageKHR = NULL;
+ 
+     vout_window_t *wnd = gl->surface;
+     EGLSurface (*createSurface)(EGLDisplay, EGLConfig, void *, const EGLint *)
+         = CreateWindowSurface;
+-    void *window;
++    void *window = NULL;
++    vlc_gl_sys_t *master_sys = NULL;
++
++    if (gl->shared_context != NULL)
++    {
++        if (gl->shared_context->ext != VLC_GL_EXT_EGL ||
++            gl->shared_context->sys == NULL)
++            goto error;
++
++        master_sys = gl->shared_context->sys;
++        sys->display = master_sys->display;
++        sys->config = master_sys->config;
++        sys->owns_display = false;
++        sys->owns_surface = true;
++        goto shared_display_ready;
++    }
+ 
+ #ifdef USE_PLATFORM_X11
+     sys->x11 = NULL;
+@@ -349,51 +371,76 @@ static int Open (vlc_object_t *obj, const struct gl_api *api)
+ 
+ #endif
+ 
++shared_display_ready:
+     if (sys->display == EGL_NO_DISPLAY)
+         goto error;
+ 
+-    /* Initialize EGL display */
+-    EGLint major, minor;
+-    if (eglInitialize(sys->display, &major, &minor) != EGL_TRUE)
+-        goto error;
+-    msg_Dbg(obj, "EGL version %s by %s",
+-            eglQueryString(sys->display, EGL_VERSION),
+-            eglQueryString(sys->display, EGL_VENDOR));
+-
+-    const char *ext = eglQueryString(sys->display, EGL_EXTENSIONS);
+-    if (*ext)
+-        msg_Dbg(obj, " extensions: %s", ext);
+-
+-    if (major != 1 || minor < api->min_minor
+-     || !CheckAPI(sys->display, api->name))
++    EGLint major = 1, minor = api->min_minor;
++    if (sys->owns_display)
+     {
+-        msg_Err(obj, "cannot select %s API", api->name);
+-        goto error;
+-    }
++        if (eglInitialize(sys->display, &major, &minor) != EGL_TRUE)
++            goto error;
++        msg_Dbg(obj, "EGL version %s by %s",
++                eglQueryString(sys->display, EGL_VERSION),
++                eglQueryString(sys->display, EGL_VENDOR));
++
++        const char *ext = eglQueryString(sys->display, EGL_EXTENSIONS);
++        if (*ext)
++            msg_Dbg(obj, " extensions: %s", ext);
++
++        if (major != 1 || minor < api->min_minor
++         || !CheckAPI(sys->display, api->name))
++        {
++            msg_Err(obj, "cannot select %s API", api->name);
++            goto error;
++        }
+ 
+-    const EGLint conf_attr[] = {
+-        EGL_RED_SIZE, 5,
+-        EGL_GREEN_SIZE, 5,
+-        EGL_BLUE_SIZE, 5,
+-        EGL_RENDERABLE_TYPE, api->render_bit,
+-        EGL_NONE
+-    };
+-    EGLConfig cfgv[1];
+-    EGLint cfgc;
++        const EGLint conf_attr[] = {
++            EGL_RED_SIZE, 5,
++            EGL_GREEN_SIZE, 5,
++            EGL_BLUE_SIZE, 5,
++            EGL_RENDERABLE_TYPE, api->render_bit,
++            EGL_NONE
++        };
++        EGLConfig cfgv[1];
++        EGLint cfgc;
+ 
+-    if (eglChooseConfig(sys->display, conf_attr, cfgv, 1, &cfgc) != EGL_TRUE
+-     || cfgc == 0)
+-    {
+-        msg_Err (obj, "cannot choose EGL configuration");
+-        goto error;
+-    }
++        if (eglChooseConfig(sys->display, conf_attr, cfgv, 1, &cfgc) != EGL_TRUE
++         || cfgc == 0)
++        {
++            msg_Err (obj, "cannot choose EGL configuration");
++            goto error;
++        }
++        sys->config = cfgv[0];
+ 
+-    /* Create a drawing surface */
+-    sys->surface = createSurface(sys->display, cfgv[0], window, NULL);
+-    if (sys->surface == EGL_NO_SURFACE)
++        /* Create a drawing surface */
++        sys->surface = createSurface(sys->display, sys->config, window, NULL);
++        if (sys->surface == EGL_NO_SURFACE)
++        {
++            msg_Err (obj, "cannot create EGL window surface");
++            goto error;
++        }
++    }
++    else
+     {
+-        msg_Err (obj, "cannot create EGL window surface");
+-        goto error;
++        if (!CheckAPI(sys->display, api->name))
++        {
++            msg_Err(obj, "cannot reuse shared EGL API %s", api->name);
++            goto error;
++        }
++
++        const EGLint pbuffer_attr[] = {
++            EGL_WIDTH, 1,
++            EGL_HEIGHT, 1,
++            EGL_NONE
++        };
++        sys->surface = eglCreatePbufferSurface(sys->display, sys->config,
++                                               pbuffer_attr);
++        if (sys->surface == EGL_NO_SURFACE)
++        {
++            msg_Err(obj, "cannot create shared EGL pbuffer surface");
++            goto error;
++        }
+     }
+ 
+     if (eglBindAPI (api->api) != EGL_TRUE)
+@@ -402,7 +449,9 @@ static int Open (vlc_object_t *obj, const struct gl_api *api)
+         goto error;
+     }
+ 
+-    EGLContext ctx = eglCreateContext(sys->display, cfgv[0], EGL_NO_CONTEXT,
++    EGLContext share_ctx =
++        (master_sys != NULL) ? master_sys->context : EGL_NO_CONTEXT;
++    EGLContext ctx = eglCreateContext(sys->display, sys->config, share_ctx,
+                                       api->attr);
+     if (ctx == EGL_NO_CONTEXT)
+     {
 diff --git a/modules/video_output/opengl/vout_helper.c b/modules/video_output/opengl/vout_helper.c
-index 13d65e0..5387d9e 100644
+index 13d65e0..fb7ce30 100644
 --- a/modules/video_output/opengl/vout_helper.c
 +++ b/modules/video_output/opengl/vout_helper.c
-@@ -1672,8 +1672,9 @@ static void TextureCropForStereo(vout_display_opengl_t *vgl,
+@@ -1160,26 +1160,17 @@ error:
+     return NULL;
+ }
+ 
+-int vout_display_opengl_Prepare(vout_display_opengl_t *vgl,
+-                                picture_t *picture, subpicture_t *subpicture)
++static int vout_display_opengl_PrepareSubpictureCommon(vout_display_opengl_t *vgl,
++                                                 subpicture_t *subpicture)
+ {
+-    GL_ASSERT_NOERROR();
+-
+-    opengl_tex_converter_t *tc = vgl->prgm->tc;
+-
+-    /* Update the texture */
+-    int ret = tc->pf_update(tc, vgl->texture, vgl->tex_width, vgl->tex_height,
+-                            picture, NULL);
+-    if (ret != VLC_SUCCESS)
+-        return ret;
+-
++    int ret = VLC_SUCCESS;
+     int         last_count = vgl->region_count;
+     gl_region_t *last = vgl->region;
+ 
+     vgl->region_count = 0;
+     vgl->region       = NULL;
+ 
+-    tc = vgl->sub_prgm->tc;
++    opengl_tex_converter_t *tc = vgl->sub_prgm->tc;
+     if (subpicture) {
+ 
+         int count = 0;
+@@ -1247,8 +1238,32 @@ int vout_display_opengl_Prepare(vout_display_opengl_t *vgl,
+     }
+     free(last);
+ 
+-    VLC_UNUSED(subpicture);
++    return ret;
++}
+ 
++int vout_display_opengl_PrepareSubpicture(vout_display_opengl_t *vgl,
++                                          subpicture_t *subpicture)
++{
++    GL_ASSERT_NOERROR();
++    int ret = vout_display_opengl_PrepareSubpictureCommon(vgl, subpicture);
++    GL_ASSERT_NOERROR();
++    return ret;
++}
++
++int vout_display_opengl_Prepare(vout_display_opengl_t *vgl,
++                                picture_t *picture, subpicture_t *subpicture)
++{
++    GL_ASSERT_NOERROR();
++
++    opengl_tex_converter_t *tc = vgl->prgm->tc;
++
++    /* Update the texture */
++    int ret = tc->pf_update(tc, vgl->texture, vgl->tex_width, vgl->tex_height,
++                            picture, NULL);
++    if (ret != VLC_SUCCESS)
++        return ret;
++
++    ret = vout_display_opengl_PrepareSubpictureCommon(vgl, subpicture);
+     GL_ASSERT_NOERROR();
+     return ret;
+ }
+@@ -1672,8 +1687,9 @@ static void TextureCropForStereo(vout_display_opengl_t *vgl,
      }
  }
  
@@ -1360,7 +1307,7 @@ index 13d65e0..5387d9e 100644
  {
      GL_ASSERT_NOERROR();
  
-@@ -1807,11 +1808,23 @@ int vout_display_opengl_Display(vout_display_opengl_t *vgl,
+@@ -1807,11 +1823,23 @@ int vout_display_opengl_Display(vout_display_opengl_t *vgl,
      }
      vgl->vt.Disable(GL_BLEND);
  
@@ -1387,13 +1334,15 @@ index 13d65e0..5387d9e 100644
 +}
 +
 diff --git a/modules/video_output/opengl/vout_helper.h b/modules/video_output/opengl/vout_helper.h
-index 48014b4..32dadda 100644
+index 48014b4..7e733fa 100644
 --- a/modules/video_output/opengl/vout_helper.h
 +++ b/modules/video_output/opengl/vout_helper.h
-@@ -262,6 +262,8 @@ void vout_display_opengl_Viewport(vout_display_opengl_t *vgl, int x, int y,
+@@ -262,6 +262,10 @@ void vout_display_opengl_Viewport(vout_display_opengl_t *vgl, int x, int y,
  
  int vout_display_opengl_Prepare(vout_display_opengl_t *vgl,
                                  picture_t *picture, subpicture_t *subpicture);
++int vout_display_opengl_PrepareSubpicture(vout_display_opengl_t *vgl,
++                                          subpicture_t *subpicture);
 +int vout_display_opengl_DisplayNoSwap(vout_display_opengl_t *vgl,
 +                                      const video_format_t *source);
  int vout_display_opengl_Display(vout_display_opengl_t *vgl,
@@ -1536,3 +1485,111 @@ index fcd3ecb..7a4c2b4 100644
  
      if( in->p_demux == NULL )
      {
+diff --git a/src/libvlccore.sym b/src/libvlccore.sym
+index a15ba0d..87304c1 100644
+--- a/src/libvlccore.sym
++++ b/src/libvlccore.sym
+@@ -691,6 +691,7 @@ vlc_fifo_DequeueAllUnlocked
+ vlc_fifo_GetCount
+ vlc_fifo_GetBytes
+ vlc_gl_Create
++vlc_gl_CreateShared
+ vlc_gl_Release
+ vlc_gl_Hold
+ vlc_gl_surface_Create
+diff --git a/src/video_output/opengl.c b/src/video_output/opengl.c
+index c9dcdab..cb95482 100644
+--- a/src/video_output/opengl.c
++++ b/src/video_output/opengl.c
+@@ -36,6 +36,20 @@ struct vlc_gl_priv_t
+     vlc_gl_t gl;
+     atomic_uint ref_count;
+ };
++
++static const char *vlc_gl_SharedModuleName(const vlc_gl_t *gl)
++{
++    if (gl == NULL)
++        return NULL;
++
++    switch (gl->ext)
++    {
++        case VLC_GL_EXT_EGL:
++            return "egl";
++        default:
++            return NULL;
++    }
++}
+ #undef vlc_gl_Create
+ /**
+  * Creates an OpenGL context (and its underlying surface).
+@@ -71,6 +85,8 @@ vlc_gl_t *vlc_gl_Create(struct vout_window_t *wnd, unsigned flags,
+         return NULL;
+ 
+     glpriv->gl.surface = wnd;
++    glpriv->gl.api_type = flags;
++    glpriv->gl.shared_context = NULL;
+     glpriv->gl.module = module_need(&glpriv->gl, type, name, true);
+     if (glpriv->gl.module == NULL)
+     {
+@@ -82,6 +98,49 @@ vlc_gl_t *vlc_gl_Create(struct vout_window_t *wnd, unsigned flags,
+     return &glpriv->gl;
+ }
+ 
++vlc_gl_t *vlc_gl_CreateShared(vlc_gl_t *master)
++{
++    if (master == NULL)
++        return NULL;
++
++    const char *name = vlc_gl_SharedModuleName(master);
++    if (name == NULL)
++        return NULL;
++
++    vlc_object_t *parent = (vlc_object_t *)master->surface;
++    struct vlc_gl_priv_t *glpriv = vlc_custom_create(parent, sizeof (*glpriv), "gl");
++    if (unlikely(glpriv == NULL))
++        return NULL;
++
++    const char *type;
++    switch (master->api_type)
++    {
++        case VLC_OPENGL:
++            type = "opengl";
++            break;
++        case VLC_OPENGL_ES2:
++            type = "opengl es2";
++            break;
++        default:
++            vlc_object_release(&glpriv->gl);
++            return NULL;
++    }
++
++    glpriv->gl.surface = master->surface;
++    glpriv->gl.api_type = master->api_type;
++    glpriv->gl.shared_context = master;
++    vlc_gl_Hold(master);
++    glpriv->gl.module = module_need(&glpriv->gl, type, name, true);
++    if (glpriv->gl.module == NULL)
++    {
++        vlc_gl_Release(master);
++        vlc_object_release(&glpriv->gl);
++        return NULL;
++    }
++    atomic_init(&glpriv->ref_count, 1);
++    return &glpriv->gl;
++}
++
+ void vlc_gl_Hold(vlc_gl_t *gl)
+ {
+     struct vlc_gl_priv_t *glpriv = (struct vlc_gl_priv_t *)gl;
+@@ -93,8 +152,11 @@ void vlc_gl_Release(vlc_gl_t *gl)
+     struct vlc_gl_priv_t *glpriv = (struct vlc_gl_priv_t *)gl;
+     if (atomic_fetch_sub(&glpriv->ref_count, 1) != 1)
+         return;
++    vlc_gl_t *shared_context = gl->shared_context;
+     module_unneed(gl, gl->module);
+     vlc_object_release(gl);
++    if (shared_context != NULL)
++        vlc_gl_Release(shared_context);
+ }
+ 
+ #include <vlc_vout_window.h>

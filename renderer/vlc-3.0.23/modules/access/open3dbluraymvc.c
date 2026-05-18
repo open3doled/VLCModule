@@ -26,6 +26,8 @@
 #endif
 
 #include <assert.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <stdio.h>
 
 #ifdef HAVE_GETMNTENT_R
@@ -55,7 +57,6 @@
 #include "../demux/mpeg/timestamps.h"
 #include "../demux/timestamps_filter.h"
 #include "../video_output/open3d_subtitle_bridge.h"
-
 /* FIXME we should find a better way than including that */
 #include "../../src/text/iso-639_def.h"
 
@@ -173,7 +174,7 @@ vlc_module_begin ()
     set_category(CAT_INPUT)
     set_subcategory(SUBCAT_INPUT_ACCESS)
     set_capability("access_demux", 200)
-    add_bool("bluray-menu", true, BD_MENU_TEXT, BD_MENU_LONGTEXT, false)
+    add_bool("bluray-menu", false, BD_MENU_TEXT, BD_MENU_LONGTEXT, false)
     add_string("bluray-region", ppsz_region_code[REGION_DEFAULT], BD_REGION_TEXT, BD_REGION_LONGTEXT, false)
         change_string_list(ppsz_region_code, ppsz_region_code_text)
 #if OPEN3DBLURAY_ENABLE_MVC
@@ -201,33 +202,6 @@ vlc_module_begin ()
 
 vlc_module_end ()
 
-#if defined(OPEN3D_VLC_ABI_ALIAS_T64)
-extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
-extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
-extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
-EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
-
-EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
-vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
-{
-    return vlc_entry__3_0_0f(vlc_set, opaque);
-}
-
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-vlc_entry_copyright__3_0_0ft64(void)
-{
-    return vlc_entry_copyright__3_0_0f();
-}
-
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-vlc_entry_license__3_0_0ft64(void)
-{
-    return vlc_entry_license__3_0_0f();
-}
-#endif
-
 /* libbluray's overlay.h defines 2 types of overlay (bd_overlay_plane_e). */
 #define MAX_OVERLAY 2
 
@@ -252,6 +226,8 @@ typedef struct bluray_overlay_t
     uint8_t             i_subtitle_offset_raw;
     int8_t              i_subtitle_offset_signed;
     int                 i_subtitle_offset_frame;
+    bool                b_palette_cache_valid;
+    BD_PG_PALETTE_ENTRY palette_cache[256];
 
     /* pointer to last subpicture updater.
      * used to disconnect this overlay from vout when:
@@ -319,14 +295,20 @@ struct  demux_sys_t
     bool                b_menu_open;
     bool                b_popup_available;
     vlc_tick_t          i_still_end_time;
+    unsigned            i_redundant_end_of_title_streak;
+    bool                b_probe_yield_redundant_end_of_title;
+    bool                b_probe_logged_redundant_end_of_title;
+    unsigned            i_probe_redundant_end_of_title_yield_count;
 
     vlc_mutex_t         bdj_overlay_lock; /* used to lock BD-J overlay open/close while overlays are being sent to vout */
 
     /* */
     vout_thread_t       *p_vout;
     open3d_subtitle_bridge_t subtitle_bridge;
+    open3d_interactive_graphics_bridge_t interactive_graphics_bridge;
 
     es_out_id_t         *p_dummy_video;
+    vlc_tick_t          i_dummy_video_next_pts;
 
     /* TS stream */
     es_out_t            *p_tf_out;
@@ -354,6 +336,7 @@ struct  demux_sys_t
     es_out_id_t         *p_mvc_video;
     bool                b_mvc_first_unit;
     bool                b_mvc_seen_matched;
+    bool                b_mvc_base_fallback_selected;
     bool                b_mvc_next_block_discontinuity;
     bool                b_mvc_hold_unmatched_until_match;
     int                 i_mvc_group;
@@ -590,6 +573,913 @@ static bool open3dblurayTraceForcedFilterEnabled(void)
            strcasecmp(env, "no") != 0;
 }
 
+static bool open3dblurayTraceNavInputEnabled(void)
+{
+    const char *env = getenv("OPEN3DBLURAY_TRACE_NAV_INPUT");
+    if (env == NULL || *env == '\0')
+        return false;
+
+    return strcmp(env, "0") != 0 &&
+           strcasecmp(env, "false") != 0 &&
+           strcasecmp(env, "no") != 0;
+}
+
+static const char *open3dblurayNavKeyName(unsigned int key)
+{
+    switch (key) {
+    case BD_VK_MOUSE_ACTIVATE: return "mouse_activate";
+    case BD_VK_ENTER:          return "enter";
+    case BD_VK_UP:             return "up";
+    case BD_VK_DOWN:           return "down";
+    case BD_VK_LEFT:           return "left";
+    case BD_VK_RIGHT:          return "right";
+    case BD_VK_POPUP:          return "popup";
+    default:                   return "unknown";
+    }
+}
+
+static const char *open3dblurayNavActionName(int query)
+{
+    switch (query) {
+    case DEMUX_NAV_ACTIVATE: return "activate";
+    case DEMUX_NAV_UP:       return "up";
+    case DEMUX_NAV_DOWN:     return "down";
+    case DEMUX_NAV_LEFT:     return "left";
+    case DEMUX_NAV_RIGHT:    return "right";
+    case DEMUX_NAV_POPUP:    return "popup";
+    case DEMUX_NAV_MENU:     return "menu";
+    default:                 return "unknown";
+    }
+}
+
+static bool open3dblurayTraceInteractiveGraphicsBridgeEnabled(void)
+{
+    const char *env = getenv("OPEN3DBLURAY_TRACE_IG_BRIDGE");
+    if (env == NULL || *env == '\0')
+        return false;
+
+    return strcmp(env, "0") != 0 &&
+           strcasecmp(env, "false") != 0 &&
+           strcasecmp(env, "no") != 0;
+}
+
+static bool open3dblurayTraceMenuVisualsEnabled(void)
+{
+    const char *env = getenv("OPEN3DBLURAY_TRACE_MENU_VISUALS");
+    if (env == NULL || *env == '\0')
+        return false;
+
+    return strcmp(env, "0") != 0 &&
+           strcasecmp(env, "false") != 0 &&
+           strcasecmp(env, "no") != 0;
+}
+
+static bool open3dblurayTraceSpuSendEnabled(void)
+{
+    const char *env = getenv("OPEN3DBLURAY_TRACE_SPU_SEND");
+    if (env == NULL || *env == '\0')
+        return false;
+
+    return strcmp(env, "0") != 0 &&
+           strcasecmp(env, "false") != 0 &&
+           strcasecmp(env, "no") != 0;
+}
+
+static bool open3dblurayTracePgRegionsEnabled(void)
+{
+    const char *env = getenv("OPEN3DBLURAY_TRACE_PG_REGIONS");
+    if (env == NULL || *env == '\0')
+        return false;
+
+    return strcmp(env, "0") != 0 &&
+           strcasecmp(env, "false") != 0 &&
+           strcasecmp(env, "no") != 0;
+}
+
+static bool open3dblurayYieldRedundantEndOfTitleEnabled(void)
+{
+    const char *env = getenv("OPEN3DBLURAY_YIELD_REDUNDANT_END_OF_TITLE");
+    if (env == NULL || *env == '\0')
+        return false;
+
+    return strcmp(env, "0") != 0 &&
+           strcasecmp(env, "false") != 0 &&
+           strcasecmp(env, "no") != 0;
+}
+
+static bool open3dblurayIgnoreMouseMoveProbeEnabled(void)
+{
+    const char *env = getenv("OPEN3DBLURAY_PROBE_IGNORE_MOUSE_MOVE");
+    if (env == NULL || *env == '\0')
+        return false;
+
+    return strcmp(env, "0") != 0 &&
+           strcasecmp(env, "false") != 0 &&
+           strcasecmp(env, "no") != 0;
+}
+
+typedef struct
+{
+    bool enabled;
+    unsigned source_width;
+    unsigned source_height;
+    unsigned scene_width;
+    unsigned scene_height;
+} open3dbluray_mouse_scene_probe_t;
+
+static bool open3dblurayLoadMouseSceneProbe(open3dbluray_mouse_scene_probe_t *p_probe)
+{
+    const char *env = getenv("OPEN3DBLURAY_PROBE_MOUSE_SOURCE_TO_SCENE");
+    unsigned source_width = 0;
+    unsigned source_height = 0;
+    unsigned scene_width = 0;
+    unsigned scene_height = 0;
+
+    if (p_probe == NULL)
+        return false;
+
+    memset(p_probe, 0, sizeof(*p_probe));
+
+    if (env == NULL || *env == '\0')
+        return false;
+
+    if (sscanf(env, "%ux%u:%ux%u",
+               &source_width, &source_height,
+               &scene_width, &scene_height) != 4)
+        return false;
+
+    if (source_width == 0 || source_height == 0 ||
+        scene_width == 0 || scene_height == 0)
+        return false;
+
+    p_probe->enabled = true;
+    p_probe->source_width = source_width;
+    p_probe->source_height = source_height;
+    p_probe->scene_width = scene_width;
+    p_probe->scene_height = scene_height;
+    return true;
+}
+
+static bool open3dblurayNormalizeMouseCoords(const open3dbluray_mouse_scene_probe_t *p_probe,
+                                             int raw_x, int raw_y,
+                                             int *p_clamped_x, int *p_clamped_y,
+                                             int *p_mapped_x, int *p_mapped_y)
+{
+    uint64_t mapped_x;
+    uint64_t mapped_y;
+    int clamped_x;
+    int clamped_y;
+
+    if (p_probe == NULL || !p_probe->enabled ||
+        p_probe->source_width == 0 || p_probe->source_height == 0 ||
+        p_probe->scene_width == 0 || p_probe->scene_height == 0 ||
+        p_clamped_x == NULL || p_clamped_y == NULL ||
+        p_mapped_x == NULL || p_mapped_y == NULL)
+        return false;
+
+    clamped_x = raw_x;
+    clamped_y = raw_y;
+
+    if (clamped_x < 0)
+        clamped_x = 0;
+    else if ((unsigned)clamped_x >= p_probe->source_width)
+        clamped_x = (int)p_probe->source_width - 1;
+
+    if (clamped_y < 0)
+        clamped_y = 0;
+    else if ((unsigned)clamped_y >= p_probe->source_height)
+        clamped_y = (int)p_probe->source_height - 1;
+
+    mapped_x = ((uint64_t)(unsigned)clamped_x * p_probe->scene_width) /
+               p_probe->source_width;
+    mapped_y = ((uint64_t)(unsigned)clamped_y * p_probe->scene_height) /
+               p_probe->source_height;
+
+    if (mapped_x >= p_probe->scene_width)
+        mapped_x = p_probe->scene_width - 1;
+    if (mapped_y >= p_probe->scene_height)
+        mapped_y = p_probe->scene_height - 1;
+
+    *p_clamped_x = clamped_x;
+    *p_clamped_y = clamped_y;
+    *p_mapped_x = (int)mapped_x;
+    *p_mapped_y = (int)mapped_y;
+    return true;
+}
+
+static const char *open3dblurayOverlayPlaneName(unsigned plane)
+{
+    switch (plane)
+    {
+    case BD_OVERLAY_PG:
+        return "pg";
+    case BD_OVERLAY_IG:
+        return "ig";
+    default:
+        return "unknown";
+    }
+}
+
+static const char *open3dblurayClipAppTypeName(unsigned app_type)
+{
+    switch (app_type)
+    {
+    case BD_CLIP_APP_TYPE_TS_MAIN_PATH_MOVIE:
+        return "main-movie";
+    case BD_CLIP_APP_TYPE_TS_MAIN_PATH_TIMED_SLIDESHOW:
+        return "main-timed-slideshow";
+    case BD_CLIP_APP_TYPE_TS_MAIN_PATH_BROWSABLE_SLIDESHOW:
+        return "main-browsable-slideshow";
+    case BD_CLIP_APP_TYPE_TS_SUB_PATH_BROWSABLE_SLIDESHOW:
+        return "sub-browsable-slideshow";
+    case BD_CLIP_APP_TYPE_TS_SUB_PATH_INTERACTIVE_MENU:
+        return "sub-interactive-menu";
+    case BD_CLIP_APP_TYPE_TS_SUB_PATH_TEXT_SUBTITLE:
+        return "sub-text-subtitle";
+    case BD_CLIP_APP_TYPE_TS_SUB_PATH_ELEMENTARY_STREAM_PATH:
+        return "sub-elementary-stream";
+    default:
+        return "unknown";
+    }
+}
+
+static const char *open3dblurayStillModeName(unsigned still_mode)
+{
+    switch (still_mode)
+    {
+    case BLURAY_STILL_NONE:
+        return "none";
+    case BLURAY_STILL_TIME:
+        return "time";
+    case BLURAY_STILL_INFINITE:
+        return "infinite";
+    default:
+        return "unknown";
+    }
+}
+
+static const char *open3dblurayStreamCodingTypeName(unsigned coding_type)
+{
+    switch (coding_type)
+    {
+    case BLURAY_STREAM_TYPE_VIDEO_MPEG1:
+        return "mpeg1";
+    case BLURAY_STREAM_TYPE_VIDEO_MPEG2:
+        return "mpeg2";
+    case BLURAY_STREAM_TYPE_VIDEO_VC1:
+        return "vc1";
+    case BLURAY_STREAM_TYPE_VIDEO_H264:
+        return "h264";
+    case BD_STREAM_TYPE_VIDEO_HEVC:
+        return "hevc";
+    case BLURAY_STREAM_TYPE_AUDIO_MPEG1:
+        return "audio-mpeg1";
+    case BLURAY_STREAM_TYPE_AUDIO_MPEG2:
+        return "audio-mpeg2";
+    case BLURAY_STREAM_TYPE_AUDIO_LPCM:
+        return "lpcm";
+    case BLURAY_STREAM_TYPE_AUDIO_AC3:
+        return "ac3";
+    case BLURAY_STREAM_TYPE_AUDIO_DTS:
+        return "dts";
+    case BLURAY_STREAM_TYPE_AUDIO_TRUHD:
+        return "truehd";
+    case BLURAY_STREAM_TYPE_AUDIO_AC3PLUS:
+        return "ac3plus";
+    case BLURAY_STREAM_TYPE_AUDIO_DTSHD:
+        return "dtshd";
+    case BLURAY_STREAM_TYPE_AUDIO_DTSHD_MASTER:
+        return "dtshd-master";
+    case BLURAY_STREAM_TYPE_AUDIO_AC3PLUS_SECONDARY:
+        return "ac3plus-secondary";
+    case BLURAY_STREAM_TYPE_AUDIO_DTSHD_SECONDARY:
+        return "dtshd-secondary";
+    case BLURAY_STREAM_TYPE_SUB_PG:
+        return "pg";
+    case BLURAY_STREAM_TYPE_SUB_IG:
+        return "ig";
+    case BLURAY_STREAM_TYPE_SUB_TEXT:
+        return "text";
+    default:
+        return "unknown";
+    }
+}
+
+static unsigned open3dblurayCountRegionChain(const subpicture_region_t *regions)
+{
+    unsigned count = 0;
+    for (const subpicture_region_t *region = regions; region != NULL; region = region->p_next)
+        ++count;
+    return count;
+}
+
+typedef struct
+{
+    unsigned regions;
+    uint64_t visible_area;
+    bool bounds_valid;
+    int x;
+    int y;
+    unsigned width;
+    unsigned height;
+    bool full_canvas;
+} open3dbluray_region_chain_summary_t;
+
+static void open3dbluraySummarizeRegionChain(const subpicture_region_t *regions,
+                                             unsigned canvas_width,
+                                             unsigned canvas_height,
+                                             open3dbluray_region_chain_summary_t *summary)
+{
+    if (summary == NULL)
+        return;
+
+    memset(summary, 0, sizeof(*summary));
+
+    int min_x = INT_MAX;
+    int min_y = INT_MAX;
+    int max_x = INT_MIN;
+    int max_y = INT_MIN;
+
+    for (const subpicture_region_t *region = regions;
+         region != NULL;
+         region = region->p_next)
+    {
+        ++summary->regions;
+
+        const unsigned width = region->fmt.i_visible_width > 0
+                             ? region->fmt.i_visible_width
+                             : region->fmt.i_width;
+        const unsigned height = region->fmt.i_visible_height > 0
+                              ? region->fmt.i_visible_height
+                              : region->fmt.i_height;
+        summary->visible_area += (uint64_t)width * (uint64_t)height;
+
+        if (width == 0 || height == 0)
+            continue;
+
+        const int region_min_x = region->i_x;
+        const int region_min_y = region->i_y;
+        const int region_max_x = region->i_x + (int)width;
+        const int region_max_y = region->i_y + (int)height;
+
+        if (region_min_x < min_x)
+            min_x = region_min_x;
+        if (region_min_y < min_y)
+            min_y = region_min_y;
+        if (region_max_x > max_x)
+            max_x = region_max_x;
+        if (region_max_y > max_y)
+            max_y = region_max_y;
+    }
+
+    if (max_x > min_x && max_y > min_y)
+    {
+        summary->bounds_valid = true;
+        summary->x = min_x;
+        summary->y = min_y;
+        summary->width = (unsigned)(max_x - min_x);
+        summary->height = (unsigned)(max_y - min_y);
+        summary->full_canvas =
+            summary->x == 0 &&
+            summary->y == 0 &&
+            summary->width == canvas_width &&
+            summary->height == canvas_height;
+    }
+}
+
+static void open3dblurayTraceIgRegionChain(demux_t *p_demux,
+                                           const char *phase,
+                                           const bluray_overlay_t *p_ov,
+                                           bool use_direct_bridge,
+                                           bool menu_open)
+{
+    if (!open3dblurayTraceInteractiveGraphicsBridgeEnabled() ||
+        p_demux == NULL || phase == NULL || p_ov == NULL ||
+        p_ov->plane != BD_OVERLAY_IG)
+        return;
+
+    open3dbluray_region_chain_summary_t summary;
+    open3dbluraySummarizeRegionChain(p_ov->p_regions, (unsigned)p_ov->width,
+                                     (unsigned)p_ov->height, &summary);
+
+    static open3dbluray_region_chain_summary_t last_summary;
+    static char last_phase[32];
+    static bool last_direct = false;
+    static bool last_menu_open = false;
+    static bool last_valid = false;
+
+    if (last_valid &&
+        strcmp(last_phase, phase) == 0 &&
+        last_direct == use_direct_bridge &&
+        last_menu_open == menu_open &&
+        memcmp(&last_summary, &summary, sizeof(summary)) == 0)
+        return;
+
+    last_summary = summary;
+    last_direct = use_direct_bridge;
+    last_menu_open = menu_open;
+    last_valid = true;
+    snprintf(last_phase, sizeof(last_phase), "%s", phase);
+
+    msg_Warn(p_demux,
+             "open3dbluray trace ig-coverage phase=%s direct=%d menu_open=%d "
+             "regions=%u area=%" PRIu64 " canvas=%ux%u bounds_valid=%d "
+             "bounds=%d,%d %ux%u full_canvas=%d pts90k=%" PRId64,
+             phase,
+             use_direct_bridge ? 1 : 0,
+             menu_open ? 1 : 0,
+             summary.regions,
+             summary.visible_area,
+             p_ov->width,
+             p_ov->height,
+             summary.bounds_valid ? 1 : 0,
+             summary.bounds_valid ? summary.x : 0,
+             summary.bounds_valid ? summary.y : 0,
+             summary.bounds_valid ? summary.width : 0,
+             summary.bounds_valid ? summary.height : 0,
+             summary.full_canvas ? 1 : 0,
+             p_ov->pts90k);
+}
+
+static void open3dblurayTraceOverlayCoverage(demux_t *p_demux,
+                                             const char *phase,
+                                             const bluray_overlay_t *p_ov,
+                                             bool use_direct_bridge,
+                                             bool menu_open)
+{
+    if (!open3dblurayTraceMenuVisualsEnabled() ||
+        p_demux == NULL || phase == NULL || p_ov == NULL)
+        return;
+
+    open3dbluray_region_chain_summary_t summary;
+    const unsigned plane = (unsigned)p_ov->plane;
+    const unsigned slot = plane < MAX_OVERLAY ? plane : 0;
+    open3dbluraySummarizeRegionChain(p_ov->p_regions, (unsigned)p_ov->width,
+                                     (unsigned)p_ov->height, &summary);
+
+    static open3dbluray_region_chain_summary_t last_summary[MAX_OVERLAY];
+    static char last_phase[MAX_OVERLAY][32];
+    static bool last_direct[MAX_OVERLAY];
+    static bool last_menu_open[MAX_OVERLAY];
+    static bool last_valid[MAX_OVERLAY];
+
+    if (plane < MAX_OVERLAY &&
+        last_valid[slot] &&
+        strcmp(last_phase[slot], phase) == 0 &&
+        last_direct[slot] == use_direct_bridge &&
+        last_menu_open[slot] == menu_open &&
+        memcmp(&last_summary[slot], &summary, sizeof(summary)) == 0)
+        return;
+
+    if (plane < MAX_OVERLAY)
+    {
+        last_summary[slot] = summary;
+        last_direct[slot] = use_direct_bridge;
+        last_menu_open[slot] = menu_open;
+        last_valid[slot] = true;
+        snprintf(last_phase[slot], sizeof(last_phase[slot]), "%s", phase);
+    }
+
+    msg_Warn(p_demux,
+             "open3dbluray trace overlay-coverage phase=%s plane=%s direct=%d menu_open=%d "
+             "regions=%u area=%" PRIu64 " canvas=%ux%u bounds_valid=%d "
+             "bounds=%d,%d %ux%u full_canvas=%d pts90k=%" PRId64,
+             phase,
+             open3dblurayOverlayPlaneName(plane),
+             use_direct_bridge ? 1 : 0,
+             menu_open ? 1 : 0,
+             summary.regions,
+             summary.visible_area,
+             p_ov->width,
+             p_ov->height,
+             summary.bounds_valid ? 1 : 0,
+             summary.bounds_valid ? summary.x : 0,
+             summary.bounds_valid ? summary.y : 0,
+             summary.bounds_valid ? summary.width : 0,
+             summary.bounds_valid ? summary.height : 0,
+             summary.full_canvas ? 1 : 0,
+             p_ov->pts90k);
+}
+
+static void open3dblurayTracePgRegionChain(demux_t *p_demux,
+                                           const char *phase,
+                                           const bluray_overlay_t *p_ov)
+{
+    if (!open3dblurayTracePgRegionsEnabled() ||
+        p_demux == NULL || phase == NULL || p_ov == NULL ||
+        p_ov->plane != BD_OVERLAY_PG)
+        return;
+
+    const unsigned total_regions = open3dblurayCountRegionChain(p_ov->p_regions);
+    msg_Dbg(p_demux,
+            "open3dbluray trace pg-region-chain phase=%s regions=%u size=%ux%u pts90k=%" PRId64 " offset_valid=%d offset_seq=%u offset_signed=%d offset_frame=%d",
+            phase,
+            total_regions,
+            p_ov->width,
+            p_ov->height,
+            p_ov->pts90k,
+            p_ov->b_subtitle_offset_valid ? 1 : 0,
+            p_ov->i_subtitle_offset_sequence,
+            (int)p_ov->i_subtitle_offset_signed,
+            p_ov->i_subtitle_offset_frame);
+
+    unsigned index = 0;
+    for (const subpicture_region_t *region = p_ov->p_regions;
+         region != NULL && index < 4;
+         region = region->p_next, ++index)
+    {
+        const picture_t *picture = region->p_picture;
+        const video_format_t *picture_format =
+            picture != NULL ? &picture->format : NULL;
+        const plane_t *plane0 =
+            picture != NULL && picture->i_planes > 0 ? &picture->p[0] : NULL;
+
+        msg_Dbg(p_demux,
+                "open3dbluray trace pg-region phase=%s idx=%u bitmap=%d text=%d xy=%d,%d fmt=%ux%u vis=%ux%u picfmt=%ux%u picvis=%ux%u planes=%d plane0_lines=%d plane0_pitch=%d plane0_visible_lines=%d plane0_visible_pitch=%d",
+                phase,
+                index,
+                picture != NULL ? 1 : 0,
+                region->p_text != NULL ? 1 : 0,
+                region->i_x,
+                region->i_y,
+                region->fmt.i_width,
+                region->fmt.i_height,
+                region->fmt.i_visible_width,
+                region->fmt.i_visible_height,
+                picture_format != NULL ? picture_format->i_width : 0,
+                picture_format != NULL ? picture_format->i_height : 0,
+                picture_format != NULL ? picture_format->i_visible_width : 0,
+                picture_format != NULL ? picture_format->i_visible_height : 0,
+                picture != NULL ? picture->i_planes : 0,
+                plane0 != NULL ? plane0->i_lines : 0,
+                plane0 != NULL ? plane0->i_pitch : 0,
+                plane0 != NULL ? plane0->i_visible_lines : 0,
+                plane0 != NULL ? plane0->i_visible_pitch : 0);
+    }
+
+    if (index == 4 && total_regions > 4)
+        msg_Dbg(p_demux,
+                "open3dbluray trace pg-region phase=%s truncated=1 total_regions=%u",
+                phase,
+                total_regions);
+}
+
+static bool open3dblurayTraceArgbAccessEnabled(const bluray_overlay_t *p_ov,
+                                               const BD_ARGB_OVERLAY *eventov,
+                                               const subpicture_region_t *p_reg)
+{
+    if (!open3dblurayTraceInteractiveGraphicsBridgeEnabled() ||
+        p_ov == NULL || eventov == NULL || p_reg == NULL)
+        return false;
+    return true;
+}
+
+static const char *open3dblurayArgbCmdName(uint8_t cmd)
+{
+    switch (cmd)
+    {
+        case BD_ARGB_OVERLAY_INIT:
+            return "init";
+        case BD_ARGB_OVERLAY_CLOSE:
+            return "close";
+        case BD_ARGB_OVERLAY_DRAW:
+            return "draw";
+        case BD_ARGB_OVERLAY_FLUSH:
+            return "flush";
+        default:
+            return "other";
+    }
+}
+
+static const char *open3dblurayArgbShapeName(const BD_ARGB_OVERLAY *eventov)
+{
+    if (eventov == NULL)
+        return "other";
+
+    if (eventov->x == 0 && eventov->y == 0 &&
+        eventov->w == 1920 && eventov->h == 1080)
+        return "full";
+
+    if (eventov->x == 396 && eventov->y == 888 &&
+        eventov->w == 1126 && eventov->h == 92)
+        return "strip";
+
+    return "other";
+}
+
+static void open3dblurayTraceArgbEntry(demux_t *p_demux,
+                                       demux_sys_t *p_sys,
+                                       const BD_ARGB_OVERLAY *eventov)
+{
+    static unsigned trace_count = 0;
+    const bluray_overlay_t *p_ov = NULL;
+    const subpicture_region_t *p_reg = NULL;
+
+    if (p_demux == NULL || p_sys == NULL || eventov == NULL ||
+        !open3dblurayTraceInteractiveGraphicsBridgeEnabled() ||
+        trace_count >= 48)
+        return;
+
+    if (eventov->plane < MAX_OVERLAY)
+    {
+        p_ov = p_sys->p_overlays[eventov->plane];
+        if (p_ov != NULL)
+            p_reg = p_ov->p_regions;
+    }
+
+    trace_count++;
+    fprintf(stderr,
+            "open3dbluray raw argb-entry count=%u cmd=%s handle=%p plane=%u "
+            "rect=%u,%u-%u,%u stride=%u argb_present=%d\n",
+            trace_count,
+            open3dblurayArgbCmdName(eventov->cmd),
+            (void *)p_demux,
+            (unsigned)eventov->plane,
+            (unsigned)eventov->x,
+            (unsigned)eventov->y,
+            (unsigned)(eventov->x + eventov->w - 1),
+            (unsigned)(eventov->y + eventov->h - 1),
+            (unsigned)eventov->stride,
+            eventov->argb != NULL ? 1 : 0);
+    fflush(stderr);
+    msg_Warn(p_demux,
+             "open3dbluray trace argb-entry count=%u cmd=%s plane=%u pts=%" PRId64 " "
+             "rect=%u,%u-%u,%u stride=%u ov_present=%d ov_size=%ux%u "
+             "reg_present=%d reg_chroma=0x%08x reg_size=%ux%u argb_present=%d",
+             trace_count,
+             open3dblurayArgbCmdName(eventov->cmd),
+             (unsigned)eventov->plane,
+             eventov->pts,
+             (unsigned)eventov->x,
+             (unsigned)eventov->y,
+             (unsigned)(eventov->x + eventov->w - 1),
+             (unsigned)(eventov->y + eventov->h - 1),
+             (unsigned)eventov->stride,
+             p_ov != NULL ? 1 : 0,
+             p_ov != NULL ? p_ov->width : 0,
+             p_ov != NULL ? p_ov->height : 0,
+             p_reg != NULL ? 1 : 0,
+             p_reg != NULL ? (unsigned)p_reg->fmt.i_chroma : 0U,
+             p_reg != NULL ? p_reg->fmt.i_width : 0,
+             p_reg != NULL ? p_reg->fmt.i_height : 0,
+             eventov->argb != NULL ? 1 : 0);
+}
+
+static void open3dblurayTraceArgbSkip(demux_t *p_demux,
+                                      const bluray_overlay_t *p_ov,
+                                      const BD_ARGB_OVERLAY *eventov,
+                                      const subpicture_region_t *p_reg,
+                                      const char *reason)
+{
+    static unsigned trace_count = 0;
+
+    if (p_demux == NULL || eventov == NULL || reason == NULL ||
+        !open3dblurayTraceInteractiveGraphicsBridgeEnabled() ||
+        trace_count >= 48)
+        return;
+
+    trace_count++;
+    msg_Warn(p_demux,
+             "open3dbluray trace argb-skip count=%u reason=%s plane=%u "
+             "rect=%u,%u-%u,%u stride=%u ov_present=%d ov_size=%ux%u "
+             "reg_present=%d reg_chroma=0x%08x reg_size=%ux%u argb_present=%d",
+             trace_count,
+             reason,
+             (unsigned)eventov->plane,
+             (unsigned)eventov->x,
+             (unsigned)(eventov->y),
+             (unsigned)(eventov->x + eventov->w - 1),
+             (unsigned)(eventov->y + eventov->h - 1),
+             (unsigned)eventov->stride,
+             p_ov != NULL ? 1 : 0,
+             p_ov != NULL ? p_ov->width : 0,
+             p_ov != NULL ? p_ov->height : 0,
+             p_reg != NULL ? 1 : 0,
+             p_reg != NULL ? (unsigned)p_reg->fmt.i_chroma : 0U,
+             p_reg != NULL ? p_reg->fmt.i_width : 0,
+             p_reg != NULL ? p_reg->fmt.i_height : 0,
+             eventov->argb != NULL ? 1 : 0);
+}
+
+static bool open3dblurayReadArgbOverlayPixel(const BD_ARGB_OVERLAY *eventov,
+                                             int abs_x, int abs_y,
+                                             uint32_t *value)
+{
+    if (eventov == NULL || eventov->argb == NULL || value == NULL ||
+        abs_x < eventov->x || abs_y < eventov->y ||
+        abs_x >= eventov->x + eventov->w ||
+        abs_y >= eventov->y + eventov->h)
+        return false;
+
+    const int rel_x = abs_x - eventov->x;
+    const int rel_y = abs_y - eventov->y;
+    *value = eventov->argb[rel_y * eventov->stride + rel_x];
+    return true;
+}
+
+static bool open3dblurayReadArgbRegionPixel(const subpicture_region_t *p_reg,
+                                            int abs_x, int abs_y,
+                                            uint32_t *value)
+{
+    if (p_reg == NULL || p_reg->p_picture == NULL || value == NULL ||
+        abs_x < 0 || abs_y < 0 ||
+        abs_x >= p_reg->fmt.i_width ||
+        abs_y >= p_reg->fmt.i_height)
+        return false;
+
+    const plane_t *plane = &p_reg->p_picture->p[0];
+    const uint32_t *row =
+        (const uint32_t *)(const void *)(plane->p_pixels + plane->i_pitch * abs_y);
+    *value = row[abs_x];
+    return true;
+}
+
+static void open3dblurayFormatArgbSample(char *buf, size_t buf_size,
+                                         bool available, uint32_t value)
+{
+    if (buf_size == 0)
+        return;
+
+    if (!available)
+    {
+        snprintf(buf, buf_size, "na");
+        return;
+    }
+
+    snprintf(buf, buf_size, "0x%08" PRIx32, value);
+}
+
+static void open3dblurayTraceArgbAccessSamples(demux_t *p_demux,
+                                               const bluray_overlay_t *p_ov,
+                                               const BD_ARGB_OVERLAY *eventov,
+                                               const subpicture_region_t *p_reg)
+{
+    static unsigned trace_count = 0;
+    const char *shape = "other";
+
+    if (p_demux == NULL ||
+        !open3dblurayTraceArgbAccessEnabled(p_ov, eventov, p_reg) ||
+        trace_count >= 32)
+        return;
+
+    trace_count++;
+    shape = open3dblurayArgbShapeName(eventov);
+
+    uint32_t src00 = 0, src960 = 0, src500 = 0, src1000 = 0, src1300 = 0;
+    uint32_t dst00 = 0, dst960 = 0, dst500 = 0, dst1000 = 0, dst1300 = 0;
+    char src00_buf[16], src960_buf[16], src500_buf[16], src1000_buf[16], src1300_buf[16];
+    char dst00_buf[16], dst960_buf[16], dst500_buf[16], dst1000_buf[16], dst1300_buf[16];
+
+    open3dblurayFormatArgbSample(src00_buf, sizeof(src00_buf),
+                                 open3dblurayReadArgbOverlayPixel(eventov, 0, 0, &src00), src00);
+    open3dblurayFormatArgbSample(src960_buf, sizeof(src960_buf),
+                                 open3dblurayReadArgbOverlayPixel(eventov, 960, 540, &src960), src960);
+    open3dblurayFormatArgbSample(src500_buf, sizeof(src500_buf),
+                                 open3dblurayReadArgbOverlayPixel(eventov, 500, 920, &src500), src500);
+    open3dblurayFormatArgbSample(src1000_buf, sizeof(src1000_buf),
+                                 open3dblurayReadArgbOverlayPixel(eventov, 1000, 920, &src1000), src1000);
+    open3dblurayFormatArgbSample(src1300_buf, sizeof(src1300_buf),
+                                 open3dblurayReadArgbOverlayPixel(eventov, 1300, 920, &src1300), src1300);
+
+    open3dblurayFormatArgbSample(dst00_buf, sizeof(dst00_buf),
+                                 open3dblurayReadArgbRegionPixel(p_reg, 0, 0, &dst00), dst00);
+    open3dblurayFormatArgbSample(dst960_buf, sizeof(dst960_buf),
+                                 open3dblurayReadArgbRegionPixel(p_reg, 960, 540, &dst960), dst960);
+    open3dblurayFormatArgbSample(dst500_buf, sizeof(dst500_buf),
+                                 open3dblurayReadArgbRegionPixel(p_reg, 500, 920, &dst500), dst500);
+    open3dblurayFormatArgbSample(dst1000_buf, sizeof(dst1000_buf),
+                                 open3dblurayReadArgbRegionPixel(p_reg, 1000, 920, &dst1000), dst1000);
+    open3dblurayFormatArgbSample(dst1300_buf, sizeof(dst1300_buf),
+                                 open3dblurayReadArgbRegionPixel(p_reg, 1300, 920, &dst1300), dst1300);
+
+    fprintf(stderr,
+            "open3dbluray raw argb-access count=%u shape=%s ov_plane=%u event_plane=%u "
+            "ov_size=%ux%u reg_size=%ux%u rect=%d,%d-%d,%d stride=%d "
+            "src00=%s src960x540=%s src500x920=%s src1000x920=%s src1300x920=%s "
+            "dst00=%s dst960x540=%s dst500x920=%s dst1000x920=%s dst1300x920=%s\n",
+            trace_count,
+            shape,
+            (unsigned)p_ov->plane,
+            (unsigned)eventov->plane,
+            p_ov->width,
+            p_ov->height,
+            p_reg->fmt.i_width,
+            p_reg->fmt.i_height,
+            eventov->x,
+            eventov->y,
+            eventov->x + eventov->w - 1,
+            eventov->y + eventov->h - 1,
+            eventov->stride,
+            src00_buf,
+            src960_buf,
+            src500_buf,
+            src1000_buf,
+            src1300_buf,
+            dst00_buf,
+            dst960_buf,
+            dst500_buf,
+            dst1000_buf,
+            dst1300_buf);
+    fflush(stderr);
+
+    msg_Warn(p_demux,
+             "open3dbluray trace argb-access count=%u shape=%s ov_plane=%u event_plane=%u "
+             "ov_size=%ux%u reg_size=%ux%u rect=%d,%d-%d,%d stride=%d "
+             "src00=%s src960x540=%s src500x920=%s src1000x920=%s src1300x920=%s "
+             "dst00=%s dst960x540=%s dst500x920=%s dst1000x920=%s dst1300x920=%s",
+             trace_count,
+             shape,
+             (unsigned)p_ov->plane,
+             (unsigned)eventov->plane,
+             p_ov->width,
+             p_ov->height,
+             p_reg->fmt.i_width,
+             p_reg->fmt.i_height,
+             eventov->x,
+             eventov->y,
+             eventov->x + eventov->w - 1,
+             eventov->y + eventov->h - 1,
+             eventov->stride,
+             src00_buf,
+             src960_buf,
+             src500_buf,
+             src1000_buf,
+             src1300_buf,
+             dst00_buf,
+             dst960_buf,
+             dst500_buf,
+             dst1000_buf,
+             dst1300_buf);
+}
+
+static void open3dblurayTraceArgbUpdaterSamples(const bluray_overlay_t *p_ov,
+                                                const subpicture_region_t *p_src_reg,
+                                                const subpicture_region_t *p_dst_reg)
+{
+    static unsigned trace_count = 0;
+    uint32_t src00 = 0, src960 = 0, src500 = 0, src1000 = 0, src1300 = 0;
+    uint32_t dst00 = 0, dst960 = 0, dst500 = 0, dst1000 = 0, dst1300 = 0;
+    char src00_buf[16], src960_buf[16], src500_buf[16], src1000_buf[16], src1300_buf[16];
+    char dst00_buf[16], dst960_buf[16], dst500_buf[16], dst1000_buf[16], dst1300_buf[16];
+
+    if (!open3dblurayTraceInteractiveGraphicsBridgeEnabled() ||
+        p_ov == NULL || p_src_reg == NULL || p_dst_reg == NULL ||
+        p_ov->plane != BD_OVERLAY_IG ||
+        p_src_reg->p_picture == NULL ||
+        p_dst_reg->p_picture == NULL ||
+        trace_count >= 32)
+        return;
+
+    trace_count++;
+
+    open3dblurayFormatArgbSample(src00_buf, sizeof(src00_buf),
+                                 open3dblurayReadArgbRegionPixel(p_src_reg, 0, 0, &src00), src00);
+    open3dblurayFormatArgbSample(src960_buf, sizeof(src960_buf),
+                                 open3dblurayReadArgbRegionPixel(p_src_reg, 960, 540, &src960), src960);
+    open3dblurayFormatArgbSample(src500_buf, sizeof(src500_buf),
+                                 open3dblurayReadArgbRegionPixel(p_src_reg, 500, 920, &src500), src500);
+    open3dblurayFormatArgbSample(src1000_buf, sizeof(src1000_buf),
+                                 open3dblurayReadArgbRegionPixel(p_src_reg, 1000, 920, &src1000), src1000);
+    open3dblurayFormatArgbSample(src1300_buf, sizeof(src1300_buf),
+                                 open3dblurayReadArgbRegionPixel(p_src_reg, 1300, 920, &src1300), src1300);
+
+    open3dblurayFormatArgbSample(dst00_buf, sizeof(dst00_buf),
+                                 open3dblurayReadArgbRegionPixel(p_dst_reg, 0, 0, &dst00), dst00);
+    open3dblurayFormatArgbSample(dst960_buf, sizeof(dst960_buf),
+                                 open3dblurayReadArgbRegionPixel(p_dst_reg, 960, 540, &dst960), dst960);
+    open3dblurayFormatArgbSample(dst500_buf, sizeof(dst500_buf),
+                                 open3dblurayReadArgbRegionPixel(p_dst_reg, 500, 920, &dst500), dst500);
+    open3dblurayFormatArgbSample(dst1000_buf, sizeof(dst1000_buf),
+                                 open3dblurayReadArgbRegionPixel(p_dst_reg, 1000, 920, &dst1000), dst1000);
+    open3dblurayFormatArgbSample(dst1300_buf, sizeof(dst1300_buf),
+                                 open3dblurayReadArgbRegionPixel(p_dst_reg, 1300, 920, &dst1300), dst1300);
+
+    fprintf(stderr,
+            "open3dbluray raw argb-updater count=%u plane=%u ov_size=%ux%u "
+            "src_reg=%ux%u dst_reg=%ux%u src00=%s src960x540=%s src500x920=%s "
+            "src1000x920=%s src1300x920=%s dst00=%s dst960x540=%s dst500x920=%s "
+            "dst1000x920=%s dst1300x920=%s\n",
+            trace_count,
+            (unsigned)p_ov->plane,
+            p_ov->width,
+            p_ov->height,
+            p_src_reg->fmt.i_width,
+            p_src_reg->fmt.i_height,
+            p_dst_reg->fmt.i_width,
+            p_dst_reg->fmt.i_height,
+            src00_buf,
+            src960_buf,
+            src500_buf,
+            src1000_buf,
+            src1300_buf,
+            dst00_buf,
+            dst960_buf,
+            dst500_buf,
+            dst1000_buf,
+            dst1300_buf);
+    fflush(stderr);
+}
+
 static void open3dblurayTracePgsBlock(demux_t *p_demux,
                                       int i_pid,
                                       const block_t *p_block)
@@ -623,6 +1513,232 @@ static void open3dblurayTracePgsBlock(demux_t *p_demux,
              p_block->i_dts,
              p_block->i_flags,
              hexbuf);
+}
+
+static const char *open3dblurayPgsSegmentName(uint8_t i_segment_type)
+{
+    switch (i_segment_type) {
+    case 0x14: return "PDS";
+    case 0x15: return "ODS";
+    case 0x16: return "PCS";
+    case 0x17: return "WDS";
+    case 0x80: return "END";
+    default:   return "unknown";
+    }
+}
+
+static void open3dblurayTraceSpuSend(demux_t *p_demux,
+                                     int i_selected_pid,
+                                     const es_pair_t *p_pair,
+                                     const block_t *p_block,
+                                     const char *psz_route)
+{
+    static unsigned s_trace_count = 0;
+    int i_real_pid = -1;
+    const bool b_forced_alias =
+        p_pair != NULL && open3dblurayDecodeForcedSubtitleEsId(p_pair->fmt.i_id, &i_real_pid);
+    const uint8_t i_segment_type =
+        (p_block != NULL && p_block->p_buffer != NULL && p_block->i_buffer > 0)
+            ? p_block->p_buffer[0] : 0xff;
+
+    if (!open3dblurayTraceSpuSendEnabled() ||
+        p_demux == NULL || p_pair == NULL || p_block == NULL ||
+        p_pair->fmt.i_cat != SPU_ES)
+        return;
+
+    if (!b_forced_alias)
+        i_real_pid = p_pair->fmt.i_id;
+
+    if (i_selected_pid > 0 && i_real_pid != i_selected_pid)
+        return;
+
+    if (s_trace_count >= 64)
+        return;
+    s_trace_count++;
+
+    msg_Info(p_demux,
+             "%s trace_spu_send route=%s es_id=0x%08x pid=0x%04x forced_alias=%d selected_pid=0x%04x bytes=%zu pts=%" PRId64 " dts=%" PRId64 " flags=0x%x seg=%s(0x%02x)",
+             OPEN3DBLURAY_LOG_PREFIX,
+             psz_route != NULL ? psz_route : "unknown",
+             p_pair->fmt.i_id,
+             i_real_pid,
+             b_forced_alias ? 1 : 0,
+             i_selected_pid,
+             p_block->i_buffer,
+             p_block->i_pts,
+             p_block->i_dts,
+             p_block->i_flags,
+             open3dblurayPgsSegmentName(i_segment_type),
+             i_segment_type);
+}
+
+static unsigned open3dblurayCountTsSyncHits(const uint8_t *p_buf,
+                                            size_t i_size,
+                                            size_t i_stride,
+                                            size_t i_sync,
+                                            unsigned i_limit)
+{
+    unsigned i_hits = 0;
+    size_t i_pos = i_sync;
+
+    if (p_buf == NULL || i_stride == 0 || i_sync >= i_size)
+        return 0;
+
+    while (i_pos < i_size && i_hits < i_limit) {
+        if (p_buf[i_pos] != 0x47)
+            break;
+        ++i_hits;
+        if (i_size - i_pos <= i_stride)
+            break;
+        i_pos += i_stride;
+    }
+
+    return i_hits;
+}
+
+static bool open3dblurayTraceSubtitleSourceEnabled(void)
+{
+    const char *env = getenv("OPEN3D_TRACE_BLURAY_SUBTITLE_SOURCE");
+    return env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+}
+
+static void open3dblurayTraceSubtitleSourceBlock(demux_t *p_demux,
+                                                 const uint8_t *p_buf,
+                                                 size_t i_size)
+{
+    enum { OPEN3D_SUBTITLE_SOURCE_TRACE_MAX_BLOCKS = 1536 };
+    static unsigned s_trace_blocks = 0;
+    static unsigned s_first_hit_block = 0;
+    static unsigned s_total_seen[5] = {0};
+    static unsigned s_total_payload1[5] = {0};
+    static unsigned s_total_payload1_unitstart1[5] = {0};
+    static unsigned s_total_payload0[5] = {0};
+    int first47[4] = {-1, -1, -1, -1};
+    size_t i_scan = 0;
+    unsigned cand188_0 = 0;
+    unsigned cand188_4 = 0;
+    unsigned cand192_0 = 0;
+    unsigned cand192_4 = 0;
+    size_t i_stride = 0;
+    size_t i_sync = 0;
+    unsigned i_hits = 0;
+    unsigned i_packets = 0;
+    unsigned seen[5] = {0};
+    unsigned payload1[5] = {0};
+    unsigned payload1_unitstart1[5] = {0};
+    unsigned payload0[5] = {0};
+    bool b_any_cluster = false;
+
+    if (!open3dblurayTraceSubtitleSourceEnabled() ||
+        p_buf == NULL || i_size < 188 ||
+        s_trace_blocks >= OPEN3D_SUBTITLE_SOURCE_TRACE_MAX_BLOCKS)
+        return;
+
+    s_trace_blocks++;
+
+    i_scan = i_size < 512 ? i_size : 512;
+    for (size_t i = 0, j = 0; i < i_scan && j < 4; ++i) {
+        if (p_buf[i] == 0x47)
+            first47[j++] = (int)i;
+    }
+
+    cand188_0 = open3dblurayCountTsSyncHits(p_buf, i_size, 188, 0, 16);
+    cand188_4 = open3dblurayCountTsSyncHits(p_buf, i_size, 188, 4, 16);
+    cand192_0 = open3dblurayCountTsSyncHits(p_buf, i_size, 192, 0, 16);
+    cand192_4 = open3dblurayCountTsSyncHits(p_buf, i_size, 192, 4, 16);
+
+    if (cand188_0 > i_hits) {
+        i_stride = 188;
+        i_sync = 0;
+        i_hits = cand188_0;
+    }
+    if (cand188_4 > i_hits) {
+        i_stride = 188;
+        i_sync = 4;
+        i_hits = cand188_4;
+    }
+    if (cand192_0 > i_hits) {
+        i_stride = 192;
+        i_sync = 0;
+        i_hits = cand192_0;
+    }
+    if (cand192_4 > i_hits) {
+        i_stride = 192;
+        i_sync = 4;
+        i_hits = cand192_4;
+    }
+
+    if (i_hits > 0 && i_stride > 0 && i_sync < i_size) {
+        i_packets = (unsigned)((i_size - i_sync) / i_stride);
+        for (unsigned i = 0; i < i_packets; ++i) {
+            const uint8_t *p_ts = p_buf + i * i_stride + i_sync;
+            unsigned idx;
+            int i_pid;
+            bool b_payload;
+            bool b_unit_start;
+
+            if (p_ts + 4 > p_buf + i_size || p_ts[0] != 0x47)
+                continue;
+
+            i_pid = ((p_ts[1] & 0x1f) << 8) | p_ts[2];
+            if (i_pid < 4608 || i_pid > 4612)
+                continue;
+
+            idx = (unsigned)(i_pid - 4608);
+            b_payload = (p_ts[3] & 0x10) != 0;
+            b_unit_start = (p_ts[1] & 0x40) != 0;
+
+            seen[idx]++;
+            b_any_cluster = true;
+            if (b_payload) {
+                payload1[idx]++;
+                if (b_unit_start)
+                    payload1_unitstart1[idx]++;
+            } else {
+                payload0[idx]++;
+            }
+        }
+    }
+
+    for (unsigned i = 0; i < 5; ++i) {
+        s_total_seen[i] += seen[i];
+        s_total_payload1[i] += payload1[i];
+        s_total_payload1_unitstart1[i] += payload1_unitstart1[i];
+        s_total_payload0[i] += payload0[i];
+    }
+
+    if (b_any_cluster && s_first_hit_block == 0)
+        s_first_hit_block = s_trace_blocks;
+
+    if (s_trace_blocks == 1) {
+        msg_Dbg(p_demux,
+                "TRACE subtitleSourceBlockSig block=%u bytes=%zu first47=%d,%d,%d,%d cand188_0=%u cand188_4=%u cand192_0=%u cand192_4=%u chosen=%zu@%zu hits=%u packets=%u pid4608=%u/%u/%u/%u pid4609=%u/%u/%u/%u pid4610=%u/%u/%u/%u pid4611=%u/%u/%u/%u pid4612=%u/%u/%u/%u",
+                s_trace_blocks,
+                i_size,
+                first47[0], first47[1], first47[2], first47[3],
+                cand188_0, cand188_4, cand192_0, cand192_4,
+                i_stride, i_sync,
+                i_hits, i_packets,
+                seen[0], payload1[0], payload1_unitstart1[0], payload0[0],
+                seen[1], payload1[1], payload1_unitstart1[1], payload0[1],
+                seen[2], payload1[2], payload1_unitstart1[2], payload0[2],
+                seen[3], payload1[3], payload1_unitstart1[3], payload0[3],
+                seen[4], payload1[4], payload1_unitstart1[4], payload0[4]);
+    }
+
+    if ((s_trace_blocks % 256) == 0 || b_any_cluster ||
+        s_trace_blocks == OPEN3D_SUBTITLE_SOURCE_TRACE_MAX_BLOCKS) {
+        msg_Dbg(p_demux,
+                "TRACE subtitleSourceWindow blocks=%u first_hit_block=%u last_bytes=%zu last_chosen=%zu@%zu last_hits=%u last_packets=%u pid4608=%u/%u/%u/%u pid4609=%u/%u/%u/%u pid4610=%u/%u/%u/%u pid4611=%u/%u/%u/%u pid4612=%u/%u/%u/%u",
+                s_trace_blocks,
+                s_first_hit_block,
+                i_size, i_stride, i_sync, i_hits, i_packets,
+                s_total_seen[0], s_total_payload1[0], s_total_payload1_unitstart1[0], s_total_payload0[0],
+                s_total_seen[1], s_total_payload1[1], s_total_payload1_unitstart1[1], s_total_payload0[1],
+                s_total_seen[2], s_total_payload1[2], s_total_payload1_unitstart1[2], s_total_payload0[2],
+                s_total_seen[3], s_total_payload1[3], s_total_payload1_unitstart1[3], s_total_payload0[3],
+                s_total_seen[4], s_total_payload1[4], s_total_payload1_unitstart1[4], s_total_payload0[4]);
+    }
 }
 
 static es_pair_t *getUnusedEsPair(vlc_array_t *p_array)
@@ -892,12 +2008,119 @@ static void FindMountPoint(char **file)
 #endif
 }
 
+static char *open3dblurayResolveLocalPathCaseFallback(demux_t *p_demux,
+                                                      const char *psz_path)
+{
+    struct stat st;
+
+    if (psz_path == NULL)
+        return NULL;
+
+    if (vlc_stat(psz_path, &st) == 0)
+        return strdup(psz_path);
+
+    char *psz_path_dup = strdup(psz_path);
+    if (psz_path_dup == NULL)
+        return NULL;
+
+    char *psz_base = strrchr(psz_path_dup, '/');
+    char *psz_dir = psz_path_dup;
+    if (psz_base != NULL) {
+        *psz_base++ = '\0';
+        if (*psz_dir == '\0')
+            psz_dir = "/";
+    } else {
+        psz_base = psz_path_dup;
+        psz_dir = ".";
+    }
+
+    if (*psz_base == '\0') {
+        free(psz_path_dup);
+        return NULL;
+    }
+
+    DIR *p_dir = vlc_opendir(psz_dir);
+    if (p_dir == NULL) {
+        free(psz_path_dup);
+        return NULL;
+    }
+
+    char *psz_match_path = NULL;
+    unsigned i_matches = 0;
+    const char *psz_entry;
+
+    while ((psz_entry = vlc_readdir(p_dir)) != NULL) {
+        if (strcmp(psz_entry, psz_base) == 0)
+            continue;
+        if (strcasecmp(psz_entry, psz_base) != 0)
+            continue;
+
+        char *psz_candidate = NULL;
+        if (!strcmp(psz_dir, "/")) {
+            if (asprintf(&psz_candidate, "/%s", psz_entry) < 0)
+                psz_candidate = NULL;
+        } else if (asprintf(&psz_candidate, "%s/%s", psz_dir, psz_entry) < 0) {
+            psz_candidate = NULL;
+        }
+
+        if (psz_candidate == NULL)
+            continue;
+
+        if (vlc_stat(psz_candidate, &st) == 0 &&
+            (S_ISREG(st.st_mode) || S_ISBLK(st.st_mode))) {
+            i_matches++;
+            if (i_matches == 1) {
+                psz_match_path = psz_candidate;
+                continue;
+            }
+        }
+
+        free(psz_candidate);
+    }
+
+    closedir(p_dir);
+    free(psz_path_dup);
+
+    if (i_matches == 1) {
+        msg_Warn(p_demux,
+                 "%s resolved case-mismatched local path requested=%s resolved=%s",
+                 OPEN3DBLURAY_LOG_PREFIX, psz_path, psz_match_path);
+        return psz_match_path;
+    }
+
+    if (i_matches > 1) {
+        msg_Warn(p_demux,
+                 "%s ambiguous case-mismatched local path requested=%s matches=%u",
+                 OPEN3DBLURAY_LOG_PREFIX, psz_path, i_matches);
+    }
+
+    free(psz_match_path);
+    return NULL;
+}
+
 static void blurayReleaseVout(demux_t *p_demux)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
 
     if (p_sys->p_vout != NULL) {
+        if (var_Type(VLC_OBJECT(p_sys->p_vout), OPEN3D_BLURAY_MENU_OPEN_VAR) == 0)
+            var_Create(VLC_OBJECT(p_sys->p_vout), OPEN3D_BLURAY_MENU_OPEN_VAR, VLC_VAR_BOOL);
+        var_SetBool(VLC_OBJECT(p_sys->p_vout), OPEN3D_BLURAY_MENU_OPEN_VAR, false);
+        if (var_Type(VLC_OBJECT(p_sys->p_vout), OPEN3D_BLURAY_FORCE_MONO_MENU_VAR) == 0)
+            var_Create(VLC_OBJECT(p_sys->p_vout), OPEN3D_BLURAY_FORCE_MONO_MENU_VAR,
+                       VLC_VAR_BOOL);
+        var_SetBool(VLC_OBJECT(p_sys->p_vout), OPEN3D_BLURAY_FORCE_MONO_MENU_VAR, false);
+        /*
+         * The bridge objects outlive any individual vout instance. Clear the
+         * wake target before detaching from the old vout so later overlay
+         * updates cannot signal a destroyed prepare condition.
+         */
+        Open3DDirectBridgeNotifyAttachToObject(VLC_OBJECT(p_sys->p_vout), NULL, NULL);
+        Open3DSubtitleBridgeSetNotifyCond(&p_sys->subtitle_bridge, NULL, NULL);
+        Open3DInteractiveGraphicsBridgeSetNotifyCond(&p_sys->interactive_graphics_bridge,
+                                                     NULL, NULL);
         Open3DSubtitleBridgeDetachFromObject(VLC_OBJECT(p_sys->p_vout));
+        Open3DInteractiveGraphicsBridgeDetachFromObject(VLC_OBJECT(p_sys->p_vout));
         var_DelCallback(p_sys->p_vout, "mouse-moved", onMouseEvent, p_demux);
         var_DelCallback(p_sys->p_vout, "mouse-clicked", onMouseEvent, p_demux);
 
@@ -925,30 +2148,460 @@ static void blurayReleaseVout(demux_t *p_demux)
     }
 }
 
-static void open3dblurayEnsureVout(demux_t *p_demux)
+static void blurayClearOverlay(demux_t *p_demux, int plane);
+static bool open3dblurayStillImageActive(demux_t *p_demux);
+
+static bool open3dblurayInteractiveGraphicsOverlayHasRegions(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux != NULL ? p_demux->p_sys : NULL;
+
+    if (p_sys == NULL)
+        return false;
+
+    bool has_regions = false;
+    vlc_mutex_lock(&p_sys->bdj_overlay_lock);
+    bluray_overlay_t *ov = p_sys->p_overlays[BD_OVERLAY_IG];
+    if (ov != NULL)
+    {
+        vlc_mutex_lock(&ov->lock);
+        has_regions = ov->p_regions != NULL;
+        vlc_mutex_unlock(&ov->lock);
+    }
+    vlc_mutex_unlock(&p_sys->bdj_overlay_lock);
+    return has_regions;
+}
+
+static bool open3dblurayInteractiveGraphicsOverlayPresent(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux != NULL ? p_demux->p_sys : NULL;
+
+    if (p_sys == NULL)
+        return false;
+
+    bool present = false;
+    vlc_mutex_lock(&p_sys->bdj_overlay_lock);
+    bluray_overlay_t *ov = p_sys->p_overlays[BD_OVERLAY_IG];
+    if (ov != NULL)
+    {
+        vlc_mutex_lock(&ov->lock);
+        present = ov->width > 0 && ov->height > 0;
+        vlc_mutex_unlock(&ov->lock);
+    }
+    vlc_mutex_unlock(&p_sys->bdj_overlay_lock);
+    return present;
+}
+
+static bool open3dblurayShouldPreserveMenuStateOnPlaylistTransition(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux != NULL ? p_demux->p_sys : NULL;
+
+    if (p_sys == NULL || !p_sys->b_menu_open)
+        return false;
+
+    if (open3dblurayStillImageActive(p_demux))
+        return true;
+
+    if (open3dblurayInteractiveGraphicsOverlayHasRegions(p_demux))
+        return true;
+
+    if (open3dblurayInteractiveGraphicsOverlayPresent(p_demux))
+        return true;
+
+    return false;
+}
+
+static void open3dblurayPublishMenuOpenState(demux_t *p_demux)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
 
-    if (p_sys->p_vout != NULL)
-        return;
-
-    p_sys->p_vout = input_GetVout(p_demux->p_input);
+    if (p_demux->p_input != NULL) {
+        if (var_Type(p_demux->p_input, OPEN3D_BLURAY_MENU_OPEN_VAR) == 0)
+            var_Create(p_demux->p_input, OPEN3D_BLURAY_MENU_OPEN_VAR, VLC_VAR_BOOL);
+        var_SetBool(p_demux->p_input, OPEN3D_BLURAY_MENU_OPEN_VAR, p_sys->b_menu_open);
+    }
     if (p_sys->p_vout != NULL) {
-        var_AddCallback(p_sys->p_vout, "mouse-moved", onMouseEvent, p_demux);
-        var_AddCallback(p_sys->p_vout, "mouse-clicked", onMouseEvent, p_demux);
+        if (var_Type(VLC_OBJECT(p_sys->p_vout), OPEN3D_BLURAY_MENU_OPEN_VAR) == 0)
+            var_Create(VLC_OBJECT(p_sys->p_vout), OPEN3D_BLURAY_MENU_OPEN_VAR,
+                       VLC_VAR_BOOL);
+        var_SetBool(VLC_OBJECT(p_sys->p_vout), OPEN3D_BLURAY_MENU_OPEN_VAR,
+                    p_sys->b_menu_open);
     }
 }
 
-static void open3dblurayAttachSubtitleBridgeToVout(demux_t *p_demux)
+static bool open3dblurayForceMonoMenuActive(const demux_sys_t *p_sys)
+{
+#if OPEN3DBLURAY_ENABLE_MVC
+    /* Mono menu fallback must be the default menu-open policy for Objective B,
+     * not just a side effect of the stock-base MVC handoff. Some BD-J menus can
+     * open without ever toggling the synthetic mvc1 <-> stock-base switch, and
+     * those runs were therefore staying on the packed-stereo presenter lane
+     * (`mono_menu=0`) even in the nominal 2D menu mode. Treat any active
+     * menu-open lane as mono-menu eligible; ONE_PLANE and TWO_PLANES remain
+     * bounded exceptions on the vout side and only keep stereo when the live IG
+     * bridge advertises a matching payload. */
+    return p_sys != NULL &&
+           (p_sys->b_mvc_base_fallback_selected || p_sys->b_menu_open);
+#else
+    VLC_UNUSED(p_sys);
+    return false;
+#endif
+}
+
+static void open3dblurayPublishForceMonoMenuState(demux_t *p_demux)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
+    const bool b_force_mono = open3dblurayForceMonoMenuActive(p_sys);
+
+    if (p_demux->p_input != NULL) {
+        if (var_Type(p_demux->p_input, OPEN3D_BLURAY_FORCE_MONO_MENU_VAR) == 0)
+            var_Create(p_demux->p_input, OPEN3D_BLURAY_FORCE_MONO_MENU_VAR, VLC_VAR_BOOL);
+        var_SetBool(p_demux->p_input, OPEN3D_BLURAY_FORCE_MONO_MENU_VAR, b_force_mono);
+    }
+    if (p_sys->p_vout != NULL) {
+        if (var_Type(VLC_OBJECT(p_sys->p_vout), OPEN3D_BLURAY_FORCE_MONO_MENU_VAR) == 0)
+            var_Create(VLC_OBJECT(p_sys->p_vout), OPEN3D_BLURAY_FORCE_MONO_MENU_VAR,
+                       VLC_VAR_BOOL);
+        var_SetBool(VLC_OBJECT(p_sys->p_vout), OPEN3D_BLURAY_FORCE_MONO_MENU_VAR,
+                    b_force_mono);
+    }
+}
+
+static const char *open3dblurayInteractiveGraphicsS3DModeName(int mode)
+{
+    switch (mode)
+    {
+        case BLURAY_IG_S3D_MODE_TWOD_OUTPUT:
+            return "TWOD_OUTPUT";
+        case BLURAY_IG_S3D_MODE_ONE_PLANE:
+            return "ONE_PLANE";
+        case BLURAY_IG_S3D_MODE_TWO_PLANES:
+            return "TWO_PLANES";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static bool open3dblurayParseForcedInteractiveGraphicsS3DMode(int *mode_out)
+{
+    const char *env = getenv("OPEN3DBLURAY_FORCE_IG_S3D_MODE");
+    char *end = NULL;
+    long parsed = 0;
+
+    if (mode_out != NULL)
+        *mode_out = 0;
+    if (env == NULL || *env == '\0')
+        return false;
+
+    if (strcasecmp(env, "TWOD_OUTPUT") == 0 || strcmp(env, "1") == 0)
+        parsed = BLURAY_IG_S3D_MODE_TWOD_OUTPUT;
+    else if (strcasecmp(env, "ONE_PLANE") == 0 || strcmp(env, "2") == 0)
+        parsed = BLURAY_IG_S3D_MODE_ONE_PLANE;
+    else if (strcasecmp(env, "TWO_PLANES") == 0 || strcmp(env, "3") == 0)
+        parsed = BLURAY_IG_S3D_MODE_TWO_PLANES;
+    else
+    {
+        parsed = strtol(env, &end, 10);
+        if (end == env || *end != '\0')
+            return false;
+    }
+
+    if (parsed < BLURAY_IG_S3D_MODE_TWOD_OUTPUT ||
+        parsed > BLURAY_IG_S3D_MODE_TWO_PLANES)
+        return false;
+
+    if (mode_out != NULL)
+        *mode_out = (int)parsed;
+    return true;
+}
+
+static bool open3dblurayParseForcedInteractiveGraphicsS3DOffset(int *offset_out)
+{
+    const char *env = getenv("OPEN3DBLURAY_FORCE_IG_S3D_OFFSET");
+    char *end = NULL;
+    long parsed = 0;
+
+    if (offset_out != NULL)
+        *offset_out = 0;
+    if (env == NULL || *env == '\0')
+        return false;
+
+    parsed = strtol(env, &end, 10);
+    if (end == env || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX)
+        return false;
+
+    if (offset_out != NULL)
+        *offset_out = (int)parsed;
+    return true;
+}
+
+static void open3dblurayReadInteractiveGraphicsS3DState(
+    demux_t *p_demux, open3d_interactive_graphics_s3d_state_t *state,
+    const char *reason)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const bool trace = open3dblurayTraceInteractiveGraphicsBridgeEnabled();
+    bool forced_mode_valid = false;
+    bool forced_offset_valid = false;
+    int forced_mode = 0;
+    int forced_offset = 0;
+
+    Open3DInteractiveGraphicsStereoStateClear(state);
+    if (p_sys == NULL || p_sys->bluray == NULL || state == NULL)
+        return;
+
+    BLURAY_IG_S3D_STATE bluray_state;
+    if (bd_get_ig_s3d_state(p_sys->bluray, &bluray_state))
+    {
+        state->mode_valid = bluray_state.mode_valid != 0;
+        state->mode = bluray_state.mode;
+        state->offset_valid = bluray_state.offset_valid != 0;
+        state->offset = bluray_state.offset;
+        state->epoch = bluray_state.epoch;
+    }
+
+    forced_mode_valid = open3dblurayParseForcedInteractiveGraphicsS3DMode(&forced_mode);
+    forced_offset_valid = open3dblurayParseForcedInteractiveGraphicsS3DOffset(&forced_offset);
+    if (forced_mode_valid)
+    {
+        state->mode_valid = true;
+        state->mode = forced_mode;
+    }
+    if (forced_offset_valid)
+    {
+        state->offset_valid = true;
+        state->offset = forced_offset;
+    }
+
+    if (trace)
+    {
+        if (forced_mode_valid || forced_offset_valid)
+            msg_Dbg(p_demux,
+                    "open3dbluray trace ig-s3d override reason=%s mode_valid=%d mode=%d(%s) offset_valid=%d offset=%d",
+                    reason != NULL ? reason : "unspecified",
+                    forced_mode_valid ? 1 : 0,
+                    forced_mode_valid ? forced_mode : state->mode,
+                    open3dblurayInteractiveGraphicsS3DModeName(forced_mode_valid ? forced_mode
+                                                                                 : state->mode),
+                    forced_offset_valid ? 1 : 0,
+                    forced_offset_valid ? forced_offset : state->offset);
+        msg_Dbg(p_demux,
+                "open3dbluray trace ig-s3d read reason=%s epoch=%" PRIu64 " mode_valid=%d mode=%d(%s) offset_valid=%d offset=%d",
+                reason != NULL ? reason : "unspecified",
+                state->epoch,
+                state->mode_valid ? 1 : 0,
+                state->mode,
+                open3dblurayInteractiveGraphicsS3DModeName(state->mode),
+                state->offset_valid ? 1 : 0,
+                state->offset);
+    }
+}
+
+static void open3dblurayRefreshInteractiveGraphicsS3DBridgeState(
+    demux_t *p_demux, const char *reason)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    open3d_interactive_graphics_s3d_state_t state;
+
+    if (p_sys == NULL)
+        return;
+
+    open3dblurayReadInteractiveGraphicsS3DState(p_demux, &state, reason);
+    Open3DInteractiveGraphicsBridgeSetStereoState(
+        &p_sys->interactive_graphics_bridge, &state);
+}
+
+static void open3dblurayPublishPopupAvailableState(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    if (p_demux->p_input != NULL) {
+        if (var_Type(p_demux->p_input, "menu-popup-available") == 0)
+            var_Create(p_demux->p_input, "menu-popup-available", VLC_VAR_BOOL);
+        var_SetBool(p_demux->p_input, "menu-popup-available",
+                    p_sys->b_popup_available);
+    }
+}
+
+static void open3dblurayClearActiveMenuState(demux_t *p_demux, const char *reason)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const bool had_menu_open = p_sys->b_menu_open;
+    const bool had_popup_available = p_sys->b_popup_available;
+
+    if (!had_menu_open && !had_popup_available)
+        return;
+
+    p_sys->b_menu_open = false;
+    p_sys->b_popup_available = false;
+    open3dblurayPublishMenuOpenState(p_demux);
+    open3dblurayPublishForceMonoMenuState(p_demux);
+    open3dblurayPublishPopupAvailableState(p_demux);
+
+    if (p_sys->p_overlays[BD_OVERLAY_IG] != NULL)
+        blurayClearOverlay(p_demux, BD_OVERLAY_IG);
+    else
+        Open3DInteractiveGraphicsBridgeClear(&p_sys->interactive_graphics_bridge);
+    Open3DInteractiveGraphicsBridgeSetStereoState(&p_sys->interactive_graphics_bridge,
+                                                  NULL);
+
+    msg_Info(p_demux,
+             "menu_state event=feature-playback-clear reason=%s before_open=%d before_popup=%d",
+             reason != NULL ? reason : "unspecified",
+             had_menu_open ? 1 : 0,
+             had_popup_available ? 1 : 0);
+}
+
+static void open3dblurayRefreshTrackedVoutState(demux_t *p_demux,
+                                                const char *reason)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const bool trace = open3dblurayTraceInteractiveGraphicsBridgeEnabled();
+
+    if (p_sys->p_vout == NULL)
+        return;
+
+    /*
+     * Replacement/reused vouts can retain the display-side "bridge disabled"
+     * bit from the previous instance's Close() path. Object-tree lookups stop
+     * at the first enable var they encounter, so a stale false on the vout
+     * masks the input-level true bit and makes menu-open IG fall back to the
+     * non-direct lane even though the bridge object itself was reattached.
+     */
+    Open3DSubtitleBridgeSetEnabledOnObject(VLC_OBJECT(p_sys->p_vout), true);
+    Open3DInteractiveGraphicsBridgeSetEnabledOnObject(
+        VLC_OBJECT(p_sys->p_vout), true);
+    open3dblurayPublishMenuOpenState(p_demux);
+    open3dblurayPublishForceMonoMenuState(p_demux);
+    open3dblurayRefreshInteractiveGraphicsS3DBridgeState(
+        p_demux, reason != NULL ? reason : "vout-refresh");
+    if (trace)
+        msg_Dbg(p_demux,
+                "open3dbluray trace ig-bridge vout-refresh reason=%s vout=%p",
+                reason != NULL ? reason : "unspecified",
+                (void *)p_sys->p_vout);
+}
+
+static void open3dblurayAdoptAcquiredVout(demux_t *p_demux,
+                                          vout_thread_t *current_vout,
+                                          const char *reason)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const bool trace = open3dblurayTraceInteractiveGraphicsBridgeEnabled();
+
+    if (current_vout == NULL)
+        return;
+
+    if (p_sys->p_vout == current_vout)
+    {
+        open3dblurayRefreshTrackedVoutState(
+            p_demux, reason != NULL ? reason : "vout-acquire");
+        vlc_object_release(current_vout);
+        return;
+    }
+
+    if (p_sys->p_vout != NULL)
+    {
+        if (trace)
+            msg_Dbg(p_demux,
+                    "open3dbluray trace ig-bridge vout-rebind reason=%s old=%p new=%p",
+                    reason != NULL ? reason : "unspecified",
+                    (void *)p_sys->p_vout,
+                    (void *)current_vout);
+        blurayReleaseVout(p_demux);
+    }
+
+    p_sys->p_vout = current_vout;
+    open3dblurayRefreshTrackedVoutState(
+        p_demux, reason != NULL ? reason : "vout-acquire");
+    if (trace)
+        msg_Dbg(p_demux,
+                "open3dbluray trace ig-bridge vout-acquire reason=%s vout=%p",
+                reason != NULL ? reason : "unspecified",
+                (void *)p_sys->p_vout);
+    var_AddCallback(p_sys->p_vout, "mouse-moved", onMouseEvent, p_demux);
+    var_AddCallback(p_sys->p_vout, "mouse-clicked", onMouseEvent, p_demux);
+}
+
+static void open3dblurayEnsureVout(demux_t *p_demux)
+{
+    vout_thread_t *current_vout = input_GetVout(p_demux->p_input);
+
+    open3dblurayAdoptAcquiredVout(p_demux, current_vout, "vout-acquire");
+}
+
+static void open3dblurayAttachDirectBridgesToInput(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    vlc_object_t *input_obj = VLC_OBJECT(p_demux->p_input);
+
+    if (input_obj == NULL)
+        return;
+
+    Open3DSubtitleBridgeAttachToObject(input_obj, &p_sys->subtitle_bridge);
+    Open3DInteractiveGraphicsBridgeAttachToObject(
+        input_obj, &p_sys->interactive_graphics_bridge);
+    Open3DSubtitleBridgeSetEnabledOnObject(input_obj, true);
+    Open3DInteractiveGraphicsBridgeSetEnabledOnObject(input_obj, true);
+}
+
+static void open3dblurayAttachDirectBridgesToVout(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const bool trace = open3dblurayTraceInteractiveGraphicsBridgeEnabled();
+    open3d_interactive_graphics_bridge_t *ig_root_before = NULL;
+    open3d_interactive_graphics_bridge_t *ig_root_after = NULL;
+    vlc_object_t *input_obj = VLC_OBJECT(p_demux->p_input);
+
+    open3dblurayAttachDirectBridgesToInput(p_demux);
+    if (input_obj != NULL)
+        ig_root_before = Open3DInteractiveGraphicsBridgeGetFromObject(input_obj);
 
     open3dblurayEnsureVout(p_demux);
     if (p_sys->p_vout == NULL)
         return;
 
+    open3d_interactive_graphics_bridge_t *ig_before =
+        Open3DInteractiveGraphicsBridgeGetFromObject(VLC_OBJECT(p_sys->p_vout));
+    const bool ig_enabled_before =
+        Open3DInteractiveGraphicsBridgeGetEnabledFromObject(VLC_OBJECT(p_sys->p_vout));
+
     Open3DSubtitleBridgeAttachToObject(VLC_OBJECT(p_sys->p_vout),
                                        &p_sys->subtitle_bridge);
+    Open3DInteractiveGraphicsBridgeAttachToObject(VLC_OBJECT(p_sys->p_vout),
+                                                  &p_sys->interactive_graphics_bridge);
+    Open3DSubtitleBridgeSetEnabledOnObject(VLC_OBJECT(p_sys->p_vout), true);
+    Open3DInteractiveGraphicsBridgeSetEnabledOnObject(
+        VLC_OBJECT(p_sys->p_vout), true);
+    Open3DSubtitleBridgeSetNotifyCond(&p_sys->subtitle_bridge,
+                                      Open3DDirectBridgeNotifyCondFromObject(
+                                          VLC_OBJECT(p_sys->p_vout)),
+                                      Open3DDirectBridgeNotifyPendingFromObject(
+                                          VLC_OBJECT(p_sys->p_vout)));
+    Open3DInteractiveGraphicsBridgeSetNotifyCond(
+        &p_sys->interactive_graphics_bridge,
+        Open3DDirectBridgeNotifyCondFromObject(VLC_OBJECT(p_sys->p_vout)),
+        Open3DDirectBridgeNotifyPendingFromObject(VLC_OBJECT(p_sys->p_vout)));
+    open3dblurayRefreshInteractiveGraphicsS3DBridgeState(p_demux, "bridge-attach");
+    Open3DDirectBridgeNotifyWake(VLC_OBJECT(p_sys->p_vout));
+    if (input_obj != NULL)
+        ig_root_after = Open3DInteractiveGraphicsBridgeGetFromObject(input_obj);
+    if (trace)
+    {
+        open3d_interactive_graphics_bridge_t *ig_after =
+            Open3DInteractiveGraphicsBridgeGetFromObject(VLC_OBJECT(p_sys->p_vout));
+        const bool ig_enabled_after =
+            Open3DInteractiveGraphicsBridgeGetEnabledFromObject(VLC_OBJECT(p_sys->p_vout));
+        msg_Dbg(p_demux,
+                "open3dbluray trace ig-bridge attach input=%p input_before=%p input_after=%p vout=%p before=%p enabled_before=%d after=%p enabled_after=%d",
+                (void *)p_demux->p_input,
+                (void *)ig_root_before,
+                (void *)ig_root_after,
+                (void *)p_sys->p_vout,
+                (void *)ig_before,
+                ig_enabled_before ? 1 : 0,
+                (void *)ig_after,
+                ig_enabled_after ? 1 : 0);
+    }
 }
 
 static bool open3dblurayUseDirectSubtitleBridge(demux_t *p_demux,
@@ -959,7 +2612,32 @@ static bool open3dblurayUseDirectSubtitleBridge(demux_t *p_demux,
     if (p_sys->p_vout == NULL || p_ov == NULL || p_ov->plane != BD_OVERLAY_PG)
         return false;
 
-    return Open3DSubtitleBridgeGetEnabledFromObject(VLC_OBJECT(p_sys->p_vout));
+    return Open3DSubtitleBridgeGetEnabledFromObjectTree(VLC_OBJECT(p_sys->p_vout));
+}
+
+static bool open3dblurayUseDirectInteractiveGraphicsBridge(demux_t *p_demux,
+                                                           const bluray_overlay_t *p_ov)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    if (p_sys->p_vout == NULL || p_ov == NULL || p_ov->plane != BD_OVERLAY_IG)
+        return false;
+
+    return Open3DInteractiveGraphicsBridgeGetEnabledFromObjectTree(
+        VLC_OBJECT(p_sys->p_vout));
+}
+
+static bool open3dblurayUseDirectOverlayBridge(demux_t *p_demux,
+                                               const bluray_overlay_t *p_ov)
+{
+    if (p_ov == NULL)
+        return false;
+
+    if (p_ov->plane == BD_OVERLAY_PG)
+        return open3dblurayUseDirectSubtitleBridge(p_demux, p_ov);
+    if (p_ov->plane == BD_OVERLAY_IG)
+        return open3dblurayUseDirectInteractiveGraphicsBridge(p_demux, p_ov);
+    return false;
 }
 
 static void open3dblurayDetachOverlaySubpictureFromVout(demux_t *p_demux,
@@ -1008,6 +2686,71 @@ static void open3dbluraySyncSubtitleBridgeFromOverlayLocked(demux_t *p_demux,
                                    p_ov->p_regions, pts,
                                    &depth_state) != VLC_SUCCESS)
         msg_Err(p_demux, "failed to update direct Blu-ray subtitle bridge");
+}
+
+static void open3dbluraySyncInteractiveGraphicsBridgeFromOverlayLocked(
+    demux_t *p_demux, const bluray_overlay_t *p_ov)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const bool trace = open3dblurayTraceInteractiveGraphicsBridgeEnabled();
+    open3d_interactive_graphics_s3d_state_t s3d_state;
+
+    if (p_ov == NULL || p_ov->plane != BD_OVERLAY_IG)
+    {
+        Open3DInteractiveGraphicsBridgeClear(&p_sys->interactive_graphics_bridge);
+        Open3DInteractiveGraphicsBridgeSetStereoState(&p_sys->interactive_graphics_bridge,
+                                                      NULL);
+        return;
+    }
+
+    const vlc_tick_t pts = p_ov->pts90k > 0 ? FROM_SCALE(p_ov->pts90k)
+                                            : mdate();
+    const unsigned region_count = open3dblurayCountRegionChain(p_ov->p_regions);
+    open3dblurayReadInteractiveGraphicsS3DState(p_demux, &s3d_state,
+                                                "bridge-update");
+    if (Open3DInteractiveGraphicsBridgeUpdate(&p_sys->interactive_graphics_bridge,
+                                              p_ov->width, p_ov->height,
+                                              p_ov->p_regions, pts,
+                                              &s3d_state) != VLC_SUCCESS)
+    {
+        msg_Err(p_demux, "failed to update direct Blu-ray interactive graphics bridge");
+    }
+    else if (trace)
+    {
+        open3dblurayTraceIgRegionChain(p_demux, "bridge-update", p_ov,
+                                       open3dblurayUseDirectInteractiveGraphicsBridge(p_demux, p_ov),
+                                       p_sys->b_menu_open);
+        msg_Dbg(p_demux,
+                "open3dbluray trace ig-bridge update plane=%u payload=%s regions=%u size=%ux%u pts=%" PRId64 " s3d_epoch=%" PRIu64 " mode_valid=%d mode=%d(%s) offset_valid=%d offset=%d",
+                (unsigned)p_ov->plane,
+                Open3DInteractiveGraphicsPayloadKindName(OPEN3D_IG_PAYLOAD_MONO),
+                region_count,
+                p_ov->width,
+                p_ov->height,
+                pts,
+                s3d_state.epoch,
+                s3d_state.mode_valid ? 1 : 0,
+                s3d_state.mode,
+                open3dblurayInteractiveGraphicsS3DModeName(s3d_state.mode),
+                s3d_state.offset_valid ? 1 : 0,
+                s3d_state.offset);
+    }
+}
+
+static void open3dbluraySyncDirectOverlayBridgeFromOverlayLocked(demux_t *p_demux,
+                                                                 const bluray_overlay_t *p_ov)
+{
+    if (p_ov == NULL)
+        return;
+
+    open3dblurayTraceOverlayCoverage(p_demux, "bridge-update", p_ov,
+                                     open3dblurayUseDirectOverlayBridge(p_demux, p_ov),
+                                     p_demux->p_sys->b_menu_open);
+
+    if (p_ov->plane == BD_OVERLAY_PG)
+        open3dbluraySyncSubtitleBridgeFromOverlayLocked(p_demux, p_ov);
+    else if (p_ov->plane == BD_OVERLAY_IG)
+        open3dbluraySyncInteractiveGraphicsBridgeFromOverlayLocked(p_demux, p_ov);
 }
 
 static void open3dblurayPublishSubtitleOffsetToVout(demux_t *p_demux,
@@ -1069,17 +2812,44 @@ static void open3dblurayPublishSubtitleOffsetToVout(demux_t *p_demux,
 static es_out_id_t * blurayCreateBackgroundUnlocked(demux_t *p_demux)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
+    vlc_tick_t i_dummy_pts = VLC_TICK_INVALID;
+    static const unsigned i_dummy_width = 1920;
+    static const unsigned i_dummy_height = 1080;
+    static const vlc_tick_t i_dummy_frame_duration = CLOCK_FREQ / 25;
+    const size_t i_luma_size = (size_t)i_dummy_width * i_dummy_height;
+    const size_t i_chroma_size = i_luma_size / 4;
+    const size_t i_dummy_size = i_luma_size + 2 * i_chroma_size;
 
     if (p_sys->p_dummy_video)
         return p_sys->p_dummy_video;
 
     msg_Info(p_demux, "Start background");
+    if (open3dblurayTraceMenuVisualsEnabled())
+        msg_Warn(p_demux,
+                 "open3dbluray trace background-create phase=start menu=%d menu_open=%d vout=%d dummy=%d",
+                 p_sys->b_menu ? 1 : 0,
+                 p_sys->b_menu_open ? 1 : 0,
+                 p_sys->p_vout != NULL ? 1 : 0,
+                 p_sys->p_dummy_video != NULL ? 1 : 0);
 
-    /* */
+    /* Keep the fallback on a decoder path that does not depend on avcodec
+       hardware probing. A single raw I420 black frame is enough to stand up
+       a vout for menu-open IG overlays on BD-J still-image lanes when the
+       packaged runtime includes the rawvideo decoder. */
     es_format_t fmt;
     es_format_Init( &fmt, VIDEO_ES, VLC_CODEC_I420 );
+    fmt.b_packetized = true;
     video_format_Setup( &fmt.video, VLC_CODEC_I420,
-                        1920, 1080, 1920, 1080, 1, 1);
+                        i_dummy_width, i_dummy_height,
+                        i_dummy_width, i_dummy_height, 1, 1);
+    /*
+     * Keep the synthetic stream metadata aligned with the timeline we feed to
+     * the decoder. Advertising 1 fps while sending 25 fps timestamps makes the
+     * menu fallback lane much harder to reason about and can stretch failures
+     * into apparent multi-second/multi-minute stalls.
+     */
+    fmt.video.i_frame_rate = 25;
+    fmt.video.i_frame_rate_base = 1;
     fmt.i_priority = ES_PRIORITY_SELECTABLE_MIN;
     fmt.i_id = 4115; /* 4113 = main video. 4114 = MVC. 4115 = unused. */
     fmt.i_group = 1;
@@ -1091,22 +2861,47 @@ static es_out_id_t * blurayCreateBackgroundUnlocked(demux_t *p_demux)
         goto out;
     }
 
-    block_t *p_block = block_Alloc(fmt.video.i_width * fmt.video.i_height *
-                                   fmt.video.i_bits_per_pixel / 8);
+    block_t *p_block = block_Alloc(i_dummy_size);
     if (!p_block) {
         msg_Err(p_demux, "Error allocating block for background video");
+        es_out_Del(p_demux->out, p_sys->p_dummy_video);
+        p_sys->p_dummy_video = NULL;
         goto out;
     }
 
-    // XXX TODO: what would be correct timestamp ???
-    p_block->i_dts = p_block->i_pts = mdate() + CLOCK_FREQ/25;
-
-    uint8_t *p = p_block->p_buffer;
-    memset(p, 0, fmt.video.i_width * fmt.video.i_height);
-    p += fmt.video.i_width * fmt.video.i_height;
-    memset(p, 0x80, fmt.video.i_width * fmt.video.i_height / 2);
-
+    /*
+     * The dummy background frame exists only to stand up a usable vout for
+     * menu/still-image lanes. Keep it on a tiny synthetic media timeline and
+     * publish a matching PCR so rawvideo does not start against a missing,
+     * zero, or wall-clock-based reference.
+     */
+    /*
+     * Each synthetic dummy ES stands up a fresh rawvideo decoder/vout lane.
+     * Rebase that lane onto a tiny local media timeline every time we create
+     * it, instead of carrying forward an arbitrary stale tick across prior
+     * PCR resets or playlist/menu hops.
+     */
+    p_sys->i_dummy_video_next_pts = i_dummy_frame_duration;
+    p_block->i_dts = p_block->i_pts = p_sys->i_dummy_video_next_pts;
+    p_block->i_length = i_dummy_frame_duration;
+    p_block->i_flags |= BLOCK_FLAG_DISCONTINUITY | BLOCK_FLAG_TYPE_I;
+    memset(p_block->p_buffer, 0x00, i_luma_size);
+    memset(p_block->p_buffer + i_luma_size, 0x80, 2 * i_chroma_size);
+    p_block->i_buffer = i_dummy_size;
+    i_dummy_pts = p_block->i_pts;
+    es_out_SetPCR(p_demux->out, i_dummy_pts);
+    es_out_Control(p_demux->out, ES_OUT_SET_ES, p_sys->p_dummy_video);
     es_out_Send(p_demux->out, p_sys->p_dummy_video, p_block);
+    p_sys->i_dummy_video_next_pts += i_dummy_frame_duration;
+    if (open3dblurayTraceMenuVisualsEnabled())
+        msg_Warn(p_demux,
+                 "open3dbluray trace background-create phase=send es=%d size=%ux%u pts=%" PRId64 " pcr=%" PRId64 " dur=%" PRId64,
+                 p_sys->p_dummy_video != NULL ? 1 : 0,
+                 fmt.video.i_width,
+                 fmt.video.i_height,
+                 i_dummy_pts,
+                 i_dummy_pts,
+                 i_dummy_frame_duration);
 
  out:
     es_format_Clean(&fmt);
@@ -1117,14 +2912,62 @@ static void stopBackground(demux_t *p_demux)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
 
-    if (!p_sys->p_dummy_video) {
+    if (!p_sys->p_dummy_video)
         return;
-    }
 
     msg_Info(p_demux, "Stop background");
+    if (open3dblurayTraceMenuVisualsEnabled())
+        msg_Warn(p_demux,
+                 "open3dbluray trace background-create phase=stop menu=%d menu_open=%d vout=%d dummy=%d",
+                 p_sys->b_menu ? 1 : 0,
+                 p_sys->b_menu_open ? 1 : 0,
+                 p_sys->p_vout != NULL ? 1 : 0,
+                 p_sys->p_dummy_video != NULL ? 1 : 0);
 
     es_out_Del(p_demux->out, p_sys->p_dummy_video);
     p_sys->p_dummy_video = NULL;
+}
+
+static bool open3dblurayCurrentClipHasUsablePrimaryVideo(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux != NULL ? p_demux->p_sys : NULL;
+
+    if (p_sys == NULL)
+        return false;
+
+    bool b_has_video = false;
+
+    vlc_mutex_lock(&p_sys->pl_info_lock);
+    const BLURAY_CLIP_INFO *p_clip = p_sys->p_clip_info;
+    if (p_clip != NULL && p_clip->video_stream_count > 0) {
+        const BLURAY_STREAM_INFO *p_video0 = &p_clip->video_streams[0];
+        switch (p_video0->coding_type) {
+        case BLURAY_STREAM_TYPE_VIDEO_MPEG1:
+        case BLURAY_STREAM_TYPE_VIDEO_MPEG2:
+        case BLURAY_STREAM_TYPE_VIDEO_VC1:
+        case BLURAY_STREAM_TYPE_VIDEO_H264:
+        case BD_STREAM_TYPE_VIDEO_HEVC:
+            b_has_video = true;
+            break;
+        default:
+            break;
+        }
+    }
+    vlc_mutex_unlock(&p_sys->pl_info_lock);
+
+    return b_has_video;
+}
+
+static bool open3dblurayShouldHoldBackground(demux_t *p_demux)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    const bool b_clip_has_primary_video =
+        open3dblurayCurrentClipHasUsablePrimaryVideo(p_demux);
+
+    return p_sys->p_dummy_video != NULL &&
+           p_sys->b_menu_open &&
+           !b_clip_has_primary_video &&
+           (p_sys->p_vout == NULL || open3dblurayStillImageActive(p_demux));
 }
 
 #if OPEN3DBLURAY_ENABLE_MVC
@@ -1245,6 +3088,254 @@ static void open3dblurayLogMvcInfo(demux_t *p_demux, const char *phase)
              info.sync_pts);
 }
 
+static bool open3dblurayTraceMvcGateEnabled(void)
+{
+    static int s_init = 0;
+    static bool s_enabled = false;
+
+    if (!s_init) {
+        const char *psz_env = getenv("OPEN3DBLURAY_TRACE_MVC_GATE");
+        s_enabled = psz_env != NULL && psz_env[0] != '\0' && strcmp(psz_env, "0");
+        s_init = 1;
+    }
+
+    return s_enabled;
+}
+
+static void open3dblurayGetMvcTraceContext(demux_sys_t *p_sys,
+                                           unsigned *pi_playlist,
+                                           char psz_clip_id[6])
+{
+    if (pi_playlist)
+        *pi_playlist = 0;
+    if (psz_clip_id)
+        psz_clip_id[0] = '\0';
+
+    if (p_sys == NULL)
+        return;
+
+    vlc_mutex_lock(&p_sys->pl_info_lock);
+    if (pi_playlist && p_sys->p_pl_info != NULL)
+        *pi_playlist = p_sys->p_pl_info->playlist;
+    if (psz_clip_id && p_sys->p_clip_info != NULL) {
+        memcpy(psz_clip_id, p_sys->p_clip_info->clip_id, 5);
+        psz_clip_id[5] = '\0';
+    }
+    vlc_mutex_unlock(&p_sys->pl_info_lock);
+}
+
+static void open3dblurayTraceMvcGate(demux_t *p_demux,
+                                     uint16_t i_pid,
+                                     size_t i_bytes)
+{
+    demux_sys_t *p_sys;
+    BD_OPEN3D_MVC_INFO info;
+    unsigned i_playlist = 0;
+    char sz_clip_id[6];
+    uint64_t i_sig = 0;
+    int i_have = 0;
+    static unsigned s_count = 0;
+    static uint64_t s_last_sig = UINT64_MAX;
+
+    if (!open3dblurayTraceMvcGateEnabled() || p_demux == NULL)
+        return;
+
+    p_sys = p_demux->p_sys;
+    if (p_sys == NULL)
+        return;
+
+    memset(&info, 0, sizeof(info));
+    if (p_sys->bluray != NULL)
+        i_have = bd_open3d_mvc_get_info(p_sys->bluray, &info);
+    open3dblurayGetMvcTraceContext(p_sys, &i_playlist, sz_clip_id);
+
+    ++s_count;
+    i_sig |= ((uint64_t)i_playlist & 0xffffu) << 0;
+    i_sig |= ((uint64_t)(unsigned)i_have & 0xffu) << 16;
+    i_sig |= ((uint64_t)info.available & 0xffu) << 24;
+    i_sig |= ((uint64_t)(p_sys->b_menu_open ? 1u : 0u)) << 32;
+    i_sig |= ((uint64_t)(p_sys->b_mvc_seen_matched ? 1u : 0u)) << 33;
+    i_sig |= ((uint64_t)(p_sys->b_mvc_hold_unmatched_until_match ? 1u : 0u)) << 34;
+    i_sig |= ((uint64_t)(p_sys->p_mvc_video != NULL ? 1u : 0u)) << 35;
+    i_sig |= ((uint64_t)info.base_pid & 0xffffu) << 36;
+    i_sig ^= ((uint64_t)info.dependent_pid & 0xffffu) << 52;
+    for (size_t i = 0; i < 5 && sz_clip_id[0] != '\0'; ++i)
+        i_sig ^= (uint64_t)(uint8_t)sz_clip_id[i] << ((i % 4u) * 8u);
+
+    if (s_count > 8 && (s_count % 256u) != 0u && i_sig == s_last_sig)
+        return;
+
+    s_last_sig = i_sig;
+    fprintf(stderr,
+            "open3dbluray raw mvc-gate count=%u playlist=%u clip_id=%s menu_open=%d "
+            "pid=0x%04x bytes=%zu have=%d available=%u base_pid=0x%04x dep_pid=0x%04x "
+            "matched=%d hold=%d synthetic_es=%d\n",
+            s_count,
+            i_playlist,
+            sz_clip_id[0] != '\0' ? sz_clip_id : "(none)",
+            p_sys->b_menu_open ? 1 : 0,
+            i_pid,
+            i_bytes,
+            i_have,
+            info.available,
+            info.base_pid,
+            info.dependent_pid,
+            p_sys->b_mvc_seen_matched ? 1 : 0,
+            p_sys->b_mvc_hold_unmatched_until_match ? 1 : 0,
+            p_sys->p_mvc_video != NULL ? 1 : 0);
+    fflush(stderr);
+}
+
+static void open3dblurayTraceMvcUnitSend(demux_t *p_demux,
+                                         const BD_OPEN3D_MVC_UNIT *p_unit)
+{
+    demux_sys_t *p_sys;
+    BD_OPEN3D_MVC_INFO info;
+    unsigned i_playlist = 0;
+    char sz_clip_id[6];
+    uint64_t i_sig = 0;
+    int i_have = 0;
+    static unsigned s_count = 0;
+    static uint64_t s_last_sig = UINT64_MAX;
+
+    if (!open3dblurayTraceMvcGateEnabled() || p_demux == NULL || p_unit == NULL)
+        return;
+
+    p_sys = p_demux->p_sys;
+    if (p_sys == NULL)
+        return;
+
+    memset(&info, 0, sizeof(info));
+    if (p_sys->bluray != NULL)
+        i_have = bd_open3d_mvc_get_info(p_sys->bluray, &info);
+    open3dblurayGetMvcTraceContext(p_sys, &i_playlist, sz_clip_id);
+
+    ++s_count;
+    i_sig |= ((uint64_t)i_playlist & 0xffffu) << 0;
+    i_sig |= ((uint64_t)(unsigned)i_have & 0xffu) << 16;
+    i_sig |= ((uint64_t)info.available & 0xffu) << 24;
+    i_sig |= ((uint64_t)(p_sys->b_menu_open ? 1u : 0u)) << 32;
+    i_sig |= ((uint64_t)(p_unit->flags & BD_OPEN3D_MVC_UNIT_FLAG_MATCHED ? 1u : 0u)) << 33;
+    i_sig |= ((uint64_t)(p_sys->b_mvc_seen_matched ? 1u : 0u)) << 34;
+    i_sig ^= ((uint64_t)p_unit->merged_size & 0xffffffffu) << 35;
+    for (size_t i = 0; i < 5 && sz_clip_id[0] != '\0'; ++i)
+        i_sig ^= (uint64_t)(uint8_t)sz_clip_id[i] << ((i % 4u) * 8u);
+
+    if (s_count > 8 && (s_count % 128u) != 0u && i_sig == s_last_sig)
+        return;
+
+    s_last_sig = i_sig;
+    fprintf(stderr,
+            "open3dbluray raw mvc-unit count=%u playlist=%u clip_id=%s menu_open=%d "
+            "have=%d available=%u flags=0x%x matched=%d merged=%u base=%u dep=%u "
+            "base_pts=%" PRId64 " base_dts=%" PRId64 "\n",
+            s_count,
+            i_playlist,
+            sz_clip_id[0] != '\0' ? sz_clip_id : "(none)",
+            p_sys->b_menu_open ? 1 : 0,
+            i_have,
+            info.available,
+            p_unit->flags,
+            (p_unit->flags & BD_OPEN3D_MVC_UNIT_FLAG_MATCHED) ? 1 : 0,
+            p_unit->merged_size,
+            p_unit->base_size,
+            p_unit->dependent_size,
+            p_unit->base_pts,
+            p_unit->base_dts);
+    fflush(stderr);
+}
+
+static bool open3dblurayUseStockBaseFallback(demux_t *p_demux,
+                                             BD_OPEN3D_MVC_INFO *p_info)
+{
+    demux_sys_t *p_sys;
+    BD_OPEN3D_MVC_INFO info;
+    int i_have;
+
+    if (p_demux == NULL)
+        return false;
+
+    p_sys = p_demux->p_sys;
+    if (p_sys == NULL || p_sys->bluray == NULL || p_sys->p_mvc_video == NULL)
+        return false;
+
+    memset(&info, 0, sizeof(info));
+    i_have = bd_open3d_mvc_get_info(p_sys->bluray, &info);
+    if (p_info != NULL)
+        *p_info = info;
+
+    /* The synthetic mvc1 ES can exist before any matched MVC unit actually
+     * reaches the decoder. Keeping pid 0x1011 suppressed during that gap is
+     * what turns early 2D/still/preroll lanes into audio-only or black-screen
+     * playback. Stay on the stock base view until the synthetic lane has
+     * proven it can carry matched stereo content, then fall back to the older
+     * "no dependent view exists" rule for true 2D/menu clips. */
+    if (!p_sys->b_mvc_seen_matched)
+        return true;
+
+    return i_have > 0 && info.available == 0 && info.dependent_pid == 0;
+}
+
+static void open3dblurayTraceMvcSelectionChange(demux_t *p_demux,
+                                                const char *psz_mode,
+                                                const BD_OPEN3D_MVC_INFO *p_info)
+{
+    demux_sys_t *p_sys;
+    unsigned i_playlist = 0;
+    char sz_clip_id[6];
+
+    if (!open3dblurayTraceMvcGateEnabled() || p_demux == NULL || psz_mode == NULL)
+        return;
+
+    p_sys = p_demux->p_sys;
+    if (p_sys == NULL)
+        return;
+
+    open3dblurayGetMvcTraceContext(p_sys, &i_playlist, sz_clip_id);
+    fprintf(stderr,
+            "open3dbluray raw mvc-select mode=%s playlist=%u clip_id=%s menu_open=%d "
+            "available=%u dep_pid=0x%04x synthetic_es=%d matched=%d\n",
+            psz_mode,
+            i_playlist,
+            sz_clip_id[0] != '\0' ? sz_clip_id : "(none)",
+            p_sys->b_menu_open ? 1 : 0,
+            p_info != NULL ? p_info->available : 0,
+            p_info != NULL ? p_info->dependent_pid : 0,
+            p_sys->p_mvc_video != NULL ? 1 : 0,
+            p_sys->b_mvc_seen_matched ? 1 : 0);
+    fflush(stderr);
+}
+
+static void open3dblurayTraceMvcHandoff(demux_t *p_demux,
+                                        const char *psz_from,
+                                        const char *psz_to)
+{
+    demux_sys_t *p_sys;
+    unsigned i_playlist = 0;
+    char sz_clip_id[6];
+
+    if (!open3dblurayTraceMvcGateEnabled() || p_demux == NULL ||
+        psz_from == NULL || psz_to == NULL)
+        return;
+
+    p_sys = p_demux->p_sys;
+    if (p_sys == NULL)
+        return;
+
+    open3dblurayGetMvcTraceContext(p_sys, &i_playlist, sz_clip_id);
+    fprintf(stderr,
+            "open3dbluray raw mvc-handoff from=%s to=%s playlist=%u clip_id=%s "
+            "menu_open=%d stock_base=%d synthetic_es=%d\n",
+            psz_from,
+            psz_to,
+            i_playlist,
+            sz_clip_id[0] != '\0' ? sz_clip_id : "(none)",
+            p_sys->b_menu_open ? 1 : 0,
+            p_sys->b_mvc_base_fallback_selected ? 1 : 0,
+            p_sys->p_mvc_video != NULL ? 1 : 0);
+    fflush(stderr);
+}
+
 static int open3dblurayEnsureMvcEs(demux_t *p_demux)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
@@ -1271,6 +3362,7 @@ static int open3dblurayEnsureMvcEs(demux_t *p_demux)
     es_out_Control(p_sink_out, ES_OUT_SET_ES, p_sys->p_mvc_video);
     p_sys->b_mvc_first_unit = true;
     p_sys->b_mvc_seen_matched = false;
+    p_sys->b_mvc_base_fallback_selected = false;
     p_sys->b_mvc_hold_unmatched_until_match = false;
     msg_Info(p_demux, "%s created synthetic mvc1 ES group=%d via=%s",
              OPEN3DBLURAY_LOG_PREFIX,
@@ -1472,7 +3564,17 @@ static int open3dblurayDrainMvcUnits(demux_t *p_demux)
                           p_block->i_pts != VLC_TICK_INVALID ? p_block->i_pts
                                                              : p_block->i_dts);
         }
+        if (p_sys->b_mvc_base_fallback_selected) {
+            BD_OPEN3D_MVC_INFO info;
+            memset(&info, 0, sizeof(info));
+            bd_open3d_mvc_get_info(p_sys->bluray, &info);
+            es_out_Control(p_sink_out, ES_OUT_SET_ES, p_sys->p_mvc_video);
+            p_sys->b_mvc_base_fallback_selected = false;
+            open3dblurayPublishForceMonoMenuState(p_demux);
+            open3dblurayTraceMvcSelectionChange(p_demux, "synthetic", &info);
+        }
         es_out_Send(p_sink_out, p_sys->p_mvc_video, p_block);
+        open3dblurayTraceMvcUnitSend(p_demux, &unit);
         p_sys->b_mvc_next_block_discontinuity = false;
         if (unit.flags & BD_OPEN3D_MVC_UNIT_FLAG_MATCHED) {
             p_sys->b_mvc_seen_matched = true;
@@ -1693,6 +3795,7 @@ static int blurayOpen(vlc_object_t *object)
     demux_sys_t *p_sys;
     bool forced;
     uint64_t i_init_pos = 0;
+    char *psz_resolved_bd_path = NULL;
 
     const char *error_msg = NULL;
 #define BLURAY_ERROR(s) do { error_msg = s; goto error; } while(0)
@@ -1702,6 +3805,10 @@ static int blurayOpen(vlc_object_t *object)
 
     forced = !strcasecmp(p_demux->psz_access, "bluray") ||
              !strcasecmp(p_demux->psz_access, OPEN3DBLURAY_ACCESS_NAME);
+
+    if (!p_demux->s && p_demux->psz_file != NULL)
+        psz_resolved_bd_path =
+            open3dblurayResolveLocalPathCaseFallback(p_demux, p_demux->psz_file);
 
     if (p_demux->s) {
         if (!strcasecmp(p_demux->psz_access, "file")) {
@@ -1715,10 +3822,13 @@ static int blurayOpen(vlc_object_t *object)
 
     } else if (!forced) {
         if (!p_demux->psz_file) {
+            free(psz_resolved_bd_path);
             return VLC_EGENERIC;
         }
 
-        if (probeFile(p_demux->psz_file) != VLC_SUCCESS) {
+        if (probeFile(psz_resolved_bd_path ? psz_resolved_bd_path : p_demux->psz_file)
+            != VLC_SUCCESS) {
+            free(psz_resolved_bd_path);
             return VLC_EGENERIC;
         }
     }
@@ -1736,6 +3846,9 @@ static int blurayOpen(vlc_object_t *object)
     p_sys->subtitle_selection.b_pending_apply_valid = false;
     p_sys->i_forced_filter_pid = -1;
     p_sys->pp_forced_filter_last = &p_sys->p_forced_filter_head;
+    p_sys->i_dummy_video_next_pts = CLOCK_FREQ / 25;
+    p_sys->b_probe_yield_redundant_end_of_title =
+        open3dblurayYieldRedundantEndOfTitleEnabled();
 #if OPEN3DBLURAY_ENABLE_MVC
     p_sys->i_mvc_group = 1;
     p_sys->i_seek_timing_last_group_pcr = VLC_TICK_INVALID;
@@ -1754,6 +3867,7 @@ static int blurayOpen(vlc_object_t *object)
     vlc_mutex_init(&p_sys->bdj_overlay_lock);
     vlc_mutex_init(&p_sys->read_block_lock); /* used during bd_open_stream() */
     Open3DSubtitleBridgeInit(&p_sys->subtitle_bridge);
+    Open3DInteractiveGraphicsBridgeInit(&p_sys->interactive_graphics_bridge);
 
     /* request sub demuxers to skip continuity check as some split
        file concatenation are just resetting counters... */
@@ -1768,6 +3882,19 @@ static int blurayOpen(vlc_object_t *object)
     var_Create( p_demux, "ts-pcr-offsetfix", VLC_VAR_BOOL );
     var_SetBool( p_demux, "ts-pcr-offsetfix", false );
 
+    if( var_Type( p_demux->p_input, "menu-popup-available" ) == 0 )
+        var_Create( p_demux->p_input, "menu-popup-available", VLC_VAR_BOOL );
+    var_SetBool( p_demux->p_input, "menu-popup-available", false );
+    if( var_Type( p_demux->p_input, OPEN3D_BLURAY_MENU_OPEN_VAR ) == 0 )
+        var_Create( p_demux->p_input, OPEN3D_BLURAY_MENU_OPEN_VAR, VLC_VAR_BOOL );
+    var_SetBool( p_demux->p_input, OPEN3D_BLURAY_MENU_OPEN_VAR, false );
+    if( var_Type( p_demux->p_input, OPEN3D_BLURAY_FORCE_MONO_MENU_VAR ) == 0 )
+        var_Create( p_demux->p_input, OPEN3D_BLURAY_FORCE_MONO_MENU_VAR, VLC_VAR_BOOL );
+    var_SetBool( p_demux->p_input, OPEN3D_BLURAY_FORCE_MONO_MENU_VAR, false );
+    Open3DSubtitleBridgeSetEnabledOnObject(VLC_OBJECT(p_demux->p_input), false);
+    Open3DInteractiveGraphicsBridgeSetEnabledOnObject(VLC_OBJECT(p_demux->p_input),
+                                                      false);
+
     var_AddCallback( p_demux->p_input, "intf-event", onIntfEvent, p_demux );
 
     msg_Info(p_demux,
@@ -1777,6 +3904,11 @@ static int blurayOpen(vlc_object_t *object)
              OPEN3DBLURAY_BUILD_TIME,
              p_demux->psz_access ? p_demux->psz_access : "(null)",
              p_demux->psz_file ? p_demux->psz_file : "(null)");
+    if (p_sys->b_probe_yield_redundant_end_of_title) {
+        msg_Info(p_demux,
+                 "%s probe redundant_end_of_title_yield enabled=1",
+                 OPEN3DBLURAY_LOG_PREFIX);
+    }
 
     /* Open BluRay */
 #ifdef BLURAY_DEMUX
@@ -1794,6 +3926,9 @@ static int blurayOpen(vlc_object_t *object)
         if (!p_demux->psz_file) {
             /* no path provided (bluray://). use default DVD device. */
             p_sys->psz_bd_path = var_InheritString(object, "dvd");
+        } else if (psz_resolved_bd_path != NULL) {
+            p_sys->psz_bd_path = psz_resolved_bd_path;
+            psz_resolved_bd_path = NULL;
         } else {
             /* store current bd path */
             p_sys->psz_bd_path = strdup(p_demux->psz_file);
@@ -1903,7 +4038,11 @@ static int blurayOpen(vlc_object_t *object)
     /*
      * Initialize the event queue, so we can receive events in blurayDemux(Menu).
      */
+    msg_Info(p_demux, "%s open_step phase=before-bd-get-event-null menu=%d",
+             OPEN3DBLURAY_LOG_PREFIX, p_sys->b_menu ? 1 : 0);
     bd_get_event(p_sys->bluray, NULL);
+    msg_Info(p_demux, "%s open_step phase=after-bd-get-event-null menu=%d",
+             OPEN3DBLURAY_LOG_PREFIX, p_sys->b_menu ? 1 : 0);
 
     /* Registering overlay event handler */
     bd_register_overlay_proc(p_sys->bluray, p_demux, blurayOverlayProc);
@@ -1911,11 +4050,23 @@ static int blurayOpen(vlc_object_t *object)
     if (p_sys->b_menu) {
 
         /* Register ARGB overlay handler for BD-J */
-        if (disc_info->num_bdj_titles)
+        if (disc_info->num_bdj_titles) {
+            msg_Warn(p_demux,
+                     "open3dbluray trace argb-register handle=%p bdj_titles=%u menu=%d buf=%p",
+                     (void *)p_demux,
+                     (unsigned)disc_info->num_bdj_titles,
+                     p_sys->b_menu ? 1 : 0,
+                     NULL);
             bd_register_argb_overlay_proc(p_sys->bluray, p_demux, blurayArgbOverlayProc, NULL);
+        }
 
         /* libbluray will start playback from "First-Title" title */
-        if (bd_play(p_sys->bluray) == 0)
+        msg_Info(p_demux, "%s open_step phase=before-bd-play menu=%d",
+                 OPEN3DBLURAY_LOG_PREFIX, p_sys->b_menu ? 1 : 0);
+        int bd_play_ret = bd_play(p_sys->bluray);
+        msg_Info(p_demux, "%s open_step phase=after-bd-play ret=%d",
+                 OPEN3DBLURAY_LOG_PREFIX, bd_play_ret);
+        if (bd_play_ret == 0)
             BLURAY_ERROR(_("Failed to start bluray playback. Please try without menu support."));
 
     } else {
@@ -1929,6 +4080,8 @@ static int blurayOpen(vlc_object_t *object)
     p_sys->p_tf_out = timestamps_filter_es_out_New(p_demux->out);
     if(unlikely(!p_sys->p_tf_out))
         goto error;
+    msg_Info(p_demux, "%s open_step phase=after-timestamps-filter-out",
+             OPEN3DBLURAY_LOG_PREFIX);
 
     es_out_t *out_id = p_sys->p_tf_out;
     if (unlikely(disc_info->udf_volume_id &&
@@ -1943,12 +4096,16 @@ static int blurayOpen(vlc_object_t *object)
     p_sys->p_out = esOutNew(VLC_OBJECT(p_demux), out_id, p_demux);
     if (unlikely(p_sys->p_out == NULL))
         goto error;
+    msg_Info(p_demux, "%s open_step phase=after-es-out-wrapper",
+             OPEN3DBLURAY_LOG_PREFIX);
 
     p_sys->p_parser = vlc_demux_chained_New(VLC_OBJECT(p_demux), "ts", p_sys->p_out);
     if (!p_sys->p_parser) {
         msg_Err(p_demux, "Failed to create TS demuxer");
         goto error;
     }
+    msg_Info(p_demux, "%s open_step phase=after-ts-parser",
+             OPEN3DBLURAY_LOG_PREFIX);
 
 #if OPEN3DBLURAY_ENABLE_MVC
     open3dblurayLogMvcInfo(p_demux, "open");
@@ -1960,6 +4117,7 @@ static int blurayOpen(vlc_object_t *object)
     return VLC_SUCCESS;
 
 error:
+    free(psz_resolved_bd_path);
     if (error_msg)
         vlc_dialog_display_error(p_demux, _("Blu-ray error"), "%s", error_msg);
     blurayClose(object);
@@ -1985,8 +4143,23 @@ static void blurayClose(vlc_object_t *object)
     demux_t *p_demux = (demux_t*)object;
     demux_sys_t *p_sys = p_demux->p_sys;
 
-    var_DelCallback( p_demux->p_input, "intf-event", onIntfEvent, p_demux );
+    if( p_demux->p_input != NULL &&
+        var_Type( p_demux->p_input, "menu-popup-available" ) != 0 )
+        var_SetBool( p_demux->p_input, "menu-popup-available", false );
+    if( p_demux->p_input != NULL &&
+        var_Type( p_demux->p_input, OPEN3D_BLURAY_MENU_OPEN_VAR ) != 0 )
+        var_SetBool( p_demux->p_input, OPEN3D_BLURAY_MENU_OPEN_VAR, false );
+    if( p_demux->p_input != NULL &&
+        var_Type( p_demux->p_input, OPEN3D_BLURAY_FORCE_MONO_MENU_VAR ) != 0 )
+        var_SetBool( p_demux->p_input, OPEN3D_BLURAY_FORCE_MONO_MENU_VAR, false );
+    if( p_demux->p_input != NULL )
+    {
+        Open3DSubtitleBridgeSetEnabledOnObject(VLC_OBJECT(p_demux->p_input), false);
+        Open3DInteractiveGraphicsBridgeSetEnabledOnObject(
+            VLC_OBJECT(p_demux->p_input), false);
+    }
 
+    var_DelCallback( p_demux->p_input, "intf-event", onIntfEvent, p_demux );
     setTitleInfo(p_sys, NULL);
 
     /*
@@ -1999,6 +4172,13 @@ static void blurayClose(vlc_object_t *object)
     }
 
     blurayReleaseVout(p_demux);
+
+    if (p_demux->p_input != NULL) {
+        vlc_object_t *input_obj = VLC_OBJECT(p_demux->p_input);
+        Open3DDirectBridgeNotifyAttachToObject(input_obj, NULL, NULL);
+        Open3DSubtitleBridgeDetachFromObject(input_obj);
+        Open3DInteractiveGraphicsBridgeDetachFromObject(input_obj);
+    }
 
 #if OPEN3DBLURAY_ENABLE_MVC
     if (p_sys->p_mvc_video)
@@ -2030,6 +4210,7 @@ static void blurayClose(vlc_object_t *object)
     vlc_mutex_destroy(&p_sys->bdj_overlay_lock);
     vlc_mutex_destroy(&p_sys->read_block_lock);
     Open3DSubtitleBridgeDestroy(&p_sys->subtitle_bridge);
+    Open3DInteractiveGraphicsBridgeDestroy(&p_sys->interactive_graphics_bridge);
 
     open3dblurayForcedFilterClearQueued(p_sys);
     free(p_sys->psz_bd_path);
@@ -2115,6 +4296,30 @@ static void open3dblurayUpdateSelectedSubtitleOffsetUnlocked(demux_t *p_demux, i
              p_stream->pg_ss_offset_sequence_id);
 
     open3dblurayPublishSubtitleOffsetToVout(p_demux, NULL);
+}
+
+static void open3dblurayLogSelectedAudioStreamUnlocked(demux_t *p_demux,
+                                                       int i_pid,
+                                                       const char *psz_source)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    BLURAY_STREAM_INFO *p_stream = NULL;
+
+    if (i_pid <= 0)
+        return;
+
+    p_stream = blurayGetStreamInfoByPIDUnlocked(p_sys, i_pid);
+    if (!p_stream)
+        return;
+
+    msg_Info(p_demux,
+             "%s audio_stream source=%s pid=0x%04x lang=%s format=%u rate=%u",
+             OPEN3DBLURAY_LOG_PREFIX,
+             psz_source ? psz_source : "unknown",
+             i_pid,
+             p_stream->lang,
+             p_stream->format,
+             p_stream->rate);
 }
 
 static void setStreamLang(demux_sys_t *p_sys, es_format_t *p_fmt)
@@ -2210,9 +4415,16 @@ static es_out_id_t *bluray_esOutAdd(es_out_t *p_out, const es_format_t *p_fmt)
                     OPEN3DBLURAY_LOG_PREFIX, p_sys->i_mvc_group, p_fmt->i_id);
         }
         if (p_fmt->i_id == 0x1011) {
-            /* Keep the stock TS parser alive for non-video ES, but do not let the
-             * base-view H.264 track compete with the synthetic merged mvc1 path. */
-            b_select = false;
+            /* Keep the stock base-view selected until the synthetic mvc1 path
+             * actually exists. Suppressing pid 0x1011 at ES-add time leaves
+             * discs with early base-only preroll/title playlists in an
+             * audio-only state until MVC units eventually create the merged ES. */
+            if (p_sys->p_mvc_video != NULL) {
+                BD_OPEN3D_MVC_INFO info;
+                b_select = open3dblurayUseStockBaseFallback(p_demux, &info);
+            } else {
+                b_select = true;
+            }
             fmt.i_priority = ES_PRIORITY_NOT_SELECTABLE;
             break;
         }
@@ -2397,6 +4609,11 @@ static int bluray_esOutSend(es_out_t *p_out, es_out_id_t *p_es, block_t *p_block
         es_pair_t *p_forced_pair = getEsPairByPID(&esout_sys->es,
                                                   open3dblurayMakeForcedSubtitleEsId(p_pair->fmt.i_id));
         if (p_forced_pair != NULL) {
+            open3dblurayTraceSpuSend(p_demux,
+                                     esout_sys->selected.i_spu_pid,
+                                     p_pair,
+                                     p_block,
+                                     "forced_filter");
             int i_send_ret = open3dbluraySendForcedPgsBlock(p_demux,
                                                             esout_sys->p_dst_out,
                                                             p_forced_pair->p_es,
@@ -2412,12 +4629,46 @@ static int bluray_esOutSend(es_out_t *p_out, es_out_id_t *p_es, block_t *p_block
              p_pair->fmt.i_cat == VIDEO_ES &&
              p_pair->fmt.i_id == 0x1011)
     {
+        BD_OPEN3D_MVC_INFO info;
+        const bool b_use_stock_base = open3dblurayUseStockBaseFallback(p_demux, &info);
+
+        if (b_use_stock_base) {
+            if (!p_sys->b_mvc_base_fallback_selected) {
+                es_out_t *p_sink_out = open3dblurayGetMvcSinkOut(p_demux);
+
+                open3dblurayTraceMvcHandoff(p_demux, "synthetic", "stock-base");
+                es_out_Control(p_sink_out, ES_OUT_SET_ES_STATE, p_sys->p_mvc_video, false);
+                es_out_Control(esout_sys->p_dst_out, ES_OUT_SET_ES, p_pair->p_es);
+                p_sys->b_mvc_base_fallback_selected = true;
+                open3dblurayPublishForceMonoMenuState(p_demux);
+                open3dblurayTraceMvcSelectionChange(p_demux, "stock-base", &info);
+            }
+        } else if (p_sys->b_mvc_base_fallback_selected) {
+            open3dblurayTraceMvcHandoff(p_demux, "stock-base", "synthetic");
+            es_out_Control(esout_sys->p_dst_out, ES_OUT_SET_ES_STATE, p_pair->p_es, false);
+            es_out_Control(open3dblurayGetMvcSinkOut(p_demux), ES_OUT_SET_ES,
+                           p_sys->p_mvc_video);
+            p_sys->b_mvc_base_fallback_selected = false;
+            open3dblurayPublishForceMonoMenuState(p_demux);
+            open3dblurayTraceMvcSelectionChange(p_demux, "synthetic", &info);
+        }
+
         /* Suppress the stock base-view video payload while the synthetic mvc1 ES
          * is active, but keep feeding the TS parser so audio/subtitles survive. */
-        block_Release(p_block);
-        p_block = NULL;
+        if (!b_use_stock_base) {
+            open3dblurayTraceMvcGate(p_demux, (uint16_t)p_pair->fmt.i_id,
+                                     p_block->i_buffer);
+            block_Release(p_block);
+            p_block = NULL;
+        }
     }
 #endif
+    if (p_block && p_pair && p_pair->fmt.i_cat == SPU_ES)
+        open3dblurayTraceSpuSend(p_demux,
+                                 esout_sys->selected.i_spu_pid,
+                                 p_pair,
+                                 p_block,
+                                 "decoder");
     vlc_mutex_unlock(&esout_sys->lock);
     return (p_block) ? es_out_Send(esout_sys->p_dst_out, p_es, p_block) : VLC_SUCCESS;
 }
@@ -3358,6 +5609,7 @@ static void subpictureUpdaterUpdate(subpicture_t *p_subpic,
         *p_dst = subpicture_region_Copy(p_src);
         if (*p_dst == NULL)
             break;
+        open3dblurayTraceArgbUpdaterSamples(p_overlay, p_src, *p_dst);
         p_dst = &(*p_dst)->p_next;
         p_src = p_src->p_next;
     }
@@ -3427,13 +5679,61 @@ static int onMouseEvent(vlc_object_t *p_vout, const char *psz_var, vlc_value_t o
 {
     demux_t     *p_demux = (demux_t*)p_data;
     demux_sys_t *p_sys   = p_demux->p_sys;
+    open3dbluray_mouse_scene_probe_t mouse_probe;
+    const int raw_x = val.coords.x;
+    const int raw_y = val.coords.y;
+    int clamped_x = raw_x;
+    int clamped_y = raw_y;
+    int mapped_x = raw_x;
+    int mapped_y = raw_y;
+    const bool b_ignore_mouse_move_probe =
+        p_sys->b_menu &&
+        open3dblurayIgnoreMouseMoveProbeEnabled();
+    const bool b_mouse_scene_probe =
+        p_sys->b_menu &&
+        open3dblurayLoadMouseSceneProbe(&mouse_probe) &&
+        open3dblurayNormalizeMouseCoords(&mouse_probe,
+                                         raw_x, raw_y,
+                                         &clamped_x, &clamped_y,
+                                         &mapped_x, &mapped_y);
     VLC_UNUSED(old);
     VLC_UNUSED(p_vout);
 
-    if (psz_var[6] == 'm')   //Mouse moved
-        bd_mouse_select(p_sys->bluray, -1, val.coords.x, val.coords.y);
-    else if (psz_var[6] == 'c') {
-        bd_mouse_select(p_sys->bluray, -1, val.coords.x, val.coords.y);
+    if (psz_var[6] == 'm') {  //Mouse moved
+        if (open3dblurayTraceNavInputEnabled()) {
+            msg_Dbg(p_demux,
+                    "TRACE menu_nav source=mouse-move x=%d y=%d raw_x=%d raw_y=%d "
+                    "probe_ignore_mouse_move=%d probe_mouse_source_to_scene=%d source_clamped=%d,%d source_canvas=%ux%u scene_canvas=%ux%u "
+                    "menu_enabled=%d menu_open=%d popup_available=%d",
+                    mapped_x, mapped_y, raw_x, raw_y,
+                    b_ignore_mouse_move_probe ? 1 : 0,
+                    b_mouse_scene_probe ? 1 : 0,
+                    clamped_x, clamped_y,
+                    b_mouse_scene_probe ? mouse_probe.source_width : 0,
+                    b_mouse_scene_probe ? mouse_probe.source_height : 0,
+                    b_mouse_scene_probe ? mouse_probe.scene_width : 0,
+                    b_mouse_scene_probe ? mouse_probe.scene_height : 0,
+                    p_sys->b_menu, p_sys->b_menu_open, p_sys->b_popup_available);
+        }
+        if (b_ignore_mouse_move_probe)
+            return VLC_SUCCESS;
+        bd_mouse_select(p_sys->bluray, -1, mapped_x, mapped_y);
+    } else if (psz_var[6] == 'c') {
+        msg_Info(p_demux,
+                 "menu_nav source=mouse-click x=%d y=%d raw_x=%d raw_y=%d key=%s "
+                 "probe_ignore_mouse_move=%d probe_mouse_source_to_scene=%d source_clamped=%d,%d source_canvas=%ux%u scene_canvas=%ux%u "
+                 "menu_enabled=%d menu_open=%d popup_available=%d",
+                 mapped_x, mapped_y, raw_x, raw_y,
+                 open3dblurayNavKeyName(BD_VK_MOUSE_ACTIVATE),
+                 b_ignore_mouse_move_probe ? 1 : 0,
+                 b_mouse_scene_probe ? 1 : 0,
+                 clamped_x, clamped_y,
+                 b_mouse_scene_probe ? mouse_probe.source_width : 0,
+                 b_mouse_scene_probe ? mouse_probe.source_height : 0,
+                 b_mouse_scene_probe ? mouse_probe.scene_width : 0,
+                 b_mouse_scene_probe ? mouse_probe.scene_height : 0,
+                 p_sys->b_menu, p_sys->b_menu_open, p_sys->b_popup_available);
+        bd_mouse_select(p_sys->bluray, -1, mapped_x, mapped_y);
         bd_user_input(p_sys->bluray, -1, BD_VK_MOUSE_ACTIVATE);
     } else {
         vlc_assert_unreachable();
@@ -3441,8 +5741,13 @@ static int onMouseEvent(vlc_object_t *p_vout, const char *psz_var, vlc_value_t o
     return VLC_SUCCESS;
 }
 
-static int sendKeyEvent(demux_sys_t *p_sys, unsigned int key)
+static int sendKeyEvent(demux_t *p_demux, demux_sys_t *p_sys, unsigned int key)
 {
+    msg_Info(p_demux,
+             "menu_nav source=key key=%s(%u) menu_enabled=%d menu_open=%d popup_available=%d",
+             open3dblurayNavKeyName(key), key,
+             p_sys->b_menu, p_sys->b_menu_open, p_sys->b_popup_available);
+
     if (bd_user_input(p_sys->bluray, -1, key) < 0)
         return VLC_EGENERIC;
 
@@ -3478,6 +5783,8 @@ static void blurayCloseOverlay(demux_t *p_demux, int plane)
 
     if (plane == BD_OVERLAY_PG)
         Open3DSubtitleBridgeClear(&p_sys->subtitle_bridge);
+    else if (plane == BD_OVERLAY_IG)
+        Open3DInteractiveGraphicsBridgeClear(&p_sys->interactive_graphics_bridge);
 
     for (int i = 0; i < MAX_OVERLAY; i++)
         if (p_sys->p_overlays[i])
@@ -3548,6 +5855,8 @@ static void blurayClearOverlay(demux_t *p_demux, int plane)
 
     if (plane == BD_OVERLAY_PG)
         Open3DSubtitleBridgeClear(&p_sys->subtitle_bridge);
+    else if (plane == BD_OVERLAY_IG)
+        Open3DInteractiveGraphicsBridgeClear(&p_sys->interactive_graphics_bridge);
 }
 
 static void blurayInitOverlay(demux_t *p_demux, int plane, int width, int height)
@@ -3578,6 +5887,46 @@ static void blurayInitOverlay(demux_t *p_demux, int plane, int width, int height
 
     if (plane == BD_OVERLAY_PG)
         Open3DSubtitleBridgeClear(&p_sys->subtitle_bridge);
+    else if (plane == BD_OVERLAY_IG)
+        Open3DInteractiveGraphicsBridgeClear(&p_sys->interactive_graphics_bridge);
+}
+
+static void blurayStoreOverlayPaletteLocked(bluray_overlay_t *ov,
+                                            const BD_PG_PALETTE_ENTRY *palette)
+{
+    if (ov == NULL || palette == NULL)
+        return;
+
+    ov->b_palette_cache_valid = true;
+    memcpy(ov->palette_cache, palette, sizeof(ov->palette_cache));
+}
+
+static void blurayApplyOverlayPaletteLocked(bluray_overlay_t *ov,
+                                            subpicture_region_t *region)
+{
+    if (ov == NULL || region == NULL ||
+        !ov->b_palette_cache_valid ||
+        region->fmt.i_chroma != VLC_CODEC_YUVP ||
+        region->fmt.p_palette == NULL)
+        return;
+
+    region->fmt.p_palette->i_entries = 256;
+    for (int i = 0; i < 256; ++i) {
+        region->fmt.p_palette->palette[i][0] = ov->palette_cache[i].Y;
+        region->fmt.p_palette->palette[i][1] = ov->palette_cache[i].Cb;
+        region->fmt.p_palette->palette[i][2] = ov->palette_cache[i].Cr;
+        region->fmt.p_palette->palette[i][3] = ov->palette_cache[i].T;
+    }
+}
+
+static void blurayApplyOverlayPaletteToRegionChainLocked(bluray_overlay_t *ov)
+{
+    if (ov == NULL || !ov->b_palette_cache_valid)
+        return;
+
+    for (subpicture_region_t *region = ov->p_regions;
+         region != NULL; region = region->p_next)
+        blurayApplyOverlayPaletteLocked(ov, region);
 }
 
 /*
@@ -3598,6 +5947,12 @@ static void blurayDrawOverlay(demux_t *p_demux, const BD_OVERLAY* const eventov)
      */
     vlc_mutex_lock(&ov->lock);
 
+    if (eventov->palette != NULL)
+        blurayStoreOverlayPaletteLocked(ov, eventov->palette);
+
+    if (eventov->palette_update_flag)
+        blurayApplyOverlayPaletteToRegionChainLocked(ov);
+
     /* Find a region to update */
     subpicture_region_t **pp_reg = &ov->p_regions;
     subpicture_region_t *p_reg = ov->p_regions;
@@ -3615,6 +5970,10 @@ static void blurayDrawOverlay(demux_t *p_demux, const BD_OVERLAY* const eventov)
     }
 
     if (!eventov->img) {
+        if (eventov->palette_update_flag) {
+            vlc_mutex_unlock(&ov->lock);
+            return;
+        }
         if (p_reg) {
             /* drop region */
             *pp_reg = p_reg->p_next;
@@ -3634,6 +5993,10 @@ static void blurayDrawOverlay(demux_t *p_demux, const BD_OVERLAY* const eventov)
         if (p_reg) {
             p_reg->i_x = eventov->x;
             p_reg->i_y = eventov->y;
+            if (p_reg->p_picture != NULL) {
+                plane_t *plane = &p_reg->p_picture->p[0];
+                memset(plane->p_pixels, 0xff, plane->i_pitch * plane->i_lines);
+            }
             /* Append it to our list. */
             if (p_last != NULL)
                 p_last->p_next = p_reg;
@@ -3657,15 +6020,7 @@ static void blurayDrawOverlay(demux_t *p_demux, const BD_OVERLAY* const eventov)
             img++;
         }
 
-    if (eventov->palette) {
-        p_reg->fmt.p_palette->i_entries = 256;
-        for (int i = 0; i < 256; ++i) {
-            p_reg->fmt.p_palette->palette[i][0] = eventov->palette[i].Y;
-            p_reg->fmt.p_palette->palette[i][1] = eventov->palette[i].Cb;
-            p_reg->fmt.p_palette->palette[i][2] = eventov->palette[i].Cr;
-            p_reg->fmt.p_palette->palette[i][3] = eventov->palette[i].T;
-        }
-    }
+    blurayApplyOverlayPaletteLocked(ov, p_reg);
 
     vlc_mutex_unlock(&ov->lock);
     /*
@@ -3727,10 +6082,13 @@ static void blurayOverlayProc(void *ptr, const BD_OVERLAY *const overlay)
                 }
             }
 
-            open3dbluraySyncSubtitleBridgeFromOverlayLocked(p_demux, ov);
+            if (ov->plane == BD_OVERLAY_PG)
+                open3dblurayTracePgRegionChain(p_demux, "flush", ov);
+
+            open3dbluraySyncDirectOverlayBridgeFromOverlayLocked(p_demux, ov);
             open3dblurayPublishSubtitleOffsetToVout(p_demux, ov);
             vlc_mutex_unlock(&ov->lock);
-            if (open3dblurayUseDirectSubtitleBridge(p_demux, ov))
+            if (open3dblurayUseDirectOverlayBridge(p_demux, ov))
                 open3dblurayDetachOverlaySubpictureFromVout(p_demux, ov);
         }
         blurayActivateOverlay(p_demux, overlay->plane);
@@ -3770,23 +6128,117 @@ static void blurayInitArgbOverlay(demux_t *p_demux, int plane, int width, int he
     }
 }
 
+static subpicture_region_t *blurayRecreateArgbOverlayRegionLocked(
+    demux_t *p_demux,
+    bluray_overlay_t *ov,
+    const BD_ARGB_OVERLAY *eventov,
+    const char *reason)
+{
+    if (p_demux == NULL || ov == NULL)
+        return NULL;
+
+    unsigned width = ov->width > 0 ? (unsigned)ov->width : 0;
+    unsigned height = ov->height > 0 ? (unsigned)ov->height : 0;
+
+    if (eventov != NULL)
+    {
+        const unsigned draw_width = (unsigned)eventov->x + (unsigned)eventov->w;
+        const unsigned draw_height = (unsigned)eventov->y + (unsigned)eventov->h;
+        if (draw_width > width)
+            width = draw_width;
+        if (draw_height > height)
+            height = draw_height;
+    }
+
+    if (width == 0 || height == 0)
+        return NULL;
+
+    subpicture_region_ChainDelete(ov->p_regions);
+    ov->p_regions = NULL;
+
+    video_format_t fmt;
+    video_format_Init(&fmt, 0);
+    video_format_Setup(&fmt, ARGB_OVERLAY_CHROMA,
+                       width, height, width, height, 1, 1);
+
+    subpicture_region_t *p_reg = subpicture_region_New(&fmt);
+    video_format_Clean(&fmt);
+    if (p_reg == NULL)
+        return NULL;
+
+    p_reg->i_x = 0;
+    p_reg->i_y = 0;
+
+    if (p_reg->p_picture != NULL)
+    {
+        for (int i = 0; i < p_reg->p_picture->i_planes; ++i)
+        {
+            plane_t *plane = &p_reg->p_picture->p[i];
+            memset(plane->p_pixels, 0, plane->i_pitch * plane->i_lines);
+        }
+    }
+
+    ov->p_regions = p_reg;
+
+    msg_Warn(p_demux,
+             "open3dbluray trace argb-region-recreate reason=%s plane=%u canvas=%ux%u rect=%u,%u-%u,%u",
+             reason != NULL ? reason : "unspecified",
+             (unsigned)ov->plane,
+             width,
+             height,
+             eventov != NULL ? (unsigned)eventov->x : 0,
+             eventov != NULL ? (unsigned)eventov->y : 0,
+             eventov != NULL ? (unsigned)(eventov->x + eventov->w - 1) : 0,
+             eventov != NULL ? (unsigned)(eventov->y + eventov->h - 1) : 0);
+    return p_reg;
+}
+
 static void blurayDrawArgbOverlay(demux_t *p_demux, const BD_ARGB_OVERLAY* const eventov)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
 
     bluray_overlay_t *ov = p_sys->p_overlays[eventov->plane];
     if(!ov)
+    {
+        open3dblurayTraceArgbSkip(p_demux, NULL, eventov, NULL, "no-overlay");
         return;
+    }
 
     vlc_mutex_lock(&ov->lock);
 
     /* Find a region to update */
     subpicture_region_t *p_reg = ov->p_regions;
-    if (!p_reg || p_reg->fmt.i_chroma != ARGB_OVERLAY_CHROMA ||
-        eventov->x + eventov->w > p_reg->fmt.i_width ||
+    if (!p_reg) {
+        p_reg = blurayRecreateArgbOverlayRegionLocked(p_demux, ov, eventov,
+                                                      "no-region");
+        if (!p_reg) {
+            open3dblurayTraceArgbSkip(p_demux, ov, eventov, NULL, "no-region");
+            vlc_mutex_unlock(&ov->lock);
+            return;
+        }
+    }
+
+    if (p_reg->fmt.i_chroma != ARGB_OVERLAY_CHROMA) {
+        p_reg = blurayRecreateArgbOverlayRegionLocked(p_demux, ov, eventov,
+                                                      "bad-chroma");
+        if (p_reg == NULL || p_reg->fmt.i_chroma != ARGB_OVERLAY_CHROMA) {
+            open3dblurayTraceArgbSkip(p_demux, ov, eventov, p_reg, "bad-chroma");
+            vlc_mutex_unlock(&ov->lock);
+            return;
+        }
+    }
+
+    if (eventov->x + eventov->w > p_reg->fmt.i_width ||
         eventov->y + eventov->h > p_reg->fmt.i_height) {
-        vlc_mutex_unlock(&ov->lock);
-        return;
+        p_reg = blurayRecreateArgbOverlayRegionLocked(p_demux, ov, eventov,
+                                                      "bounds");
+        if (p_reg == NULL ||
+            eventov->x + eventov->w > p_reg->fmt.i_width ||
+            eventov->y + eventov->h > p_reg->fmt.i_height) {
+            open3dblurayTraceArgbSkip(p_demux, ov, eventov, p_reg, "bounds");
+            vlc_mutex_unlock(&ov->lock);
+            return;
+        }
     }
 
     /* Now we can update the region */
@@ -3809,6 +6261,8 @@ static void blurayDrawArgbOverlay(demux_t *p_demux, const BD_ARGB_OVERLAY* const
         }
     }
 
+    open3dblurayTraceArgbAccessSamples(p_demux, ov, eventov, p_reg);
+
     vlc_mutex_unlock(&ov->lock);
     /*
      * /!\ The region is now stored in our internal list, but not in the subpicture /!\
@@ -3819,6 +6273,8 @@ static void blurayArgbOverlayProc(void *ptr, const BD_ARGB_OVERLAY *const overla
 {
     demux_t *p_demux = (demux_t*)ptr;
     demux_sys_t *p_sys = p_demux->p_sys;
+
+    open3dblurayTraceArgbEntry(p_demux, p_sys, overlay);
 
     if(overlay->plane >= MAX_OVERLAY)
         return;
@@ -3836,6 +6292,39 @@ static void blurayArgbOverlayProc(void *ptr, const BD_ARGB_OVERLAY *const overla
         vlc_mutex_unlock(&p_sys->bdj_overlay_lock);
         break;
     case BD_ARGB_OVERLAY_FLUSH:
+        if (p_sys->p_overlays[overlay->plane]) {
+            bluray_overlay_t *ov = p_sys->p_overlays[overlay->plane];
+            const bool trace_overlay = open3dblurayTraceInteractiveGraphicsBridgeEnabled();
+            bool use_direct_bridge = false;
+
+            vlc_mutex_lock(&ov->lock);
+            open3dbluraySyncDirectOverlayBridgeFromOverlayLocked(p_demux, ov);
+            use_direct_bridge = open3dblurayUseDirectOverlayBridge(p_demux, ov);
+            if (trace_overlay)
+            {
+                if (overlay->plane == BD_OVERLAY_IG)
+                    open3dblurayTraceIgRegionChain(p_demux, "overlay-flush", ov,
+                                                   use_direct_bridge,
+                                                   p_sys->b_menu_open);
+                msg_Dbg(p_demux,
+                        "open3dbluray trace overlay flush plane=%u regions=%u size=%ux%u direct=%d",
+                        (unsigned)overlay->plane,
+                        open3dblurayCountRegionChain(ov->p_regions),
+                        ov->width,
+                        ov->height,
+                        use_direct_bridge ? 1 : 0);
+            }
+            vlc_mutex_unlock(&ov->lock);
+            if (use_direct_bridge)
+            {
+                open3dblurayDetachOverlaySubpictureFromVout(p_demux, ov);
+                if (trace_overlay && overlay->plane == BD_OVERLAY_IG)
+                    msg_Dbg(p_demux,
+                            "open3dbluray trace ig-bridge detach plane=%u channel=%d",
+                            (unsigned)overlay->plane,
+                            ov->i_channel);
+            }
+        }
         blurayActivateOverlay(p_demux, overlay->plane);
         break;
     case BD_ARGB_OVERLAY_DRAW:
@@ -3850,6 +6339,8 @@ static void blurayArgbOverlayProc(void *ptr, const BD_ARGB_OVERLAY *const overla
 static void bluraySendOverlayToVout(demux_t *p_demux, bluray_overlay_t *p_ov)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
+    const bool trace_overlay = open3dblurayTraceInteractiveGraphicsBridgeEnabled();
+    const unsigned region_count = open3dblurayCountRegionChain(p_ov ? p_ov->p_regions : NULL);
 
     assert(p_ov != NULL);
     assert(p_ov->i_channel == -1);
@@ -3871,6 +6362,13 @@ static void bluraySendOverlayToVout(demux_t *p_demux, bluray_overlay_t *p_ov)
         p_pic->i_start = p_pic->i_stop = mdate();
     p_pic->i_channel = vout_RegisterSubpictureChannel(p_sys->p_vout);
     p_ov->i_channel = p_pic->i_channel;
+    if (trace_overlay && p_ov->plane == BD_OVERLAY_IG)
+        msg_Dbg(p_demux,
+                "open3dbluray trace overlay send plane=%u regions=%u pts90k=%" PRId64 " channel=%d",
+                (unsigned)p_ov->plane,
+                region_count,
+                p_ov->pts90k,
+                p_ov->i_channel);
 
     /*
      * After this point, the picture should not be accessed from the demux thread,
@@ -4220,6 +6718,14 @@ static void open3dblurayApplyStartupSubtitlePreference(demux_t *p_demux)
         return;
     }
 
+    if (p_sys->b_menu) {
+        p_sys->subtitle_selection.b_auto_forced_default_enabled = false;
+        msg_Dbg(p_demux,
+                "%s startup subtitle preference: menu mode active, leaving subtitle selection to disc menu",
+                OPEN3DBLURAY_LOG_PREFIX);
+        return;
+    }
+
     p_sys->subtitle_selection.b_auto_forced_default_enabled =
         open3dblurayForcedSubtitleTrackExposureEnabled();
     if (!p_sys->subtitle_selection.b_auto_forced_default_enabled)
@@ -4478,27 +6984,63 @@ static int blurayControl(demux_t *p_demux, int query, va_list args)
 
     case DEMUX_NAV_ACTIVATE:
         if (p_sys->b_popup_available && !p_sys->b_menu_open) {
-            return sendKeyEvent(p_sys, BD_VK_POPUP);
+            msg_Info(p_demux,
+                     "menu_nav source=control action=%s route=%s menu_enabled=%d menu_open=%d popup_available=%d",
+                     open3dblurayNavActionName(query), open3dblurayNavKeyName(BD_VK_POPUP),
+                     p_sys->b_menu, p_sys->b_menu_open, p_sys->b_popup_available);
+            return sendKeyEvent(p_demux, p_sys, BD_VK_POPUP);
         }
-        return sendKeyEvent(p_sys, BD_VK_ENTER);
+        msg_Info(p_demux,
+                 "menu_nav source=control action=%s route=%s menu_enabled=%d menu_open=%d popup_available=%d",
+                 open3dblurayNavActionName(query), open3dblurayNavKeyName(BD_VK_ENTER),
+                 p_sys->b_menu, p_sys->b_menu_open, p_sys->b_popup_available);
+        return sendKeyEvent(p_demux, p_sys, BD_VK_ENTER);
     case DEMUX_NAV_UP:
-        return sendKeyEvent(p_sys, BD_VK_UP);
+        msg_Info(p_demux,
+                 "menu_nav source=control action=%s route=%s menu_enabled=%d menu_open=%d popup_available=%d",
+                 open3dblurayNavActionName(query), open3dblurayNavKeyName(BD_VK_UP),
+                 p_sys->b_menu, p_sys->b_menu_open, p_sys->b_popup_available);
+        return sendKeyEvent(p_demux, p_sys, BD_VK_UP);
     case DEMUX_NAV_DOWN:
-        return sendKeyEvent(p_sys, BD_VK_DOWN);
+        msg_Info(p_demux,
+                 "menu_nav source=control action=%s route=%s menu_enabled=%d menu_open=%d popup_available=%d",
+                 open3dblurayNavActionName(query), open3dblurayNavKeyName(BD_VK_DOWN),
+                 p_sys->b_menu, p_sys->b_menu_open, p_sys->b_popup_available);
+        return sendKeyEvent(p_demux, p_sys, BD_VK_DOWN);
     case DEMUX_NAV_LEFT:
-        return sendKeyEvent(p_sys, BD_VK_LEFT);
+        msg_Info(p_demux,
+                 "menu_nav source=control action=%s route=%s menu_enabled=%d menu_open=%d popup_available=%d",
+                 open3dblurayNavActionName(query), open3dblurayNavKeyName(BD_VK_LEFT),
+                 p_sys->b_menu, p_sys->b_menu_open, p_sys->b_popup_available);
+        return sendKeyEvent(p_demux, p_sys, BD_VK_LEFT);
     case DEMUX_NAV_RIGHT:
-        return sendKeyEvent(p_sys, BD_VK_RIGHT);
+        msg_Info(p_demux,
+                 "menu_nav source=control action=%s route=%s menu_enabled=%d menu_open=%d popup_available=%d",
+                 open3dblurayNavActionName(query), open3dblurayNavKeyName(BD_VK_RIGHT),
+                 p_sys->b_menu, p_sys->b_menu_open, p_sys->b_popup_available);
+        return sendKeyEvent(p_demux, p_sys, BD_VK_RIGHT);
     case DEMUX_NAV_POPUP:
-        return sendKeyEvent(p_sys, BD_VK_POPUP);
+        msg_Info(p_demux,
+                 "menu_nav source=control action=%s route=%s menu_enabled=%d menu_open=%d popup_available=%d",
+                 open3dblurayNavActionName(query), open3dblurayNavKeyName(BD_VK_POPUP),
+                 p_sys->b_menu, p_sys->b_menu_open, p_sys->b_popup_available);
+        return sendKeyEvent(p_demux, p_sys, BD_VK_POPUP);
     case DEMUX_NAV_MENU:
         if (p_sys->b_menu) {
             if (bd_menu_call(p_sys->bluray, -1) == 1) {
+                msg_Info(p_demux,
+                         "menu_nav source=control action=%s route=top_menu_call menu_enabled=%d menu_open=%d popup_available=%d",
+                         open3dblurayNavActionName(query),
+                         p_sys->b_menu, p_sys->b_menu_open, p_sys->b_popup_available);
                 p_demux->info.i_update |= INPUT_UPDATE_TITLE | INPUT_UPDATE_SEEKPOINT;
                 return VLC_SUCCESS;
             }
             msg_Err(p_demux, "Can't select Top Menu title");
-            return sendKeyEvent(p_sys, BD_VK_POPUP);
+            msg_Info(p_demux,
+                     "menu_nav source=control action=%s route=%s fallback=top_menu_failed menu_enabled=%d menu_open=%d popup_available=%d",
+                     open3dblurayNavActionName(query), open3dblurayNavKeyName(BD_VK_POPUP),
+                     p_sys->b_menu, p_sys->b_menu_open, p_sys->b_popup_available);
+            return sendKeyEvent(p_demux, p_sys, BD_VK_POPUP);
         }
         return VLC_EGENERIC;
 
@@ -4641,6 +7183,13 @@ static void blurayResetStillImage( demux_t *p_demux )
     }
 }
 
+static bool open3dblurayStillImageActive(demux_t *p_demux)
+{
+    return p_demux != NULL &&
+           p_demux->p_sys != NULL &&
+           p_demux->p_sys->i_still_end_time != STILL_IMAGE_NOT_SET;
+}
+
 static void blurayStillImage( demux_t *p_demux, unsigned i_timeout )
 {
     demux_sys_t *p_sys = p_demux->p_sys;
@@ -4720,7 +7269,11 @@ static void blurayOnStreamSelectedEvent(demux_t *p_demux, uint32_t i_type, uint3
                                                open3dblurayGetRememberedSubtitleUiId(p_demux));
         }
         else
+        {
+            if (i_type == BD_EVENT_AUDIO_STREAM)
+                open3dblurayLogSelectedAudioStreamUnlocked(p_demux, i_pid, "event");
             es_out_Control(p_sys->p_out, BLURAY_ES_OUT_CONTROL_SET_ES_BY_PID, (int)i_type, i_pid);
+        }
     }
 }
 
@@ -4749,9 +7302,16 @@ static void blurayUpdatePlaylist(demux_t *p_demux, unsigned i_playlist)
     blurayResetStillImage(p_demux);
 }
 
+static bool open3dblurayTraceClipStateEnabled(void)
+{
+    const char *env = getenv("OPEN3DBLURAY_TRACE_CLIP_STATE");
+    return env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+}
+
 static void blurayOnClipUpdate(demux_t *p_demux, uint32_t clip)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
+    const bool b_trace_clip_state = open3dblurayTraceClipStateEnabled();
 
     vlc_mutex_lock(&p_sys->pl_info_lock);
 
@@ -4768,6 +7328,66 @@ static void blurayOnClipUpdate(demux_t *p_demux, uint32_t clip)
     }
 
     CLPI_CL *clpi = bd_get_clpi(p_sys->bluray, clip);
+    if (b_trace_clip_state && p_sys->p_clip_info != NULL) {
+        const BLURAY_CLIP_INFO *p_clip = p_sys->p_clip_info;
+        const BLURAY_STREAM_INFO *p_video0 = p_clip->video_stream_count > 0
+                                           ? &p_clip->video_streams[0]
+                                           : NULL;
+        const unsigned i_playlist = p_sys->p_pl_info != NULL
+                                  ? p_sys->p_pl_info->playlist
+                                  : 0;
+        const unsigned i_actual_app = clpi != NULL ? clpi->clip.application_type : 0;
+
+        fprintf(stderr,
+                "open3dbluray raw clip-state playlist=%u clip_ref=%u clip_id=%.5s "
+                "tracked_app=%s(%u) clpi_app=%s(%u) still=%s(%u) still_time=%u "
+                "pkt_count=%u start=%" PRIu64 " in=%" PRIu64 " out=%" PRIu64 " "
+                "video=%u audio=%u pg=%u ig=%u sec_video=%u sec_audio=%u "
+                "v0_pid=%u v0_type=%s(0x%02x) v0_fmt=%u v0_rate=%u v0_aspect=%u\n",
+                i_playlist,
+                clip,
+                p_clip->clip_id,
+                open3dblurayClipAppTypeName((unsigned)p_sys->clip_application_type),
+                (unsigned)p_sys->clip_application_type,
+                open3dblurayClipAppTypeName(i_actual_app),
+                i_actual_app,
+                open3dblurayStillModeName((unsigned)p_clip->still_mode),
+                (unsigned)p_clip->still_mode,
+                (unsigned)p_clip->still_time,
+                (unsigned)p_clip->pkt_count,
+                p_clip->start_time,
+                p_clip->in_time,
+                p_clip->out_time,
+                (unsigned)p_clip->video_stream_count,
+                (unsigned)p_clip->audio_stream_count,
+                (unsigned)p_clip->pg_stream_count,
+                (unsigned)p_clip->ig_stream_count,
+                (unsigned)p_clip->sec_video_stream_count,
+                (unsigned)p_clip->sec_audio_stream_count,
+                p_video0 != NULL ? (unsigned)p_video0->pid : 0u,
+                p_video0 != NULL ? open3dblurayStreamCodingTypeName((unsigned)p_video0->coding_type)
+                                 : "none",
+                p_video0 != NULL ? (unsigned)p_video0->coding_type : 0u,
+                p_video0 != NULL ? (unsigned)p_video0->format : 0u,
+                p_video0 != NULL ? (unsigned)p_video0->rate : 0u,
+                p_video0 != NULL ? (unsigned)p_video0->aspect : 0u);
+    } else if (b_trace_clip_state) {
+        const unsigned i_playlist = p_sys->p_pl_info != NULL
+                                  ? p_sys->p_pl_info->playlist
+                                  : 0;
+        const unsigned i_actual_app = clpi != NULL ? clpi->clip.application_type : 0;
+
+        fprintf(stderr,
+                "open3dbluray raw clip-state playlist=%u clip_ref=%u clip_info=missing "
+                "tracked_app=%s(%u) clpi_app=%s(%u)\n",
+                i_playlist,
+                clip,
+                open3dblurayClipAppTypeName((unsigned)p_sys->clip_application_type),
+                (unsigned)p_sys->clip_application_type,
+                open3dblurayClipAppTypeName(i_actual_app),
+                i_actual_app);
+    }
+
     if(clpi && clpi->clip.application_type != p_sys->clip_application_type)
     {
         if(p_sys->clip_application_type == BD_CLIP_APP_TYPE_TS_MAIN_PATH_TIMED_SLIDESHOW ||
@@ -4789,9 +7409,168 @@ static void blurayOnClipUpdate(demux_t *p_demux, uint32_t clip)
     blurayResetStillImage(p_demux);
 }
 
+static bool open3dblurayShouldTraceBdEvent(uint32_t event)
+{
+    switch ((bd_event_e)event) {
+    case BD_EVENT_TITLE:
+    case BD_EVENT_PLAYLIST:
+    case BD_EVENT_PLAYITEM:
+    case BD_EVENT_SEEK:
+    case BD_EVENT_PLAYLIST_STOP:
+    case BD_EVENT_DISCONTINUITY:
+    case BD_EVENT_STILL:
+    case BD_EVENT_STILL_TIME:
+    case BD_EVENT_END_OF_TITLE:
+    case BD_EVENT_IDLE:
+    case BD_EVENT_POPUP:
+    case BD_EVENT_MENU:
+    case BD_EVENT_STEREOSCOPIC_STATUS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void open3dblurayLogBdEventState(demux_t *p_demux, const char *psz_phase,
+                                        const BD_EVENT *e, bool b_delayed)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    unsigned i_playlist = 0;
+    unsigned i_clip_app = 0;
+
+    vlc_mutex_lock(&p_sys->pl_info_lock);
+    if (p_sys->p_pl_info != NULL)
+        i_playlist = p_sys->p_pl_info->playlist;
+    i_clip_app = (unsigned)p_sys->clip_application_type;
+    vlc_mutex_unlock(&p_sys->pl_info_lock);
+
+    const char *psz_name = bd_event_name((uint32_t)e->event);
+
+    msg_Info(p_demux,
+             "%s trace bd-event phase=%s name=%s(%d) param=%d delayed=%d "
+             "title=%d seekpoint=%d playlist=%u clip_app=%s(%u) "
+             "pl_playing=%d menu=%d menu_open=%d popup=%d draining=%d still_active=%d",
+             OPEN3DBLURAY_LOG_PREFIX,
+             psz_phase,
+             psz_name != NULL ? psz_name : "UNKNOWN",
+             e->event,
+             e->param,
+             b_delayed ? 1 : 0,
+             p_demux->info.i_title,
+             p_demux->info.i_seekpoint,
+             i_playlist,
+             open3dblurayClipAppTypeName(i_clip_app),
+             i_clip_app,
+             p_sys->b_pl_playing ? 1 : 0,
+             p_sys->b_menu ? 1 : 0,
+             p_sys->b_menu_open ? 1 : 0,
+             p_sys->b_popup_available ? 1 : 0,
+             p_sys->b_draining ? 1 : 0,
+             p_sys->i_still_end_time != STILL_IMAGE_NOT_SET ? 1 : 0);
+}
+
+static void open3dblurayLogProbeRedundantEndOfTitleYield(demux_t *p_demux,
+                                                         const BD_EVENT *e)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    unsigned i_playlist = 0;
+
+    vlc_mutex_lock(&p_sys->pl_info_lock);
+    if (p_sys->p_pl_info != NULL)
+        i_playlist = p_sys->p_pl_info->playlist;
+    vlc_mutex_unlock(&p_sys->pl_info_lock);
+
+    msg_Warn(p_demux,
+             "%s probe redundant_end_of_title_yield count=%u title=%d seekpoint=%d "
+             "playlist=%u param=%d menu=%d menu_open=%d popup=%d draining=%d",
+             OPEN3DBLURAY_LOG_PREFIX,
+             p_sys->i_probe_redundant_end_of_title_yield_count,
+             p_demux->info.i_title,
+             p_demux->info.i_seekpoint,
+             i_playlist,
+             e != NULL ? e->param : 0,
+             p_sys->b_menu ? 1 : 0,
+             p_sys->b_menu_open ? 1 : 0,
+             p_sys->b_popup_available ? 1 : 0,
+             p_sys->b_draining ? 1 : 0);
+}
+
+static void open3dblurayLogRedundantEndOfTitleStorm(demux_t *p_demux,
+                                                    const BD_EVENT *e,
+                                                    unsigned i_streak)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+    unsigned i_playlist = 0;
+
+    vlc_mutex_lock(&p_sys->pl_info_lock);
+    if (p_sys->p_pl_info != NULL)
+        i_playlist = p_sys->p_pl_info->playlist;
+    vlc_mutex_unlock(&p_sys->pl_info_lock);
+
+    msg_Warn(p_demux,
+             "%s fix redundant_end_of_title_storm streak=%u title=%d seekpoint=%d "
+             "playlist=%u param=%d menu=%d menu_open=%d popup=%d draining=%d",
+             OPEN3DBLURAY_LOG_PREFIX,
+             i_streak,
+             p_demux->info.i_title,
+             p_demux->info.i_seekpoint,
+             i_playlist,
+             e != NULL ? e->param : 0,
+             p_sys->b_menu ? 1 : 0,
+             p_sys->b_menu_open ? 1 : 0,
+             p_sys->b_popup_available ? 1 : 0,
+             p_sys->b_draining ? 1 : 0);
+}
+
+static void open3dblurayHandleInterruptedPlaylistStop(demux_t *p_demux,
+                                                      const char *reason)
+{
+    demux_sys_t *p_sys = p_demux->p_sys;
+
+    if (!p_sys->b_pl_playing)
+        return;
+
+    /* BD_EVENT_PLAYLIST_STOP is the authoritative interruption boundary for
+     * menu-driven playlist hops. Handle the parser/PCR flush there so the
+     * following PLAYLIST event does not force a second avoidable restart. */
+    msg_Info(p_demux, "Stopping playlist playback reason=%s",
+             reason != NULL ? reason : "unspecified");
+    blurayRestartParser(p_demux, false, false);
+    es_out_Control(p_demux->out, ES_OUT_RESET_PCR);
+
+    if (p_sys->b_menu_open)
+    {
+        if (open3dblurayShouldPreserveMenuStateOnPlaylistTransition(p_demux))
+        {
+            const bool still_active =
+                open3dblurayStillImageActive(p_demux);
+            const bool ig_regions =
+                open3dblurayInteractiveGraphicsOverlayHasRegions(p_demux);
+            const bool ig_overlay_present =
+                open3dblurayInteractiveGraphicsOverlayPresent(p_demux);
+            msg_Info(p_demux,
+                     "menu_state event=playlist-transition preserve=1 menu_open=%d still_active=%d ig_regions=%d ig_overlay_present=%d",
+                     p_sys->b_menu_open ? 1 : 0,
+                     still_active ? 1 : 0,
+                     ig_regions ? 1 : 0,
+                     ig_overlay_present ? 1 : 0);
+        }
+        else
+        {
+            open3dblurayClearActiveMenuState(p_demux, "playlist_transition");
+        }
+    }
+
+    p_sys->b_pl_playing = false;
+    p_sys->b_draining = false;
+}
+
 static void blurayHandleEvent(demux_t *p_demux, const BD_EVENT *e, bool b_delayed)
 {
     demux_sys_t *p_sys = p_demux->p_sys;
+
+    if (open3dblurayShouldTraceBdEvent((uint32_t)e->event))
+        open3dblurayLogBdEventState(p_demux, "enter", e, b_delayed);
 
     switch (e->event) {
     case BD_EVENT_TITLE:
@@ -4803,21 +7582,26 @@ static void blurayHandleEvent(demux_t *p_demux, const BD_EVENT *e, bool b_delaye
         setTitleInfo(p_sys, NULL);
         /* reset title infos here ? */
         p_demux->info.i_update |= INPUT_UPDATE_TITLE | INPUT_UPDATE_SEEKPOINT; /* might be BD-J title with no video */
+        open3dblurayLogBdEventState(p_demux, "after", e, b_delayed);
         break;
     case BD_EVENT_PLAYLIST:
         /* Start of playlist playback (?????.mpls) */
         blurayUpdatePlaylist(p_demux, e->param);
         if (p_sys->b_pl_playing) {
-            /* previous playlist was stopped in middle. flush to avoid delay */
-            msg_Info(p_demux, "Stopping playlist playback");
-            blurayRestartParser(p_demux, false, false);
-            es_out_Control( p_demux->out, ES_OUT_RESET_PCR );
+            open3dblurayHandleInterruptedPlaylistStop(
+                p_demux, "playlist_event_without_stop");
         }
         p_sys->b_pl_playing = true;
+        open3dblurayLogBdEventState(p_demux, "after", e, b_delayed);
+        break;
+    case BD_EVENT_PLAYLIST_STOP:
+        open3dblurayHandleInterruptedPlaylistStop(p_demux, "playlist_stop");
+        open3dblurayLogBdEventState(p_demux, "after", e, b_delayed);
         break;
     case BD_EVENT_PLAYITEM:
         notifyDiscontinuityToParser(p_sys);
         blurayOnClipUpdate(p_demux, e->param);
+        open3dblurayLogBdEventState(p_demux, "after", e, b_delayed);
         break;
     case BD_EVENT_CHAPTER:
         if (e->param && e->param < 0xffff)
@@ -4846,10 +7630,28 @@ static void blurayHandleEvent(demux_t *p_demux, const BD_EVENT *e, bool b_delaye
         break;
 #endif
     case BD_EVENT_MENU:
+        msg_Warn(p_demux,
+                 "%s menu_event_handle param=%d delayed=%d before_open=%d popup_available=%d",
+                 OPEN3DBLURAY_LOG_PREFIX,
+                 e->param,
+                 b_delayed ? 1 : 0,
+                 p_sys->b_menu_open ? 1 : 0,
+                 p_sys->b_popup_available ? 1 : 0);
         p_sys->b_menu_open = e->param;
+        if (p_sys->b_menu_open)
+            open3dblurayAttachDirectBridgesToVout(p_demux);
+        open3dblurayPublishMenuOpenState(p_demux);
+        open3dblurayPublishForceMonoMenuState(p_demux);
+        msg_Info(p_demux, "menu_state event=menu open=%d popup_available=%d",
+                 p_sys->b_menu_open, p_sys->b_popup_available);
+        open3dblurayLogBdEventState(p_demux, "after", e, b_delayed);
         break;
     case BD_EVENT_POPUP:
         p_sys->b_popup_available = e->param;
+        open3dblurayPublishPopupAvailableState(p_demux);
+        msg_Info(p_demux, "menu_state event=popup available=%d menu_open=%d",
+                 p_sys->b_popup_available, p_sys->b_menu_open);
+        open3dblurayLogBdEventState(p_demux, "after", e, b_delayed);
         /* TODO: show / hide pop-up menu button in gui ? */
         break;
 
@@ -4895,13 +7697,16 @@ static void blurayHandleEvent(demux_t *p_demux, const BD_EVENT *e, bool b_delaye
     /*
      * playback control events
      */
+    case BD_EVENT_STILL:
     case BD_EVENT_STILL_TIME:
         blurayStillImage(p_demux, e->param);
+        open3dblurayLogBdEventState(p_demux, "after", e, b_delayed);
         break;
     case BD_EVENT_DISCONTINUITY:
         /* reset demuxer (partially decoded PES packets must be dropped) */
         blurayRestartParser(p_demux, false, true);
         es_out_Control(p_sys->p_out, BLURAY_ES_OUT_CONTROL_FLAG_DISCONTINUITY);
+        open3dblurayLogBdEventState(p_demux, "after", e, b_delayed);
         break;
     case BD_EVENT_END_OF_TITLE:
         if(p_sys->b_pl_playing)
@@ -4911,16 +7716,40 @@ static void blurayHandleEvent(demux_t *p_demux, const BD_EVENT *e, bool b_delaye
             p_sys->b_draining = true;
             p_sys->b_pl_playing = false;
         }
+        open3dblurayLogBdEventState(p_demux, "after", e, b_delayed);
         break;
     case BD_EVENT_IDLE:
         /* nothing to do (ex. BD-J is preparing menus, waiting user input or running animation) */
         /* avoid busy loop (bd_read() returns no data) */
         msleep( 40000 );
+        open3dblurayLogBdEventState(p_demux, "after", e, b_delayed);
         break;
 
     default:
-        msg_Warn(p_demux, "event: %d param: %d", e->event, e->param);
+    {
+        const char *psz_name = bd_event_name((uint32_t)e->event);
+        unsigned i_playlist = 0;
+
+        vlc_mutex_lock(&p_sys->pl_info_lock);
+        if (p_sys->p_pl_info != NULL)
+            i_playlist = p_sys->p_pl_info->playlist;
+        vlc_mutex_unlock(&p_sys->pl_info_lock);
+
+        msg_Warn(p_demux,
+                 "%s unhandled bd-event name=%s(%d) param=%d delayed=%d "
+                 "title=%d playlist=%u menu_open=%d popup=%d pl_playing=%d",
+                 OPEN3DBLURAY_LOG_PREFIX,
+                 psz_name != NULL ? psz_name : "UNKNOWN",
+                 e->event,
+                 e->param,
+                 b_delayed ? 1 : 0,
+                 p_demux->info.i_title,
+                 i_playlist,
+                 p_sys->b_menu_open ? 1 : 0,
+                 p_sys->b_popup_available ? 1 : 0,
+                 p_sys->b_pl_playing ? 1 : 0);
         break;
+    }
     }
 }
 
@@ -4953,8 +7782,26 @@ static void blurayHandleOverlays(demux_t *p_demux, int nread)
         }
         vlc_mutex_lock(&ov->lock);
         bool display = ov->status == ToDisplay;
+        const unsigned region_count = open3dblurayCountRegionChain(ov->p_regions);
+        const int i_channel = ov->i_channel;
         vlc_mutex_unlock(&ov->lock);
         if (display) {
+            const bool trace_overlay = open3dblurayTraceInteractiveGraphicsBridgeEnabled();
+            const bool trace_visuals = open3dblurayTraceMenuVisualsEnabled();
+            const bool bdj_title = blurayIsBdjTitle(p_demux);
+            const bool still_active = open3dblurayStillImageActive(p_demux);
+            const bool clip_has_primary_video =
+                open3dblurayCurrentClipHasUsablePrimaryVideo(p_demux);
+            const bool need_legacy_background =
+                (!p_sys->p_vout && !p_sys->p_dummy_video && p_sys->b_menu &&
+                 !p_sys->p_pl_info && nread == 0 && bdj_title);
+            const bool need_menu_open_ig_background =
+                (!p_sys->p_dummy_video && p_sys->b_menu &&
+                 p_sys->b_menu_open &&
+                 !clip_has_primary_video &&
+                 p_sys->p_vout == NULL &&
+                 (nread == 0 || still_active) &&
+                 ov->plane == BD_OVERLAY_IG && region_count > 0);
             if (p_sys->p_vout == NULL)
                 open3dblurayEnsureVout(p_demux);
 
@@ -4963,20 +7810,53 @@ static void blurayHandleOverlays(demux_t *p_demux, int nread)
                disappears and just playlist is shown.
                (sometimes BD-J runs slowly ...)
             */
-            if (!p_sys->p_vout && !p_sys->p_dummy_video && p_sys->b_menu &&
-                !p_sys->p_pl_info && nread == 0 &&
-                blurayIsBdjTitle(p_demux)) {
+            if (trace_visuals)
+                msg_Warn(p_demux,
+                         "open3dbluray trace background-gate plane=%s regions=%u menu=%d menu_open=%d vout=%d dummy=%d pl_info=%d nread=%d bdj_title=%d still=%d clip_has_video=%d create=%d",
+                         open3dblurayOverlayPlaneName((unsigned)ov->plane),
+                         region_count,
+                         p_sys->b_menu ? 1 : 0,
+                         p_sys->b_menu_open ? 1 : 0,
+                         p_sys->p_vout != NULL ? 1 : 0,
+                         p_sys->p_dummy_video != NULL ? 1 : 0,
+                         p_sys->p_pl_info != NULL ? 1 : 0,
+                         nread,
+                         bdj_title ? 1 : 0,
+                         still_active ? 1 : 0,
+                         clip_has_primary_video ? 1 : 0,
+                         (need_legacy_background || need_menu_open_ig_background) ? 1 : 0);
 
-                /* Looks like there's no video stream playing.
-                   Emit blank frame so that BD-J overlay can be drawn. */
-                if(blurayCreateBackgroundUnlocked(p_demux) != NULL)
-                    p_sys->p_vout = input_GetVout(p_demux->p_input);
+            if (need_legacy_background || need_menu_open_ig_background) {
+
+                /* Only stand up the synthetic background when there is no
+                   tracked vout at all. Replacing an already-live still-image
+                   vout with a dummy rawvideo ES is what tends to spawn a
+                   second top-level window at menu-open and split the menu
+                   overlay from the background video. */
+                if (blurayCreateBackgroundUnlocked(p_demux) != NULL)
+                    open3dblurayEnsureVout(p_demux);
             }
 
             if (p_sys->p_vout != NULL) {
-                open3dblurayAttachSubtitleBridgeToVout(p_demux);
-                open3dblurayPublishSubtitleOffsetToVout(p_demux, ov);
-                if (open3dblurayUseDirectSubtitleBridge(p_demux, ov)) {
+                open3dblurayAttachDirectBridgesToVout(p_demux);
+                open3dblurayTraceOverlayCoverage(p_demux, "dispatch", ov,
+                                                 open3dblurayUseDirectOverlayBridge(p_demux, ov),
+                                                 p_sys->b_menu_open);
+                if (trace_overlay && ov->plane == BD_OVERLAY_IG)
+                    open3dblurayTraceIgRegionChain(p_demux, "dispatch", ov,
+                                                   open3dblurayUseDirectOverlayBridge(p_demux, ov),
+                                                   p_sys->b_menu_open);
+                if (trace_overlay && ov->plane == BD_OVERLAY_IG)
+                    msg_Dbg(p_demux,
+                            "open3dbluray trace overlay dispatch plane=%u regions=%u channel=%d vout=%d direct=%d",
+                            (unsigned)ov->plane,
+                            region_count,
+                            i_channel,
+                            p_sys->p_vout != NULL ? 1 : 0,
+                            open3dblurayUseDirectOverlayBridge(p_demux, ov) ? 1 : 0);
+                if (ov->plane == BD_OVERLAY_PG)
+                    open3dblurayPublishSubtitleOffsetToVout(p_demux, ov);
+                if (open3dblurayUseDirectOverlayBridge(p_demux, ov)) {
                     open3dblurayDetachOverlaySubpictureFromVout(p_demux, ov);
                     vlc_mutex_lock(&ov->lock);
                     ov->status = Displayed;
@@ -4984,6 +7864,14 @@ static void blurayHandleOverlays(demux_t *p_demux, int nread)
                 } else {
                     bluraySendOverlayToVout(p_demux, ov);
                 }
+            } else if (trace_overlay && ov->plane == BD_OVERLAY_IG) {
+                msg_Dbg(p_demux,
+                        "open3dbluray trace overlay dispatch plane=%u regions=%u channel=%d vout=%d direct=%d",
+                        (unsigned)ov->plane,
+                        region_count,
+                        i_channel,
+                        0,
+                        0);
             }
         }
     }
@@ -4997,14 +7885,30 @@ static int onIntfEvent( vlc_object_t *p_input, char const *psz_var,
     (void)p_input; (void) psz_var; (void) oldval;
     demux_t *p_demux = p_data;
     demux_sys_t *p_sys = p_demux->p_sys;
+    const bool trace = open3dblurayTraceInteractiveGraphicsBridgeEnabled();
 
     if (val.i_int == INPUT_EVENT_VOUT) {
+        vout_thread_t *current_vout = input_GetVout(p_demux->p_input);
 
-        vlc_mutex_lock(&p_sys->bdj_overlay_lock);
-        if( p_sys->p_vout != NULL ) {
-            blurayReleaseVout(p_demux);
+        if (trace)
+            msg_Dbg(p_demux,
+                    "open3dbluray trace ig-bridge vout-event tracked=%p current=%p menu_open=%d popup=%d",
+                    (void *)p_sys->p_vout,
+                    (void *)current_vout,
+                    p_sys->b_menu_open ? 1 : 0,
+                    p_sys->b_popup_available ? 1 : 0);
+
+        if (current_vout != NULL)
+            open3dblurayAdoptAcquiredVout(p_demux, current_vout, "intf-event");
+        else
+        {
+            if (trace && p_sys->p_vout != NULL)
+                msg_Dbg(p_demux,
+                        "open3dbluray trace ig-bridge vout-event-defer tracked=%p current=%p",
+                        (void *)p_sys->p_vout,
+                        (void *)current_vout);
+            open3dblurayRefreshTrackedVoutState(p_demux, "intf-event-defer");
         }
-        vlc_mutex_unlock(&p_sys->bdj_overlay_lock);
 
         blurayHandleOverlays(p_demux, 1);
     }
@@ -5043,14 +7947,68 @@ static int blurayDemux(demux_t *p_demux)
 
     if (p_sys->b_menu == false) {
         nread = bd_read(p_sys->bluray, p_block->p_buffer, BD_READ_SIZE);
-        while (bd_get_event(p_sys->bluray, &e))
+        while (bd_get_event(p_sys->bluray, &e)) {
+            if (e.event == BD_EVENT_MENU) {
+                msg_Warn(p_demux,
+                         "%s menu_event_dispatch source=bd_get_event menu_mode=0 param=%d",
+                         OPEN3DBLURAY_LOG_PREFIX,
+                         e.param);
+            }
             blurayHandleEvent(p_demux, &e, false);
+        }
     } else {
+        bool b_yield_after_redundant_end_of_title = false;
+
         nread = bd_read_ext(p_sys->bluray, p_block->p_buffer, BD_READ_SIZE, &e);
         while (e.event != BD_EVENT_NONE) {
+            if (e.event == BD_EVENT_MENU) {
+                msg_Warn(p_demux,
+                         "%s menu_event_dispatch source=%s menu_mode=1 param=%d",
+                         OPEN3DBLURAY_LOG_PREFIX,
+                         nread >= 0 ? "bd_read_ext" : "bd_read_ext(error)",
+                         e.param);
+            }
+            const bool b_redundant_end_of_title =
+                e.event == BD_EVENT_END_OF_TITLE &&
+                !p_sys->b_pl_playing;
+            if (b_redundant_end_of_title)
+                p_sys->i_redundant_end_of_title_streak++;
+            else
+                p_sys->i_redundant_end_of_title_streak = 0;
+            const bool b_probe_redundant_end_of_title =
+                p_sys->b_probe_yield_redundant_end_of_title &&
+                b_redundant_end_of_title;
             blurayHandleEvent(p_demux, &e, false);
+            if (b_probe_redundant_end_of_title) {
+                p_sys->i_probe_redundant_end_of_title_yield_count++;
+                if (!p_sys->b_probe_logged_redundant_end_of_title ||
+                    (p_sys->i_probe_redundant_end_of_title_yield_count % 1024u) == 0u) {
+                    open3dblurayLogProbeRedundantEndOfTitleYield(p_demux, &e);
+                    p_sys->b_probe_logged_redundant_end_of_title = true;
+                }
+                b_yield_after_redundant_end_of_title = true;
+                break;
+            }
+            if (b_redundant_end_of_title &&
+                p_sys->i_redundant_end_of_title_streak >= 2u) {
+                if (p_sys->i_redundant_end_of_title_streak == 2u ||
+                    (p_sys->i_redundant_end_of_title_streak % 1024u) == 0u) {
+                    open3dblurayLogRedundantEndOfTitleStorm(
+                        p_demux, &e, p_sys->i_redundant_end_of_title_streak);
+                }
+                b_yield_after_redundant_end_of_title = true;
+                break;
+            }
             bd_get_event(p_sys->bluray, &e);
+            if (e.event == BD_EVENT_MENU) {
+                msg_Warn(p_demux,
+                         "%s menu_event_dispatch source=bd_get_event menu_mode=1 param=%d",
+                         OPEN3DBLURAY_LOG_PREFIX,
+                         e.param);
+            }
         }
+        if (b_yield_after_redundant_end_of_title)
+            msleep(40000);
     }
 
     /* Process delayed selections events */
@@ -5087,8 +8045,20 @@ static int blurayDemux(demux_t *p_demux)
     }
 
     p_block->i_buffer = nread;
+    open3dblurayTraceSubtitleSourceBlock(p_demux, p_block->p_buffer, p_block->i_buffer);
 
-    stopBackground(p_demux);
+    if (open3dblurayShouldHoldBackground(p_demux)) {
+        if (open3dblurayTraceMenuVisualsEnabled())
+            msg_Warn(p_demux,
+                     "open3dbluray trace background-create phase=hold menu=%d menu_open=%d vout=%d dummy=%d nread=%d",
+                     p_sys->b_menu ? 1 : 0,
+                     p_sys->b_menu_open ? 1 : 0,
+                     p_sys->p_vout != NULL ? 1 : 0,
+                     p_sys->p_dummy_video != NULL ? 1 : 0,
+                     nread);
+    } else {
+        stopBackground(p_demux);
+    }
 
 #if OPEN3DBLURAY_ENABLE_MVC
     vlc_demux_chained_Send(p_sys->p_parser, p_block);

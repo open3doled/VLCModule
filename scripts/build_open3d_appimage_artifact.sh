@@ -9,6 +9,10 @@ APPIMAGE_ROOT="${OPEN3D_APPIMAGE_WORK_ROOT:-/opt/open3doled-appimage}"
 BUILD_ROOT="${APPIMAGE_ROOT}/build"
 TOOLS_DIR="${APPIMAGE_ROOT}/tools"
 BLURAY_STAGE_DIR="${OPEN3D_LIBBLURAY_STAGE_DIR:-${BUILD_ROOT}/vendor/libbluray/stage}"
+ACCESS_PLUGIN_OVERRIDE_PATH="${OPEN3D_APPIMAGE_ACCESS_PLUGIN_PATH:-}"
+VOUT_PLUGIN_OVERRIDE_PATH="${OPEN3D_APPIMAGE_VOUT_PLUGIN_PATH:-}"
+ITEM73_ACCESS_PLUS_HEADER_REFRESH="${OPEN3D_APPIMAGE_ITEM73_ACCESS_PLUS_HEADER_REFRESH:-0}"
+ITEM73_MIN_COMPANION_REFRESH="${OPEN3D_APPIMAGE_ITEM73_MIN_COMPANION_REFRESH:-0}"
 RUN_STAMP="${OPEN3D_APPIMAGE_RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
 APPDIR_OUT_ROOT="${OPEN3D_APPIMAGE_APPDIR_OUT_ROOT:-/out/appdir-builds}"
 APPIMAGE_OUT_ROOT="${OPEN3D_APPIMAGE_ARTIFACT_OUT_ROOT:-/out/appimage-builds}"
@@ -17,6 +21,7 @@ SUMMARY_FILE="${RUN_DIR}/summary.txt"
 APPIMAGETOOL_LOG="${RUN_DIR}/appimagetool.log"
 VERIFY_LOG="${RUN_DIR}/appimage-verify.log"
 SKIP_APPDIR_BUILD="${OPEN3D_APPIMAGE_SKIP_APPDIR_BUILD:-0}"
+SKIP_VERIFY="${OPEN3D_APPIMAGE_SKIP_VERIFY:-0}"
 APPDIR_DIR="${OPEN3D_APPIMAGE_APPDIR_PATH:-${APPDIR_OUT_ROOT}/${RUN_STAMP}/AppDir}"
 APPIMAGETOOL_URL="${OPEN3D_APPIMAGETOOL_URL:-https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage}"
 APPIMAGETOOL_BIN="${TOOLS_DIR}/appimagetool-x86_64.AppImage"
@@ -76,12 +81,20 @@ extract_embedded_appimage() {
 
 download_appimagetool() {
   mkdir -p "${TOOLS_DIR}"
+  if [[ -x "${APPIMAGETOOL_BIN}" ]]; then
+    log "Reusing cached appimagetool: ${APPIMAGETOOL_BIN}"
+    return 0
+  fi
   curl -L --fail --output "${APPIMAGETOOL_BIN}" "${APPIMAGETOOL_URL}"
   chmod 0755 "${APPIMAGETOOL_BIN}"
 }
 
 extract_appimagetool() {
   local offset
+  if [[ -x "${APPIMAGETOOL_RUN}" ]]; then
+    log "Reusing cached extracted appimagetool: ${APPIMAGETOOL_RUN}"
+    return 0
+  fi
   if ! offset="$(
     extract_embedded_appimage \
       "${APPIMAGETOOL_BIN}" \
@@ -189,11 +202,21 @@ log "repo=${REPO_DIR}"
 log "vlc_version=${VLC_VERSION}"
 log "run_stamp=${RUN_STAMP}"
 log "skip_appdir_build=${SKIP_APPDIR_BUILD}"
+log "skip_verify=${SKIP_VERIFY}"
 log "appimagetool_url=${APPIMAGETOOL_URL}"
+log "item73_access_plus_header_refresh=${ITEM73_ACCESS_PLUS_HEADER_REFRESH}"
+log "item73_min_companion_refresh=${ITEM73_MIN_COMPANION_REFRESH}"
+log "access_plugin_override=${ACCESS_PLUGIN_OVERRIDE_PATH}"
+log "vout_plugin_override=${VOUT_PLUGIN_OVERRIDE_PATH}"
 
 if [[ "${SKIP_APPDIR_BUILD}" != "1" ]]; then
   log "Running AppDir build first"
   OPEN3D_APPIMAGE_RUN_STAMP="${RUN_STAMP}" \
+  OPEN3D_APPIMAGE_ITEM73_ACCESS_PLUS_HEADER_REFRESH="${ITEM73_ACCESS_PLUS_HEADER_REFRESH}" \
+  OPEN3D_APPIMAGE_ITEM73_MIN_COMPANION_REFRESH="${ITEM73_MIN_COMPANION_REFRESH}" \
+  OPEN3D_APPIMAGE_ACCESS_PLUGIN_PATH="${ACCESS_PLUGIN_OVERRIDE_PATH}" \
+  OPEN3D_APPIMAGE_VOUT_PLUGIN_PATH="${VOUT_PLUGIN_OVERRIDE_PATH}" \
+  OPEN3D_APPIMAGE_SKIP_VERIFY="${SKIP_VERIFY}" \
     "${REPO_DIR}/scripts/build_open3d_appimage_appdir.sh"
 fi
 
@@ -223,7 +246,11 @@ if [[ ! -f "${APPIMAGE_PATH}" ]]; then
 fi
 
 chmod 0755 "${APPIMAGE_PATH}"
-verify_appimage
+if [[ "${SKIP_VERIFY}" != "1" ]]; then
+  verify_appimage
+else
+  log "Skipping AppImage verify step"
+fi
 
 log "AppImage: ${APPIMAGE_PATH}"
 log "AppImage tool log: ${APPIMAGETOOL_LOG}"

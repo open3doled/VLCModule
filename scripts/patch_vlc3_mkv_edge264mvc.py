@@ -4,45 +4,6 @@ import sys
 
 
 CODEC_DEFINE = "#define OPEN3DMKV_CODEC_H264 VLC_FOURCC('m','k','v','h')\n"
-ALIAS_BLOCK = """#if defined(OPEN3D_VLC_ABI_ALIAS_T64)
-/*
- * Host distro VLC 3.0.x builds may look for the Debian/Ubuntu t64 module
- * entry symbol even when building against the upstream 3.0.23 source tree.
- * Export both entry names so the staged mkv plugin can be loaded by the host
- * launcher without affecting the AppImage runtime.
- */
-#ifdef __cplusplus
-extern "C" {
-#endif
-extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
-extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
-extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
-EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
-
-EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
-vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
-{
-    return vlc_entry__3_0_0f(vlc_set, opaque);
-}
-
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-vlc_entry_copyright__3_0_0ft64(void)
-{
-    return vlc_entry_copyright__3_0_0f();
-}
-
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-vlc_entry_license__3_0_0ft64(void)
-{
-    return vlc_entry_license__3_0_0f();
-}
-#ifdef __cplusplus
-}
-#endif
-#endif
-"""
 
 OLD_AVC_CASE = """        S_CASE("V_MPEG4/ISO/AVC") {\n            vars.p_fmt->i_codec = VLC_FOURCC( 'a','v','c','1' );\n            fill_extra_data( vars.p_tk, 0 );\n        }\n"""
 NEW_AVC_CASE = """        S_CASE("V_MPEG4/ISO/AVC") {\n            vars.p_fmt->i_codec = OPEN3DMKV_CODEC_H264;\n            fill_extra_data( vars.p_tk, 0 );\n        }\n"""
@@ -530,12 +491,6 @@ def patch_mkv_cpp(path: Path) -> None:
             text = text[:start] + text[end:]
             break
     text = text.replace(anchor, MKV_CPP_HELPERS + anchor, 1)
-    if "vlc_entry__3_0_0ft64" not in text:
-        if MKV_CPP_INCLUDE_ANCHOR not in text:
-            raise SystemExit(f"{path}: mkv alias anchor not found")
-        text = text.replace(MKV_CPP_INCLUDE_ANCHOR,
-                            MKV_CPP_INCLUDE_ANCHOR + "\n" + ALIAS_BLOCK + "\n", 1)
-
     text = ensure_replace(
         text, MKV_OPEN_REGISTER_OLD, MKV_OPEN_REGISTER_NEW,
         f"{path}: mkv Open registration block not found",

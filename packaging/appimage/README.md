@@ -73,6 +73,19 @@ intentionally minimal: it proves the relocatable launcher/lib/plugin/data shape
 before later slices broaden the bundled plugin set and wrap it into a final
 AppImage artifact.
 
+Current BD-J/menu packaging notes:
+
+- the AppDir build copies the libbluray BD-J jars into `usr/share/java`
+- `AppRun` mirrors the maintained Open3DOLED default-on menu policy for
+  explicit `open3dbluraymvc://...` launches
+- `--no-bluray-menu` remains the packaged opt-out path
+- the current AppDir/AppImage shape does not yet bundle a JVM; menu-capable
+  packaged runs should still assume a compatible Java 8 runtime is available
+  on the host until a bundled-JVM slice is explicitly added and validated
+- current maintained real visible/navigable menu validation has only been
+  exercised against a small private reference set; broader packaged disc
+  coverage should be treated as disc-by-disc until separately validated
+
 The host smoke helper is the next diagnostic layer on top of that AppDir. It
 runs the latest exported AppDir on the host in a bounded headless mode
 (`--intf dummy --vout dummy --play-and-exit`) so missing bundled plugins or

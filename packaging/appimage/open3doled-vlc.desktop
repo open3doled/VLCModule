@@ -9,3 +9,8 @@ Terminal=false
 Categories=AudioVideo;Video;Player;
 MimeType=application/x-cd-image;video/x-matroska;video/mp4;video/x-h264;
 StartupNotify=true
+Actions=Open3DSettings;
+
+[Desktop Action Open3DSettings]
+Name=Open3D Settings
+Exec=AppRun --open3d-settings

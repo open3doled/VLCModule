@@ -9,10 +9,11 @@ Tracked here:
 - VLC-side source under `renderer/`
 - canonical VLC 3.0.23 patch under `patches/vlc-3.0.23/`
 - maintained build helpers under `scripts/`
-- root build and launch entry points:
+- root build entry point:
   - `build.sh`
-  - `launcher_sbs.sh`
-  - `launcher_pf.sh`
+- maintained AppImage packaging/launch surface:
+  - `scripts/build_open3d_appimage_artifact.sh`
+  - `packaging/appimage/AppRun`
 - pinned vendor submodules:
   - `vendor/edge264`
   - `vendor/libbluray`
@@ -115,26 +116,48 @@ The maintained build produces and stages:
 
 All generated runtime/build artifacts live under `local/out/`.
 
+Build the maintained AppImage artifact:
+
+```bash
+./scripts/build_open3d_appimage_artifact.sh
+```
+
+The packaged artifact is written under the configured AppImage output root,
+typically `local/out/appimage/appimage-builds/`.
+
 ## Launch
+
+The maintained playback path is the packaged AppImage, not a host VLC launcher.
+
+Page-flipping / `open3d` mode:
+
+```bash
+APPIMAGE=/path/to/Open3DOLED-VLC-3.0.23-x86_64.AppImage
+
+APPIMAGELAUNCHER_DISABLE=1 \
+APPIMAGE_EXTRACT_AND_RUN=1 \
+"${APPIMAGE}" [media-path-or-url] [vlc args...]
+```
 
 SBS monitor mode:
 
 ```bash
-./launcher_sbs.sh [media-path-or-url] [vlc args...]
+APPIMAGE=/path/to/Open3DOLED-VLC-3.0.23-x86_64.AppImage
+
+APPIMAGELAUNCHER_DISABLE=1 \
+APPIMAGE_EXTRACT_AND_RUN=1 \
+OPEN3D_MVC_ENABLE_VOUT=0 \
+"${APPIMAGE}" [media-path-or-url] [vlc args...]
 ```
 
-Open3D page-flipping mode:
+Default AppImage behavior:
+- page-flipping remains the maintained default when `OPEN3D_MVC_ENABLE_VOUT` is
+  unset or `1`
+- set `OPEN3D_MVC_ENABLE_VOUT=0` only for SBS / `--vout=gl` monitor-style runs
+- use `APPIMAGELAUNCHER_DISABLE=1` and `APPIMAGE_EXTRACT_AND_RUN=1` to keep the
+  runtime surface reproducible and independent of desktop AppImage integration
 
-```bash
-./launcher_pf.sh [media-path-or-url] [vlc args...]
-```
-
-Default launcher behavior:
-- do not rebuild if the maintained runtime already exists
-- rebuild automatically only if required runtime artifacts are missing
-- force rebuild only when `--rebuild` is passed
-
-Recommended max-performance launcher defaults on this host:
+Recommended max-performance runtime defaults:
 - `OPEN3D_PROCESS_CPUSET=4-7`
 - `OPEN3D_PROCESS_CPU_BACKEND=auto`
 - `OPEN3D_PRESENTER_PREFERRED_CPU=auto`
@@ -153,15 +176,19 @@ These values are now the default in both launchers. They mean:
 - `OPEN3D_PROCESS_IO_PRIORITY=0`
   - use the highest best-effort I/O priority
 
-Manual example with the recommended settings spelled out explicitly:
+Manual AppImage example with the recommended settings spelled out explicitly:
 
 ```bash
+APPIMAGE=/path/to/Open3DOLED-VLC-3.0.23-x86_64.AppImage
+
+APPIMAGELAUNCHER_DISABLE=1 \
+APPIMAGE_EXTRACT_AND_RUN=1 \
 OPEN3D_PROCESS_CPUSET=4-7 \
 OPEN3D_PROCESS_CPU_BACKEND=auto \
 OPEN3D_PRESENTER_PREFERRED_CPU=auto \
 OPEN3D_PROCESS_IO_CLASS=best-effort \
 OPEN3D_PROCESS_IO_PRIORITY=0 \
-./launcher_pf.sh "/path/to/disc.iso"
+"${APPIMAGE}" "/path/to/disc.iso"
 ```
 
 Remaining potential performance work from the tracked plan is now mainly the
@@ -170,6 +197,8 @@ direct-presentation feasibility track:
   remaining jitter further
 - if that is not enough, evaluate a separate DRM/KMS-style direct presentation
   path as a larger follow-on effort
+- deferred KMS/direct-display notes are tracked in
+  `docs/KMS_DIRECT_PLAYBACK_FUTURE.md`
 
 ## Supported Maintained Inputs
 
@@ -182,6 +211,66 @@ direct-presentation feasibility track:
   - normal Matroska AVC opens can now route to `edge264mvc` through the custom `mkv` module without requiring URL tricks
 - `.264`, `.h264`, `.mvc`
   - played with `--demux=open3dannexb` raw Annex-B passthrough
+
+## Blu-ray Menus
+
+Current maintained Blu-ray menu policy:
+- explicit Open3DOLED Blu-ray launches default to menus on
+- the CLI opt-out is `--no-bluray-menu`
+- the in-process `Open Disc` 3D UI opt-out is `Start without menus`
+- stock `Blu-ray` remains the stock VLC/libbluray path; the Open3DOLED
+  default-on menu policy applies to the explicit Open3DOLED 3D Blu-ray path
+
+Current maintained AppImage runtime prerequisite:
+- BD-J menu validation on the AppImage path currently assumes Java 8
+- if the host default JVM is newer, BD-J can fail during startup with module
+  access errors such as `IllegalAccessError`
+- before menu-capable AppImage runs, prefer exporting a Java 8 runtime
+  explicitly:
+
+```bash
+APPIMAGE=/path/to/Open3DOLED-VLC-3.0.23-x86_64.AppImage
+
+export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+export PATH="$JAVA_HOME/bin:$PATH"
+APPIMAGELAUNCHER_DISABLE=1 APPIMAGE_EXTRACT_AND_RUN=1 "${APPIMAGE}" "/path/to/disc.iso"
+```
+
+Menu-capable vs no-menu AppImage examples:
+
+```bash
+APPIMAGE=/path/to/Open3DOLED-VLC-3.0.23-x86_64.AppImage
+
+APPIMAGELAUNCHER_DISABLE=1 APPIMAGE_EXTRACT_AND_RUN=1 "${APPIMAGE}" "/path/to/disc.iso"
+APPIMAGELAUNCHER_DISABLE=1 APPIMAGE_EXTRACT_AND_RUN=1 "${APPIMAGE}" "/path/to/disc.iso" --no-bluray-menu
+```
+
+Current support boundary and limitations:
+- maintained real visible/navigable menu validation on the actual X11 launcher
+  path has only been exercised against a small private reference set
+- broader Blu-ray menu compatibility should still be treated as disc-by-disc
+  until separately validated
+- the explicit Open3DOLED 3D Blu-ray path is the maintained menu-capable path;
+  stock `Blu-ray` remains the stock VLC/libbluray path
+- if you need the older fallback behavior for a disc that has not yet been
+  validated on the maintained menu path, use `--no-bluray-menu` or
+  `Start without menus`
+
+Developer note for future menu debugging:
+- before deeper BD-J/menu flow tracing, first confirm runtime completeness on
+  the tested path
+- verify the maintained staged runtime or packaged AppDir is actually in use
+- verify BD-J jar exposure is present:
+  - AppRun `LIBBLURAY_CP`
+  - packaged AppDir `usr/share/java`
+- inspect logs for runtime-completeness failures before treating the issue as a
+  disc-logic problem:
+  - `libbluray-j2se-*.jar not found`
+  - `BD-J check: Failed to load libbluray.jar`
+  - `Java required`
+- on the AppImage path, prefer Java 8 and treat Java 9+
+  `IllegalAccessError` module-access faults as environment/runtime failures
+  first
 
 ## MKV 3D Subtitles
 
@@ -203,8 +292,8 @@ What that means in practice:
 - if dynamic MKV depth is missing or unverified, playback falls back cleanly to
   the static per-track MKV offset
 
-Maintained launcher behavior for MKV:
-- `run_open3d_playback_vlc.sh` auto-enables MKV timestamp normalization unless
+Maintained AppRun behavior for MKV:
+- AppRun auto-enables MKV timestamp normalization unless
   explicitly overridden
 - for `--sub-track=N`, the launcher also resolves and passes:
   - `--open3d-mkv-subtitle-force`
@@ -239,11 +328,13 @@ Useful optional flags:
 Known-good manual validation checks:
 - Blu-ray PF subtitle depth
   ```bash
-  OPEN3D_LAUNCHER_SKIP_REBUILD=1 ./launcher_pf.sh "/path/to/disc.iso" --sub-track=2 --open3d-debug-status --verbose=2
+  APPIMAGE=/path/to/Open3DOLED-VLC-3.0.23-x86_64.AppImage
+  APPIMAGELAUNCHER_DISABLE=1 APPIMAGE_EXTRACT_AND_RUN=1 "${APPIMAGE}" "/path/to/disc.iso" --sub-track=2 --open3d-debug-status --verbose=2
   ```
 - MKV PF subtitle depth
   ```bash
-  OPEN3D_LAUNCHER_SKIP_REBUILD=1 ./launcher_pf.sh "/path/to/movie.mkv" --sub-track=4 --open3d-debug-status --verbose=2
+  APPIMAGE=/path/to/Open3DOLED-VLC-3.0.23-x86_64.AppImage
+  APPIMAGELAUNCHER_DISABLE=1 APPIMAGE_EXTRACT_AND_RUN=1 "${APPIMAGE}" "/path/to/movie.mkv" --sub-track=4 --open3d-debug-status --verbose=2
   ```
 - OSD toggle regression check
   - while either title is playing, press `Ctrl+Shift+F9`
@@ -265,9 +356,11 @@ Current maintained subtitle expectations:
 Examples:
 
 ```bash
-./launcher_sbs.sh "/path/to/disc.iso"
-./launcher_pf.sh "/path/to/movie.mkv"
-./launcher_sbs.sh "/path/to/stream.264"
+APPIMAGE=/path/to/Open3DOLED-VLC-3.0.23-x86_64.AppImage
+
+APPIMAGELAUNCHER_DISABLE=1 APPIMAGE_EXTRACT_AND_RUN=1 OPEN3D_MVC_ENABLE_VOUT=0 "${APPIMAGE}" "/path/to/disc.iso"
+APPIMAGELAUNCHER_DISABLE=1 APPIMAGE_EXTRACT_AND_RUN=1 "${APPIMAGE}" "/path/to/movie.mkv"
+APPIMAGELAUNCHER_DISABLE=1 APPIMAGE_EXTRACT_AND_RUN=1 OPEN3D_MVC_ENABLE_VOUT=0 "${APPIMAGE}" "/path/to/stream.264"
 ```
 
 ## VLC Patch Maintenance

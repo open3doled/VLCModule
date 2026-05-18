@@ -33,9 +33,12 @@ STABLE_ROOT="${3:-${REPO_DIR}/local/out/stable_runtime}"
 TARGET="${STABLE_ROOT}/latest"
 PLUGINS_DIR="${TARGET}/plugins"
 HELPER_LIB_DIR="${TARGET}/runtime-lib"
+SHARE_DIR="${TARGET}/share"
+JAVA_DIR="${SHARE_DIR}/java"
 META_FILE="${TARGET}/STAMP.txt"
 VENDOR_BLURAY_STAGE="${OPEN3D_VENDOR_LIBBLURAY_STAGE:-${REPO_DIR}/local/out/vendor_stage/libbluray}"
 VENDOR_BLURAY_LIBDIR="${VENDOR_BLURAY_STAGE}/lib/x86_64-linux-gnu"
+VENDOR_BLURAY_JAVADIR="${VENDOR_BLURAY_STAGE}/share/java"
 
 DECODER_SRC="${VLC_SRC}/modules/.libs/libedge264mvc_plugin.so"
 OPEN3DANNEXB_SRC="${VLC_SRC}/modules/.libs/libopen3dannexb_plugin.so"
@@ -46,6 +49,7 @@ MKV_SRC="${VLC_SRC}/modules/.libs/libmkv_plugin.so"
 QT_UI_SRC="${VLC_SRC}/modules/.libs/libqt_plugin.so"
 DUMMY_SRC="${VLC_SRC}/modules/.libs/libdummy_plugin.so"
 HOTKEYS_SRC="${VLC_SRC}/modules/.libs/libhotkeys_plugin.so"
+OLDRC_SRC="${VLC_SRC}/modules/.libs/liboldrc_plugin.so"
 XCB_HOTKEYS_SRC="${VLC_SRC}/modules/.libs/libxcb_hotkeys_plugin.so"
 
 if [[ ! -f "${DECODER_SRC}" ]]; then
@@ -80,7 +84,8 @@ mkdir -p \
   "${PLUGINS_DIR}/access" \
   "${PLUGINS_DIR}/gui" \
   "${PLUGINS_DIR}/control" \
-  "${HELPER_LIB_DIR}"
+  "${HELPER_LIB_DIR}" \
+  "${JAVA_DIR}"
 
 copy_if_needed "${DECODER_SRC}" "${PLUGINS_DIR}/codec/libedge264mvc_plugin.so"
 rm -f "${PLUGINS_DIR}/demux/libmvcasm_plugin.so"
@@ -116,6 +121,11 @@ if [[ -f "${HOTKEYS_SRC}" ]]; then
 else
   rm -f "${PLUGINS_DIR}/control/libhotkeys_plugin.so"
 fi
+if [[ -f "${OLDRC_SRC}" ]]; then
+  copy_if_needed "${OLDRC_SRC}" "${PLUGINS_DIR}/control/liboldrc_plugin.so"
+else
+  rm -f "${PLUGINS_DIR}/control/liboldrc_plugin.so"
+fi
 if [[ -f "${XCB_HOTKEYS_SRC}" ]]; then
   copy_if_needed "${XCB_HOTKEYS_SRC}" "${PLUGINS_DIR}/control/libxcb_hotkeys_plugin.so"
 else
@@ -135,6 +145,13 @@ if compgen -G "${VENDOR_BLURAY_LIBDIR}/libbluray.so*" > /dev/null; then
     cp -a "${bluray_lib}" "${HELPER_LIB_DIR}/"
   done
 fi
+rm -f "${JAVA_DIR}"/libbluray-j2se-*.jar "${JAVA_DIR}"/libbluray-awt-j2se-*.jar
+if compgen -G "${VENDOR_BLURAY_JAVADIR}/libbluray-j2se-*.jar" > /dev/null; then
+  cp -a "${VENDOR_BLURAY_JAVADIR}"/libbluray-j2se-*.jar "${JAVA_DIR}/"
+fi
+if compgen -G "${VENDOR_BLURAY_JAVADIR}/libbluray-awt-j2se-*.jar" > /dev/null; then
+  cp -a "${VENDOR_BLURAY_JAVADIR}"/libbluray-awt-j2se-*.jar "${JAVA_DIR}/"
+fi
 for family in libebml.so* libmatroska.so*; do
   if compgen -G "/usr/lib/x86_64-linux-gnu/${family}" > /dev/null; then
     for runtime_lib in /usr/lib/x86_64-linux-gnu/${family}; do
@@ -149,6 +166,7 @@ rm -f "${PLUGINS_DIR}/plugins.dat"
   echo "vlc_src=${VLC_SRC}"
   echo "edge264_lib_source=${EDGE264_LIB}"
   echo "vendor_bluray_stage=${VENDOR_BLURAY_STAGE}"
+  echo "vendor_bluray_java_stage=${VENDOR_BLURAY_JAVADIR}"
   echo "repo_head=$(git -C "${REPO_DIR}" rev-parse --short HEAD 2>/dev/null || echo n/a)"
   echo "edge264_head=$(git -C "${EDGE264_REPO_DEFAULT}" rev-parse --short HEAD 2>/dev/null || echo n/a)"
 } > "${META_FILE}"

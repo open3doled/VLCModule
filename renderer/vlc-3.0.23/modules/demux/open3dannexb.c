@@ -53,33 +53,6 @@ vlc_module_begin()
     set_callbacks(Open, Close)
 vlc_module_end()
 
-#if defined(OPEN3D_VLC_ABI_ALIAS_T64)
-extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
-extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
-extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
-EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
-
-EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
-vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
-{
-    return vlc_entry__3_0_0f(vlc_set, opaque);
-}
-
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-vlc_entry_copyright__3_0_0ft64(void)
-{
-    return vlc_entry_copyright__3_0_0f();
-}
-
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-vlc_entry_license__3_0_0ft64(void)
-{
-    return vlc_entry_license__3_0_0f();
-}
-#endif
-
 static bool has_annexb_extension(const char *psz_file)
 {
     if (psz_file == NULL)

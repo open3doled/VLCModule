@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libbluray-bdj \
     libdbus-1-dev \
     libdrm-dev \
+    libdvbpsi-dev \
     libebml-dev \
     libegl1-mesa-dev \
     libfribidi-dev \

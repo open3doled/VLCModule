@@ -1,0 +1,122 @@
+# Open3DOLED - Disabled VLC Default Hotkeys
+#
+# These VLC default key bindings conflict with open3d_display calibration
+# mode controls. They are disabled by setting them to empty strings so that
+# open3d_display can exclusively handle these keys during calibration.
+#
+# Generated from: vlc_hotkey_conflict_analysis.md
+#
+# Format: key-<action>=<binding>
+# Empty value (key-action=) disables the binding
+#
+# NOTE: The AppImage launcher uses --ignore-config, so this file is for
+# documentation and non-AppImage builds only. Actual runtime overrides are
+# command-line --key-<action>= arguments in packaging/appimage/AppRun.
+#
+# These overrides take effect when VLC loads the default config from the
+# AppImage's built-in vlcrc. User-level vlcrc (~/.config/vlc/vlcrc) still
+# overrides these values if present.
+
+# === Single-Letter Key Conflicts ===
+#
+# g: subdelay-down <-> calib-g (calib help toggle)
+key-subdelay-down=
+# t: position <-> calib-t (calib drive toggle)
+key-position=
+# b: audio-track <-> calib-b (calib emitter save)
+key-audio-track=
+# p: prev (next track) <-> calib-p (calib optlog toggle)
+key-prev=
+# w: wallpaper <-> calib-w (calib Y adjust)
+key-wallpaper=
+# a: aspect-ratio <-> calib-a (calib X adjust)
+key-aspect-ratio=
+# d: deinterlace <-> calib-d (calib X adjust)
+key-deinterlace=
+# e: frame-next <-> calib-e (calib spacing up)
+key-frame-next=
+# n: next (next track) <-> calib-n (calib border down)
+key-next=
+# m: vol-mute <-> calib-m (calib border up)
+key-vol-mute=
+# z: zoom <-> calib-z (calib size down)
+key-zoom=
+# x: program-sid-next <-> calib-x (calib size up)
+key-program-sid-next=
+# i: intf-show (fullscreen toggle) <-> calib-i (calib IR frame delay)
+key-intf-show=
+# k: audiodelay-up <-> calib-k (calib IR frame delay up)
+key-audiodelay-up=
+# o: toggle-autoscale <-> calib-o (calib IR frame duration)
+key-toggle-autoscale=
+# l: loop <-> calib-l (calib IR frame duration up)
+key-loop=
+# r: random <-> emitter-read (lowercase; no calib-r key)
+key-random=
+# s: stop <-> calib-s (calib Y adjust)
+key-stop=
+# y: no VLC default (free; emitter-apply lowercase, no conflict)
+# u: no VLC default (free; emitter-save lowercase, no conflict)
+# j: audiodelay-down <-> emitter-reconnect (lowercase)
+key-audiodelay-down=
+
+# === Shift Variant Conflicts ===
+#
+# Open3D single-letter matching does not match Ctrl/Alt combinations. Shift is
+# intentionally reserved as a larger-step modifier for calibration, so Shift
+# variants of calibration letters are still intercepted by Open3D while
+# calibration is active.
+# Shift+b: title-next <-> large-step calib-b
+key-title-next=
+# Shift+d: deinterlace-mode <-> large-step calib-d
+key-deinterlace-mode=
+# Shift+s: snapshot <-> large-step calib-s
+key-snapshot=
+# Shift+k: subsync-apply <-> large-step calib-k
+key-subsync-apply=
+# Shift+m: disc-menu <-> large-step calib-m
+key-disc-menu=
+# Shift+n: chapter-next <-> large-step calib-n
+key-chapter-next=
+# Shift+o: title-prev <-> large-step calib-o
+key-title-prev=
+# Shift+p: chapter-prev <-> large-step calib-p
+key-chapter-prev=
+# Shift+a: audiodevice-cycle <-> large-step calib-a
+key-audiodevice-cycle=
+
+# === Kept (Non-Conflicting) VLC Default Bindings ===
+#
+# These should NOT be disabled:
+# key-play-pause=Space          -- core playback
+# key-vol-up=Ctrl+Up            -- volume
+# key-vol-down=Ctrl+Down        -- volume
+# key-faster=+                  -- rate control
+# key-slower=-                  -- rate control
+# key-rate-normal==             -- rate control
+# key-rate-faster-fine=]        -- fine rate
+# key-rate-slower-fine=[        -- fine rate
+# key-toggle-fullscreen=f       -- fullscreen toggle
+# key-leave-fullscreen=Esc      -- exit fullscreen
+# Navigation: Left/Right/Up/Down/Enter -- menu navigation
+# Shift+r -- record
+# v / Shift+v -- subtitle track
+# F1-F10 / Ctrl+F1-F10 -- bookmarks
+# Ctrl+Shift+k -- subsync reset
+# Alt+o / Alt+Shift+o -- scale factor
+# Shift+h / Shift+j -- subsync
+# Ctrl+Left/Right -- jump medium
+# Ctrl+Alt+Left/Right -- jump long
+# Alt+1/2/3/4 -- zoom quarter/half/original/double
+# Page Up/Down -- FOV
+# Space -- play/pause
+
+# === Notes ===
+#
+# - Setting a key to empty string (key-action=) disables the binding
+#   while keeping the action available for programmatic invocation
+# - User-level vlcrc overrides these defaults
+# - The open3d_display module still receives key-pressed events for
+#   all keys; it just won't compete with VLC's hotkeys module
+# - This file is reference documentation for non-AppImage launches. The
+#   AppImage runtime path uses AppRun command-line overrides instead.

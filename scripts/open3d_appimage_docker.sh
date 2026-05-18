@@ -13,6 +13,7 @@ Commands:
 
 Env overrides:
   OPEN3D_APPIMAGE_DOCKER_IMAGE=open3doled-appimage-builder:debian11
+  OPEN3D_APPIMAGE_DOCKER_PLATFORM=linux/amd64
   OPEN3D_APPIMAGE_OUT_DIR=/host/path/for/appimage/artifacts
   OPEN3D_APPIMAGE_CACHE_DIR=/host/path/for/persistent/docker-build-cache
 EOF
@@ -20,12 +21,14 @@ EOF
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_NAME="${OPEN3D_APPIMAGE_DOCKER_IMAGE:-open3doled-appimage-builder:debian11}"
+PLATFORM="${OPEN3D_APPIMAGE_DOCKER_PLATFORM:-linux/amd64}"
 DOCKERFILE_DIR="${REPO_DIR}/packaging/appimage"
 OUT_DIR="${OPEN3D_APPIMAGE_OUT_DIR:-${REPO_DIR}/local/out/appimage}"
 CACHE_DIR="${OPEN3D_APPIMAGE_CACHE_DIR:-${REPO_DIR}/local/cache/appimage-docker}"
 
 build_image() {
   docker build \
+    --platform "${PLATFORM}" \
     -t "${IMAGE_NAME}" \
     -f "${DOCKERFILE_DIR}/Dockerfile" \
     "${DOCKERFILE_DIR}"
@@ -34,6 +37,7 @@ build_image() {
 run_container() {
   mkdir -p "${OUT_DIR}" "${CACHE_DIR}"
   docker run --rm \
+    --platform "${PLATFORM}" \
     -v "${REPO_DIR}:/work" \
     -v "${OUT_DIR}:/out" \
     -v "${CACHE_DIR}:/opt/open3doled-appimage" \

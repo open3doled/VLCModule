@@ -176,6 +176,11 @@ def patch_open_panels_cpp(tree_root: Path):
 {
     const bool is_open3d_bluray = isOpen3DBluRaySelection();
 
+    if( is_open3d_bluray )
+        ui.dvdsimple->setText( qtr(\"Start without menus\") );
+    else
+        ui.dvdsimple->setText( qtr(\"No disc menus\") );
+
     if ( ui.dvdRadioButton->isChecked() )
     {
         if( m_discType != Dvd )
@@ -196,7 +201,7 @@ def patch_open_panels_cpp(tree_root: Path):
         {
             setDrive( psz_dvddiscpath );
             m_discType = bluray_type;
-            ui.dvdsimple->setChecked( !var_InheritBool( p_intf, \"bluray-menu\" ) );
+            ui.dvdsimple->setChecked( true );
         }
         ui.titleLabel->setText( qtr(\"Title\") );
         ui.chapterLabel->hide();

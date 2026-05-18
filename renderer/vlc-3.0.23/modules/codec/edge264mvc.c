@@ -1296,39 +1296,6 @@ vlc_module_begin()
     set_callbacks(OpenDecoder, CloseDecoder)
 vlc_module_end()
 
-#if defined(OPEN3D_VLC_ABI_ALIAS_T64)
-/*
- * Debian/Ubuntu VLC 3.0.x variants may look for "vlc_entry__3_0_0ft64"
- * while upstream VLC 3.0.23 modules export "vlc_entry__3_0_0f".
- * This opt-in compatibility shim exports the t64 entry symbol and forwards
- * to the upstream entry point.
- */
-extern int CDECL_SYMBOL vlc_entry__3_0_0f(vlc_set_cb, void *);
-extern const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0f(void);
-extern const char *CDECL_SYMBOL vlc_entry_license__3_0_0f(void);
-EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL vlc_entry__3_0_0ft64(vlc_set_cb, void *);
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_copyright__3_0_0ft64(void);
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL vlc_entry_license__3_0_0ft64(void);
-
-EXTERN_SYMBOL DLL_SYMBOL int CDECL_SYMBOL
-vlc_entry__3_0_0ft64(vlc_set_cb vlc_set, void *opaque)
-{
-    return vlc_entry__3_0_0f(vlc_set, opaque);
-}
-
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-vlc_entry_copyright__3_0_0ft64(void)
-{
-    return vlc_entry_copyright__3_0_0f();
-}
-
-EXTERN_SYMBOL DLL_SYMBOL const char *CDECL_SYMBOL
-vlc_entry_license__3_0_0ft64(void)
-{
-    return vlc_entry_license__3_0_0f();
-}
-#endif
-
 static bool IsExplicitOptIn(decoder_t *dec)
 {
     if (dec->fmt_in.i_codec == OPEN3DBLURAYMVC_CODEC_MVC ||

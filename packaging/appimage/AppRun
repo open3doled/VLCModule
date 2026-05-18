@@ -1,8 +1,17 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 APPDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPEN3D_SCRIPT_DIR="${APPDIR}/usr/lib/open3doled/scripts"
+OPEN3D_APPIMAGE_ORIG_PATH="${PATH:-}"
+OPEN3D_APPIMAGE_SYSTEM_PATH_DEFAULT="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset BASH_ENV || true
+unset ENV || true
+PATH="${OPEN3D_APPIMAGE_SYSTEM_PATH:-${OPEN3D_APPIMAGE_SYSTEM_PATH_DEFAULT}}"
+if [[ -n "${JAVA_HOME:-}" && -d "${JAVA_HOME}/bin" ]]; then
+  PATH="${JAVA_HOME}/bin:${PATH}"
+fi
+export OPEN3D_APPIMAGE_ORIG_PATH PATH
 isolation_prefix=()
 isolation_vlc_args=()
 selected_media=""
@@ -20,7 +29,9 @@ user_mkv_subtitle_force_set=0
 user_mkv_plane_set=0
 user_mkv_source_id_set=0
 user_edge264mvc_normalize_ts_set=0
+user_avcodec_hw_set=0
 media_arg_index=-1
+auto_bluray_menu_disabled=0
 
 if [[ -f "${OPEN3D_SCRIPT_DIR}/open3d_process_isolation.sh" ]]; then
   # shellcheck source=/dev/null
@@ -150,27 +161,97 @@ prepare_launcher_log() {
   printf '%s/%s_%s_pid%s.log\n' "${log_root}" "${log_tag}" "${timestamp}" "$$"
 }
 
-export VLC_PLUGIN_PATH="${APPDIR}/usr/lib/vlc/plugins"
-export VLC_DATA_PATH="${APPDIR}/usr/share/vlc"
-export LD_LIBRARY_PATH="${APPDIR}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-export QT_PLUGIN_PATH="${APPDIR}/usr/lib/qt5/plugins"
-export QT_QPA_PLATFORM_PLUGIN_PATH="${APPDIR}/usr/lib/qt5/plugins/platforms"
+collect_open3d_user_overrides() {
+  local token key
+  local overrides=""
+
+  for token in "$@"; do
+    case "${token}" in
+      --open3d-*=*)
+        key="${token%%=*}"
+        key="${key#--}"
+        ;;
+      --open3d-*)
+        key="${token#--}"
+        ;;
+      --no-open3d-*)
+        key="${token#--no-}"
+        ;;
+      *)
+        continue
+        ;;
+    esac
+
+    case ",${overrides}," in
+      *",${key},"*)
+        ;;
+      *)
+        if [[ -n "${overrides}" ]]; then
+          overrides="${overrides},${key}"
+        else
+          overrides="${key}"
+        fi
+        ;;
+    esac
+  done
+
+  if [[ -n "${overrides}" ]]; then
+    export OPEN3D_APPIMAGE_USER_OPEN3D_OVERRIDES="${overrides}"
+  else
+    unset OPEN3D_APPIMAGE_USER_OPEN3D_OVERRIDES || true
+  fi
+}
+
+OPEN3D_VLC_PLUGIN_PATH="${APPDIR}/usr/lib/vlc/plugins"
+OPEN3D_VLC_DATA_PATH="${APPDIR}/usr/share/vlc"
+OPEN3D_QT_PLUGIN_PATH="${APPDIR}/usr/lib/qt5/plugins"
+OPEN3D_QT_QPA_PLATFORM_PLUGIN_PATH="${APPDIR}/usr/lib/qt5/plugins/platforms"
+OPEN3D_VLC_LD_LIBRARY_PATH="${APPDIR}/usr/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export QT_QPA_PLATFORMTHEME="${QT_QPA_PLATFORMTHEME:-}"
 export QT_STYLE_OVERRIDE="${QT_STYLE_OVERRIDE:-}"
 export QT_IM_MODULE="${QT_IM_MODULE:-compose}"
+export OPEN3D_APPIMAGE_ENABLE_WAYLAND="${OPEN3D_APPIMAGE_ENABLE_WAYLAND:-auto}"
+open3d_wayland_runtime_available=0
+if [[ "${OPEN3D_APPIMAGE_ENABLE_WAYLAND}" != "0" &&
+      "${XDG_SESSION_TYPE:-}" == "wayland" &&
+      -n "${WAYLAND_DISPLAY:-}" &&
+      -f "${OPEN3D_QT_QPA_PLATFORM_PLUGIN_PATH}/libqwayland-egl.so" ]]; then
+  open3d_wayland_runtime_available=1
+fi
 if [[ -z "${QT_QPA_PLATFORM:-}" ]]; then
-  if [[ "${XDG_SESSION_TYPE:-}" == "wayland" && -n "${WAYLAND_DISPLAY:-}" ]]; then
+  if [[ "${open3d_wayland_runtime_available}" == "1" ]]; then
     export QT_QPA_PLATFORM=wayland
-  elif [[ "${XDG_SESSION_TYPE:-}" == "x11" && -n "${DISPLAY:-}" ]]; then
+  elif [[ -n "${DISPLAY:-}" ]]; then
     export QT_QPA_PLATFORM=xcb
+  elif [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    export QT_QPA_PLATFORM=wayland
+  fi
+fi
+if [[ "${QT_QPA_PLATFORM:-}" == "xcb" ]]; then
+  export GDK_BACKEND="${GDK_BACKEND:-x11}"
+  export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-x11}"
+  export CLUTTER_BACKEND="${CLUTTER_BACKEND:-x11}"
+  export _JAVA_AWT_WM_NONREPARENTING="${_JAVA_AWT_WM_NONREPARENTING:-1}"
+  if [[ "${OPEN3D_APPIMAGE_ENABLE_WAYLAND}" == "0" &&
+        -n "${WAYLAND_DISPLAY:-}" ]]; then
+    export OPEN3D_APPIMAGE_ORIG_WAYLAND_DISPLAY="${WAYLAND_DISPLAY}"
+    unset WAYLAND_DISPLAY
   fi
 fi
 prepare_isolated_state_dirs
-if [[ "${OPEN3D_APPIMAGE_ENABLE_BDJ:-0}" == "1" ]]; then
-  if [[ -d "${APPDIR}/usr/share/java" ]]; then
-    export LIBBLURAY_CP="${APPDIR}/usr/share/java/"
-  fi
-else
+export OPEN3D_APPIMAGE_APPRUN="${APPDIR}/AppRun"
+export OPEN3D_CONTROL_PANEL="${APPDIR}/usr/bin/open3d-control-panel"
+if [[ "${1:-}" == "--open3dctl" ]]; then
+  shift
+  exec "${APPDIR}/usr/bin/open3dctl" "$@"
+fi
+if [[ "${1:-}" == "--open3d-control-panel" ||
+      "${1:-}" == "--open3d-settings" ||
+      "${1:-}" == "--open3d-controls" ]]; then
+  shift
+  exec "${APPDIR}/usr/bin/open3d-control-panel" "$@"
+fi
+if [[ "${OPEN3D_APPIMAGE_ENABLE_BDJ:-0}" != "1" ]]; then
   unset LIBBLURAY_CP || true
 fi
 export EDGE264MVC_LIB="${EDGE264MVC_LIB:-${APPDIR}/usr/lib/libedge264.so.1}"
@@ -193,6 +274,7 @@ elif ! grep -Eq -- '(^|[[:space:]])--(no-)?edge264mvc-advertise-multiview([[:spa
 fi
 
 user_args=("$@")
+collect_open3d_user_overrides "${user_args[@]}"
 open3d_scan_user_args app_scan "${user_args[@]}"
 media_arg_index="${app_scan_media_arg_index}"
 user_codec_set="${app_scan_user_codec_set}"
@@ -205,6 +287,10 @@ user_mkv_subtitle_force_set="${app_scan_user_mkv_subtitle_force_set}"
 user_mkv_plane_set="${app_scan_user_mkv_plane_set}"
 user_mkv_source_id_set="${app_scan_user_mkv_source_id_set}"
 user_edge264mvc_normalize_ts_set="${app_scan_user_edge264mvc_normalize_ts_set}"
+user_avcodec_hw_set="${app_scan_user_avcodec_hw_set}"
+user_bluray_menu_set="${app_scan_user_bluray_menu_set}"
+user_bluray_menu_enabled="${app_scan_user_bluray_menu_enabled}"
+user_presenter_rt_set="${app_scan_user_presenter_rt_set}"
 
 if (( media_arg_index >= 0 )); then
   selected_media="${user_args[media_arg_index]}"
@@ -215,6 +301,25 @@ if (( media_arg_index >= 0 )); then
     needs_edge264="${OPEN3D_MEDIA_NEEDS_EDGE264}"
     media_ext_lc="${OPEN3D_MEDIA_EXT_LC}"
     user_args[media_arg_index]="${selected_media}"
+  fi
+fi
+
+if [[ "${user_bluray_menu_set}" == "0" &&
+      "${OPEN3D_APPIMAGE_ENABLE_BDJ:-0}" != "1" &&
+      ( "${selected_media}" == open3dbluraymvc://* ||
+        "${selected_media}" == bluray://* ) ]]; then
+  auto_bluray_menu_disabled=1
+  user_bluray_menu_set=1
+  user_bluray_menu_enabled=0
+  printf '%s\n' "open3d appimage: Blu-ray menus disabled by default; pass --bluray-menu to opt into experimental menu playback"
+fi
+
+if [[ "${selected_media}" == open3dbluraymvc://* || "${selected_media}" == bluray://* || "${OPEN3D_APPIMAGE_ENABLE_BDJ:-0}" == "1" ]]; then
+  if open3d_should_enable_bluray_bdj_runtime "${user_bluray_menu_set}" "${user_bluray_menu_enabled}" "${selected_media}"; then
+    open3d_enable_bluray_bdj_runtime "open3d appimage" \
+      "${APPDIR}/usr/share/java" || true
+  elif [[ "${user_bluray_menu_set}" == "1" && "${user_bluray_menu_enabled}" == "0" ]]; then
+    open3d_disable_bluray_bdj_runtime "open3d appimage"
   fi
 fi
 
@@ -247,11 +352,41 @@ fi
 if [[ "${OPEN3D_MVC_IGNORE_CONFIG}" == "1" ]]; then
   vlc_args+=(--ignore-config)
 fi
-if [[ "${OPEN3D_MVC_ENABLE_VOUT}" == "1" ]]; then
+if [[ "${OPEN3D_APPIMAGE_DISABLE_DEFAULT_KEYS:-1}" != "0" ]]; then
+  # Disable VLC's built-in default key bindings that conflict with open3d_display
+  # calibration-mode controls and emitter keys. These empty values remove compiled-in defaults.
+  # Set OPEN3D_APPIMAGE_DISABLE_DEFAULT_KEYS=0 to keep VLC defaults.
   vlc_args+=(
-    --open3d-enable
-    --open3d-emitter-enable
-    --open3d-emitter-tty=auto
+    # === Calib keys: clear VLC defaults that conflict with single-letter calib keys ===
+    "--key-subdelay-down="        # g: frees VLC subdelay-down for calib-g
+    "--key-position="             # t: frees VLC position for calib-t
+    "--key-audio-track="          # b: frees VLC audio-track for calib-b
+    "--key-prev="                 # p: frees VLC prev for calib-p
+    "--key-wallpaper="            # w: frees VLC wallpaper for calib-w
+    "--key-aspect-ratio="         # a: frees VLC aspect-ratio for calib-a
+    "--key-deinterlace="          # d: frees VLC deinterlace for calib-d
+    "--key-frame-next="           # e: frees VLC frame-next for calib-e
+    "--key-next="                 # n: frees VLC next for calib-n
+    "--key-vol-mute="             # m: frees VLC vol-mute for calib-m
+    "--key-zoom="                 # z: frees VLC zoom for calib-z
+    "--key-program-sid-next="     # x: frees VLC program-sid-next for calib-x
+    "--key-intf-show="            # i: frees VLC intf-show for calib-i
+    "--key-audiodelay-up="        # k: frees VLC audiodelay-up for calib-k
+    "--key-toggle-autoscale="     # o: frees VLC toggle-autoscale for calib-o
+    "--key-loop="                 # l: frees VLC loop for calib-l
+    "--key-random="               # r: frees VLC random for emitter-read (lowercase)
+    "--key-stop="                 # s: frees VLC stop for calib-s
+    "--key-audiodelay-down="      # j: frees VLC audiodelay-down for emitter-reconnect (lowercase)
+    # === Shift variants: Open3D uses Shift as the calibration large-step modifier ===
+    "--key-title-next="           # Shift+b: frees large-step calib-b
+    "--key-deinterlace-mode="     # Shift+d: frees large-step calib-d
+    "--key-snapshot="             # Shift+s: frees large-step calib-s
+    "--key-subsync-apply="        # Shift+k: frees large-step calib-k
+    "--key-disc-menu="            # Shift+m: frees large-step calib-m
+    "--key-chapter-next="         # Shift+n: frees large-step calib-n
+    "--key-title-prev="           # Shift+o: frees large-step calib-o
+    "--key-chapter-prev="         # Shift+p: frees large-step calib-p
+    "--key-audiodevice-cycle="    # Shift+a: frees large-step calib-a
   )
 fi
 if [[ -n "${EDGE264MVC_EXTRA_ARGS:-}" ]]; then
@@ -262,8 +397,25 @@ fi
 if [[ -n "${selected_demux}" && "${user_demux_set}" == "0" ]]; then
   vlc_args+=("--demux=${selected_demux}")
 fi
+if [[ "${auto_bluray_menu_disabled}" == "1" ]]; then
+  vlc_args+=(--no-bluray-menu)
+fi
 if [[ "${needs_edge264}" == "1" && "${user_codec_set}" == "0" ]]; then
-  vlc_args+=("--codec=edge264mvc,avcodec")
+  vlc_args+=("--codec=edge264mvc,avcodec,rawvideo")
+fi
+if [[ -z "${OPEN3D_APPIMAGE_AVCODEC_HW+x}" ]]; then
+  export OPEN3D_APPIMAGE_AVCODEC_HW=none
+fi
+if [[ "${user_avcodec_hw_set}" == "0" &&
+      -n "${OPEN3D_APPIMAGE_AVCODEC_HW:-}" ]]; then
+  vlc_args+=("--avcodec-hw=${OPEN3D_APPIMAGE_AVCODEC_HW}")
+fi
+if [[ "${user_bluray_menu_set}" == "1" &&
+      "${user_bluray_menu_enabled}" == "1" &&
+      "${user_presenter_rt_set}" == "0" &&
+      "${OPEN3D_APPIMAGE_MENU_DISABLE_PRESENTER_RT:-0}" == "1" ]]; then
+  vlc_args+=("--no-open3d-presenter-rt-enable")
+  printf '%s\n' "open3d appimage: disabling presenter RT for menu-enabled Blu-ray run (legacy policy override)"
 fi
 if [[ "${media_ext_lc}" == "mkv" &&
       "${user_edge264mvc_normalize_ts_set}" == "0" ]]; then
@@ -317,13 +469,30 @@ fi
 
 start_x11_window_tuner
 
+vlc_env=(
+  VLC_DATA_PATH="${OPEN3D_VLC_DATA_PATH}"
+  LD_LIBRARY_PATH="${OPEN3D_VLC_LD_LIBRARY_PATH}"
+  QT_PLUGIN_PATH="${OPEN3D_QT_PLUGIN_PATH}"
+  QT_QPA_PLATFORM_PLUGIN_PATH="${OPEN3D_QT_QPA_PLATFORM_PLUGIN_PATH}"
+)
+if [[ "${OPEN3D_APPIMAGE_FORCE_VLC_PLUGIN_PATH:-0}" == "1" ]]; then
+  vlc_env=(VLC_PLUGIN_PATH="${OPEN3D_VLC_PLUGIN_PATH}" "${vlc_env[@]}")
+else
+  # The packaged VLC binary already discovers AppDir/usr/lib/vlc/plugins
+  # relative to itself. Setting VLC_PLUGIN_PATH to that same directory makes
+  # libvlc scan every plugin twice, which duplicates preference entries.
+  vlc_env=(-u VLC_PLUGIN_PATH "${vlc_env[@]}")
+fi
+
 if log_path="$(prepare_launcher_log appimage_playback 2>/dev/null)"; then
   mkdir -p "$(dirname "${log_path}")"
   printf '%s\n' "Playback log: ${log_path}"
   exec > >(tee -a "${log_path}") 2>&1
 fi
 
-exec "${isolation_prefix[@]}" "${OPEN3D_SCRIPT_DIR}/open3d_exec_with_state_log.sh" \
+exec "${isolation_prefix[@]}" env \
+  "${vlc_env[@]}" \
+  "${OPEN3D_SCRIPT_DIR}/open3d_exec_with_state_log.sh" \
   "${APPDIR}/usr/bin/vlc" \
   "${vlc_args[@]}" \
   "${isolation_vlc_args[@]}" \
